@@ -5,10 +5,10 @@
  * regarding licensing.
  */
 
-#include <rageVectors.h>
+#include "rageVectors.h"
 
 #define RAGE_FORMATS_FILE datBase
-#include <formats-header.h>
+#include "formats-header.h"
 
 #ifdef RAGE_FORMATS_OK
 
@@ -49,7 +49,7 @@ class BlockMap;
 #define RAGE_NATIVE_ARCHITECTURE 0
 #endif
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 using TPtr = uint64_t;
 #else
 using TPtr = uint32_t;
@@ -74,4 +74,4 @@ public:
 };
 #endif
 
-#include <formats-footer.h>
+#include "formats-footer.h"

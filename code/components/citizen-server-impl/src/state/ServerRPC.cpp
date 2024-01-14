@@ -42,7 +42,7 @@ inline uint32_t MakeEntityHandle(uint16_t objectId)
 
 namespace fx
 {
-	glm::vec3 GetPlayerFocusPos(const fx::sync::SyncEntityPtr& entity);
+eastl::fixed_vector<glm::vec3, 5> GetPlayerFocusPos(const fx::sync::SyncEntityPtr& entity);
 }
 
 static tbb::concurrent_unordered_map<uint32_t, std::list<std::tuple<uint64_t, net::Buffer>>> g_replayList;
@@ -51,11 +51,18 @@ static InitFunction initFunction([]()
 {
 	fx::ServerInstanceBase::OnServerCreate.Connect([](fx::ServerInstanceBase* ref)
 	{
-		auto rpcConfiguration = RpcConfiguration::Load("citizen:/scripting/rpc_natives.json");
+		if (!IsStateGame())
+		{
+			return;
+		}
+
+		// REDM1S: _rdr3
+		auto rpcSuffix = "";
+		auto rpcConfiguration = RpcConfiguration::Load(fmt::sprintf("citizen:/scripting/rpc_natives%s.json", rpcSuffix));
 
 		if (!rpcConfiguration)
 		{
-			console::PrintWarning("server", "Could not load rpc_natives.json. Is the server running from the correct directory, and is citizen_dir set?\n");
+			console::PrintWarning("server", "Could not load rpc_natives%s.json. Is the server running from the correct directory, and is citizen_dir set?\n", rpcSuffix);
 			return;
 		}
 
@@ -74,7 +81,7 @@ static InitFunction initFunction([]()
 					{
 						for (auto& [ native, buffer ] : entry.second)
 						{
-							unsafeClient->SendPacket(0, buffer, NetPacketType_ReliableReplayed);
+							unsafeClient->SendPacket(0, buffer, NetPacketType_Reliable);
 						}
 					}
 				}
@@ -123,6 +130,14 @@ static InitFunction initFunction([]()
 
 		for (auto& native : rpcConfiguration->GetNatives())
 		{
+			// deprecated by ServerSetters
+#ifdef STATE_FIVE
+			if (native->GetName() == "CREATE_PED" || native->GetName() == "CREATE_OBJECT_NO_OFFSET")
+			{
+				continue;
+			}
+#endif
+
 			// RPC NATIVE
 			fx::ScriptEngine::RegisterNativeHandler(native->GetName(), [=](fx::ScriptContext& ctx)
 			{
@@ -142,7 +157,7 @@ static InitFunction initFunction([]()
 					{
 					case RpcConfiguration::ArgumentType::Player:
 					{
-						clientIdx = ctx.GetArgument<int>(ctxIdx);
+						clientIdx = std::stoi(ctx.CheckArgument<const char*>(ctxIdx));
 						contextId = clientIdx;
 						break;
 					}
@@ -161,7 +176,7 @@ static InitFunction initFunction([]()
 
 							if (client)
 							{
-								cxtEntity = std::any_cast<uint32_t>(client->GetData("playerEntity"));
+								cxtEntity = fx::AnyCast<uint32_t>(client->GetData("playerEntity"));
 							}
 						}
 
@@ -252,7 +267,7 @@ static InitFunction initFunction([]()
 								return;
 							}
 
-							if (client->GetData("playerEntity").has_value())
+							if (client->GetData("playerEntity"))
 							{
 								clientIdx = client->GetNetId();
 							}
@@ -285,9 +300,13 @@ static InitFunction initFunction([]()
 
 								if (playerEntity)
 								{
-									auto tgt = fx::GetPlayerFocusPos(playerEntity);
+									auto tgts = fx::GetPlayerFocusPos(playerEntity);
 
-									distance = glm::distance2(tgt, pos);
+									// use first position, which is the most focus-related position
+									if (!tgts.empty())
+									{
+										distance = glm::distance2(tgts[0], pos);
+									}
 								}
 							}
 							catch (std::bad_any_cast&)
@@ -364,7 +383,7 @@ static InitFunction initFunction([]()
 
 							if (client)
 							{
-								cxtEntity = std::any_cast<uint32_t>(client->GetData("playerEntity"));
+								cxtEntity = fx::AnyCast<uint32_t>(client->GetData("playerEntity"));
 							}
 						}
 						
@@ -429,7 +448,7 @@ static InitFunction initFunction([]()
 					}
 					case RpcConfiguration::ArgumentType::Player:
 					{
-						int player = ctx.GetArgument<int>(i);
+						int player = std::stoi(ctx.CheckArgument<const char*>(i));
 						auto client = clientRegistry->GetClientByNetID(player);
 
 						if (!client)
@@ -437,7 +456,7 @@ static InitFunction initFunction([]()
 							return;
 						}
 
-						buffer.Write<uint8_t>(client->GetSlotId());
+						buffer.Write<uint16_t>(client->GetNetId());
 
 						break;
 					}
@@ -453,7 +472,7 @@ static InitFunction initFunction([]()
 						break;
 					case RpcConfiguration::ArgumentType::String:
 					{
-						const char* str = ctx.GetArgument<const char*>(i);
+						const char* str = ctx.CheckArgument<const char*>(i);
 						buffer.Write<uint16_t>(strlen(str));
 						buffer.Write(str, strlen(str));
 						break;
@@ -465,7 +484,10 @@ static InitFunction initFunction([]()
 
 				auto sendToClient = [&](const fx::ClientSharedPtr& cl)
 				{
-					cl->SendPacket(0, buffer, NetPacketType_ReliableReplayed);
+					if (cl)
+					{
+						cl->SendPacket(0, buffer, NetPacketType_Reliable);
+					}
 				};
 
 				if (clientIdx == -2)
@@ -475,7 +497,7 @@ static InitFunction initFunction([]()
 						std::unique_lock<std::shared_mutex> _(entity->guidMutex);
 						entity->onCreationRPC.push_back([buffer](const fx::ClientSharedPtr& client)
 						{
-							client->SendPacket(0, buffer, NetPacketType_ReliableReplayed);
+							client->SendPacket(0, buffer, NetPacketType_Reliable);
 						});
 					}
 				}
@@ -598,7 +620,7 @@ static InitFunction initFunction([]()
 
 							if (client)
 							{
-								cxtEntity = std::any_cast<uint32_t>(client->GetData("playerEntity"));
+								cxtEntity = fx::AnyCast<uint32_t>(client->GetData("playerEntity"));
 							}
 						}
 

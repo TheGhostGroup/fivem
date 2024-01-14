@@ -12,8 +12,8 @@
 
 using fx::Resource;
 
-typedef std::function<void(const std::string&)> ResUIResultCallback;
-typedef std::function<void(const std::string&, ResUIResultCallback)> ResUICallback;
+typedef std::function<void(int statusCode, const std::multimap<std::string, std::string>& headers, const std::string& body)> ResUIResultCallback;
+typedef std::function<void(const std::string& path, const std::string& query, const std::multimap<std::string, std::string>& headers, const std::string& body, ResUIResultCallback)> ResUICallback;
 
 class
 #ifdef COMPILING_NUI_RESOURCES
@@ -27,6 +27,8 @@ private:
 	Resource* m_resource;
 
 	bool m_hasFrame;
+
+	bool m_isDead = false;
 
 	bool m_hasCallbacks;
 
@@ -52,13 +54,20 @@ public:
 		m_hasCallbacks = value;
 	}
 
+	inline bool IsDead() const
+	{
+		return m_isDead;
+	}
+
 	bool Create();
 
 	void Destroy();
 
 	void AddCallback(const std::string& type, ResUICallback callback);
 
-	bool InvokeCallback(const std::string& type, const std::string& data, ResUIResultCallback resultCB);
+	void RemoveCallback(const std::string& type);
+
+	bool InvokeCallback(const std::string& type, const std::string& query, const std::multimap<std::string, std::string>& headers, const std::string& data, ResUIResultCallback resultCB);
 
 	void SignalPoll();
 };

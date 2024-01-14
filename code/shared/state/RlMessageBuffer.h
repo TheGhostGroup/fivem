@@ -21,7 +21,7 @@ public:
 	}
 
 	inline MessageBuffer(std::vector<uint8_t>&& data)
-		: m_data(std::move(data)), m_curBit(0), m_maxBit(data.size() * 8)
+		: m_data(std::move(data)), m_curBit(0), m_maxBit(m_data.size() * 8)
 	{
 
 	}
@@ -38,30 +38,30 @@ public:
 
 	}
 
-	inline bool ReadBitsSingle(void* out, int length)
+	/// <summary>
+	/// rage::datBitBuffer::ReadUnsigned = 0x14128DCF8 (1604)
+	/// </summary>
+	template<typename T>
+	inline bool ReadBitsSingle(T* out, int length)
 	{
 		if (length == 13 && GetLengthHackState())
 		{
 			length = 16;
 		}
 
-		int startIdx = m_curBit / 8;
-		int shift = m_curBit % 8;
-		
-		if ((startIdx + (length / 8) > m_data.size()))
+		static_assert(std::is_integral_v<T>, "ReadBitsSingle wants an int value");
+
+		if ((m_curBit + length) > m_maxBit)
 		{
 			m_curBit += length;
 			return false;
 		}
+
+		int startIdx = m_curBit / 8;
+		int shift = m_curBit % 8;
 
 		uint32_t retval = (uint8_t)(m_data[startIdx] << shift);
 		startIdx++;
-
-		if ((startIdx + (length / 8) > m_data.size()))
-		{
-			m_curBit += length;
-			return false;
-		}
 
 		if (length > 8)
 		{
@@ -78,13 +78,18 @@ public:
 			}
 		}
 
-		auto leftover = (startIdx < m_data.size()) ? m_data[startIdx] : 0;
+		if (shift)
+		{
+			auto leftover = (startIdx < m_data.size()) ? m_data[startIdx] : 0;
+			retval |= (uint8_t)(leftover >> (8 - shift));
+		}
 
-		retval = (uint32_t)(retval | (uint8_t)(leftover >> (8 - shift))) >> (((length + 7) & 0xF8) - length);
+		retval = retval >> (((length + 7) & 0xF8) - length);
 
 		m_curBit += length;
 
-		*(uint32_t*)out = retval;
+		// hack to prevent an out-of-bounds write of `out`
+		*out = *(T*)&retval;
 
 		return true;
 	}
@@ -93,13 +98,13 @@ public:
 	inline uint8_t ReadBit()
 	{
 		int startIdx = m_curBit / 8;
-		int shift = (7 - (m_curBit % 8));
 
 		if (startIdx >= m_data.size())
 		{
 			return 0;
 		}
 
+		int shift = (7 - (m_curBit % 8));
 		uint32_t retval = (uint8_t)(m_data[startIdx] >> shift);
 
 		m_curBit++;
@@ -315,13 +320,10 @@ public:
 			return true;
 		}
 
-		if (length == 13 && GetLengthHackState())
-		{
-			length = 16;
-		}
-
 		if ((m_curBit + length) > m_maxBit)
+		{
 			return false;
+		}
 
 		auto rv = CopyBits(data, m_data.data(), length, 0, m_curBit);
 		
@@ -346,15 +348,22 @@ public:
 	}
 
 	// copied IDA code, eh
-	inline bool WriteBitsSingle(const void* data, int length)
+	template<typename T>
+	inline bool WriteBitsSingle(const T* data, int length)
 	{
 		if (length == 13 && GetLengthHackState())
 		{
 			length = 16;
 		}
 
+		static_assert(std::is_integral_v<T>, "WriteBitsSingle wants an int value");
+
 		auto a1 = m_data.data();
-		auto a2 = *(uint32_t*)data;
+
+		// hack to prevent an out-of-bounds read of `data` tripping analyzers
+		uint32_t a2 = 0;
+		*(T*)&a2 = *data;
+
 		auto a3 = length;
 		int a4 = m_curBit;
 
@@ -408,13 +417,13 @@ public:
 	inline bool WriteBit(uint8_t bit)
 	{
 		int startIdx = m_curBit / 8;
-		int shift = (7 - (m_curBit % 8));
 
 		if (startIdx >= m_data.size())
 		{
 			return false;
 		}
 
+		int shift = (7 - (m_curBit % 8));
 		m_data[startIdx] = (m_data[startIdx] & ~(1 << shift)) | (bit << shift);
 
 		m_curBit++;
@@ -476,6 +485,17 @@ public:
 		WriteBitsSingle(&data, length);
 	}
 
+	template<typename T>
+	inline void WriteSigned(int length, T data)
+	{
+		int sign = data < 0;
+		int signEx = (data < 0) ? 0xFFFFFFFF : 0;
+		int d = (data ^ signEx);
+
+		Write<int>(1, sign);
+		Write<int>(length - 1, d);
+	}
+
 	inline float ReadFloat(int length, float divisor)
 	{
 		auto integer = Read<int>(length);
@@ -500,6 +520,14 @@ public:
 		return ((float)integer / max) * divisor;
 	}
 
+	inline void WriteSignedFloat(int length, float divisor, float value)
+	{
+		float max = (1 << (length - 1)) - 1;
+		int integer = (int)((value / divisor) * max);
+
+		WriteSigned<int>(length, integer);
+	}
+
 	inline uint64_t ReadLong(int length)
 	{
 		if (length <= 32)
@@ -514,7 +542,7 @@ public:
 
 	inline MessageBuffer Clone()
 	{
-		auto s = m_maxBit - m_curBit;
+		auto s = m_maxBit - std::min(m_curBit, m_maxBit);
 		auto c = (s / 8) + (s % 8 != 0) ? 1 : 0;
 
 		std::vector<uint8_t> newData(c);

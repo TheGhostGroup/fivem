@@ -1,6 +1,7 @@
 #include <StdInc.h>
 #include <ExtDownloader.h>
 
+#if 0
 #include <CfxSubProcess.h>
 #include <IteratorView.h>
 
@@ -13,7 +14,7 @@
 
 #include <EnvironmentBlockHelpers.h>
 
-#include <boost/filesystem.hpp>
+#include <filesystem>
 
 #include <boost/random/random_device.hpp>
 #include <boost/uuid/random_generator.hpp>
@@ -255,7 +256,7 @@ public:
 	{
 		auto gid = GenerateGid();
 
-		auto path = boost::filesystem::path(filePath);
+		auto path = std::filesystem::path(filePath);
 
 		auto headers = json::array();
 
@@ -413,3 +414,9 @@ static HookFunction hookFunction([]()
 {
 	StartExtDownloader();
 });
+#else
+std::shared_ptr<ExtDownloader> CreateExtDownloader()
+{
+	return {};
+}
+#endif

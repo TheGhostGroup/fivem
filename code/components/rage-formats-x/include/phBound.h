@@ -8,11 +8,11 @@
 #include <stdint.h>
 #include <vector>
 
-#include <pgBase.h>
-#include <pgContainers.h>
+#include "pgBase.h"
+#include "pgContainers.h"
 
 #define RAGE_FORMATS_FILE phBound
-#include <formats-header.h>
+#include "formats-header.h"
 
 #ifdef RAGE_FORMATS_OK
 #if defined(RAGE_FORMATS_GAME_NY)
@@ -109,7 +109,10 @@ public:
 
 struct phBoundMaterial1
 {
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE) || defined(RAGE_FORMATS_GAME_NY)
 	uint8_t materialIdx;
+#endif
+
 #ifdef RAGE_FORMATS_GAME_NY
 	uint8_t pad;
 	uint16_t roomId : 5;
@@ -124,7 +127,7 @@ struct phBoundMaterial1
 	uint16_t f13 : 1; // "sidewalk spec 3"
 	uint16_t seeThrough : 1;
 	uint16_t f15 : 1;
-#elif defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE) || defined(RAGE_FORMATS_GAME_RDR3)
+#elif defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE)
 	uint8_t proceduralId;
 
 	// TODO: double-check order
@@ -139,12 +142,28 @@ struct phBoundMaterial1
 	uint8_t walkablePath : 1;
 	uint8_t noCamCollision : 1;
 	uint8_t shootThroughFx : 1;
+#elif defined(RAGE_FORMATS_GAME_RDR3)
+	uint16_t materialIdx;
+	uint8_t proceduralId;
+
+	uint8_t roomId : 5;
+	uint8_t pedDensity : 3;
 #endif
 };
 
 #if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE) || defined(RAGE_FORMATS_GAME_RDR3)
 struct phBoundMaterial2
 {
+#if defined(RAGE_FORMATS_GAME_RDR3)
+	uint8_t stairs : 1;
+	uint8_t blockClimb : 1;
+	uint8_t seeThrough : 1;
+	uint8_t shootThrough : 1;
+	uint8_t notCover : 1;
+	uint8_t walkablePath : 1;
+	uint8_t noCamCollision : 1;
+	uint8_t shootThroughFx : 1;
+#endif
 	uint8_t noDecal : 1;
 	uint8_t noNavmesh : 1;
 	uint8_t noRagdoll : 1;
@@ -153,7 +172,9 @@ struct phBoundMaterial2
 	uint8_t tooSteepForPlayer : 1;
 	uint8_t noNetworkSpawn : 1;
 	uint8_t noCamCollisionAllowClipping : 1;
+#if !defined(RAGE_FORMATS_GAME_RDR3)
 	uint8_t materialColorIdx;
+#endif
 	uint16_t unknown;
 };
 #endif
@@ -235,9 +256,12 @@ public:
 
 #if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 		m_material.materialIdx = 0;
+		m_material.roomId = 0;
 		m_material.pedDensity = 0;
 		m_material.proceduralId = 0;
-		m_material.roomId = 0;
+
+#if !defined(RAGE_FORMATS_GAME_RDR3)
+		
 		m_material.stairs = 0;
 		m_material.seeThrough = 0;
 		m_material.blockClimb = 0;
@@ -245,9 +269,22 @@ public:
 		m_material.notCover = 0;
 		m_material.walkablePath = 0;
 		m_material.noCamCollision = 0;
-		m_material.shootThroughFx = 0;
+		m_material.shootThroughFx = 0;	
 
-#if !defined(RAGE_FORMATS_GAME_RDR3)
+		m_pad = 0;
+#endif
+
+#if defined(RAGE_FORMATS_GAME_RDR3)
+		m_material2.stairs = 0;
+		m_material2.seeThrough = 0;
+		m_material2.blockClimb = 0;
+		m_material2.shootThrough = 0;
+		m_material2.notCover = 0;
+		m_material2.walkablePath = 0;
+		m_material2.noCamCollision = 0;
+		m_material2.shootThroughFx = 0;	
+#endif
+
 		m_material2.noDecal = 0;
 		m_material2.noNavmesh = 0;
 		m_material2.noRagdoll = 0;
@@ -256,11 +293,10 @@ public:
 		m_material2.tooSteepForPlayer = 0;
 		m_material2.noNetworkSpawn = 0;
 		m_material2.noCamCollisionAllowClipping = 0;
+#if !defined(RAGE_FORMATS_GAME_RDR3)
 		m_material2.materialColorIdx = 0;
-		m_material2.unknown = 0;
-
-		m_pad = 0;
 #endif
+		m_material2.unknown = 0;
 
 		m_unkFloat = 1.0f;
 
@@ -513,13 +549,13 @@ private:
 
 struct phBoundFlagEntry
 {
-	uint32_t m_0; // boundflags value?
+	uint32_t m_0; // boundflags
 
 #if defined(RAGE_FORMATS_GAME_RDR3)
 	uint32_t pad;
 #endif
 
-	uint32_t m_4; // defaults to -1 during import, though other values are also seen
+	uint32_t m_4; // boundflags
 
 #if defined(RAGE_FORMATS_GAME_RDR3)
 	uint32_t pad2;
@@ -878,7 +914,7 @@ struct phBoundPoly : public pgStreamableBase
 public:
 	union
 	{
-		struct  
+		struct
 		{
 #ifdef RAGE_FORMATS_GAME_RDR3
 			uint32_t typePad : 24;
@@ -892,31 +928,59 @@ public:
 #endif
 		};
 
-		struct  
+		struct
 		{
+#ifdef RAGE_FORMATS_GAME_RDR3
+			uint16_t index;
+			uint16_t type;
+#else
 			uint16_t type; // 1
 			uint16_t index;
-
+#endif
 			float radius;
+			uint32_t unk0;
+			uint32_t unk1;
 		} sphere;
 
-		struct  
+		struct
 		{
+#ifdef RAGE_FORMATS_GAME_RDR3
+			uint16_t index;
+			uint16_t type;
+#else
 			uint16_t type; // 2
 			uint16_t index;
-
+#endif
 			float length;
-			int16_t indexB;
+			uint16_t indexB;
+			uint16_t unk0;
+			uint32_t unk1;
 		} capsule;
 
-		struct  
+		struct
 		{
 			uint32_t type; // 3
 
-			int16_t indices[4];
+			uint16_t indices[4];
+			uint32_t unk0;
 		} box;
 
-		struct  
+		struct
+		{
+#ifdef RAGE_FORMATS_GAME_RDR3
+			uint16_t index;
+			uint16_t type;
+#else
+			uint16_t type; // 4
+			uint16_t index;
+#endif
+			float length;
+			uint16_t indexB;
+			uint16_t unk0;
+			uint32_t unk1;
+		} cylinder;
+
+		struct
 		{
 			float triangleArea;
 
@@ -984,9 +1048,9 @@ private:
 #endif
 
 #if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
-	pgPtr<void> m_unkPtr3;
+	pgPtr<void> m_octantData;
 
-	pgPtr<pgPtr<void>> m_unkPtr4;
+	pgPtr<pgPtr<void>> m_octants;
 #elif defined(RAGE_FORMATS_GAME_NY)
 	uint8_t m_val;
 	uint8_t m_polyPad[3];
@@ -1098,8 +1162,8 @@ public:
 #endif
 
 #ifdef RAGE_FORMATS_GAME_FIVE
-		m_unkPtr3.Resolve(blockMap);
-		m_unkPtr4.Resolve(blockMap);
+		m_octantData.Resolve(blockMap);
+		m_octants.Resolve(blockMap);
 #endif
 	}
 
@@ -1112,6 +1176,14 @@ public:
 	{
 		return *m_polyEntries;
 	}
+
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
+	inline void ClearOctantMap()
+	{
+		m_octants = nullptr;
+		m_octantData = nullptr;
+	}
+#endif
 };
 
 class phBoundGeometry : public phBoundPolyhedron
@@ -1638,4 +1710,4 @@ inline void CalculateBVH(phBoundBVH* bound, int maxPerNode = 4)
 
 #endif
 
-#include <formats-footer.h>
+#include "formats-footer.h"

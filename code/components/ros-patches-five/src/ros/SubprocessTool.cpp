@@ -77,7 +77,33 @@ static MyListener* RunListener(const std::wstring& a);
 
 std::string HandleCfxLogin();
 
-bool g_launchDone;
+volatile bool g_launchDone;
+
+#ifdef ROS_2037
+constexpr const int ViewMsg_NavigateTo = 0x1000A;
+constexpr const int ViewMsg_ExecuteJavascript = 0x1000B;
+constexpr const int ViewHostMsg_OnLoadingStateChanged = 0x20008;
+constexpr const int ViewHostMsg_OnWindowCreated = 0x20013;
+constexpr const int ViewHostMsg_OnLoadStart = 0x20006;
+constexpr const int ViewHostMsg_OnAddressBarChanged = 0x2000B;
+constexpr const int ViewHostMsg_OnLoadEnd = 0x20007;
+constexpr const int ViewHostMsg_OnJavascriptCallbackAsync = 0x20009;
+constexpr const int ViewHostMsg_OnJavascriptCallbackSync = 0x2000A;
+constexpr const int ViewHostMsg_CreateIpcChannel = 0x2001B;
+#else
+constexpr const int ViewMsg_NavigateTo = 0x1000A;
+constexpr const int ViewMsg_ExecuteJavascript = 0x1000B;
+constexpr const int ViewHostMsg_OnLoadingStateChanged = 0x2000B;
+constexpr const int ViewHostMsg_OnWindowCreated = 0x20016;
+constexpr const int ViewHostMsg_OnLoadStart = 0x20009;
+constexpr const int ViewHostMsg_OnAddressBarChanged = 0x2000E;
+constexpr const int ViewHostMsg_OnLoadEnd = 0x2000A;
+constexpr const int ViewHostMsg_OnJavascriptCallbackAsync = 0x2000C;
+constexpr const int ViewHostMsg_OnJavascriptCallbackSync = 0x2000D;
+constexpr const int ViewHostMsg_CreateIpcChannel = 0x20020;
+#endif
+
+extern void BackOffMtl();
 
 struct MyListener : public IPC::Listener, public IPC::MessageReplyDeserializer
 {
@@ -100,16 +126,16 @@ struct MyListener : public IPC::Listener, public IPC::MessageReplyDeserializer
 
 		std::vector<char> data((char*)payload, (char*)payload + payloadSize);
 
-		if (type == 0x1000a)
+		if (type == ViewMsg_NavigateTo)
 		{
 			iter.ReadString(&url);
 
-			IPC::SyncMessage outMsg(0x7FFFFFFF, 0x2001B, IPC::Message::PRIORITY_NORMAL, new MyListener());
+			IPC::SyncMessage outMsg(0x7FFFFFFF, ViewHostMsg_CreateIpcChannel, IPC::Message::PRIORITY_NORMAL, new MyListener());
 			initWindowReplyId = IPC::SyncMessage::GetMessageId(outMsg);
 
 			Write(outMsg);
 		}
-		else if (type == 0x1000b)
+		else if (type == ViewMsg_ExecuteJavascript)
 		{
 			// exec js
 			std::wstring js;
@@ -152,122 +178,176 @@ struct MyListener : public IPC::Listener, public IPC::MessageReplyDeserializer
 						"gta5"
 #elif defined(IS_RDR3)
 						"rdr2"
+#elif defined(GTA_NY)
+						"gta4"
 #else
 						""
 #endif
 						;
 
-					static bool verified;
 					static bool launched;
-					static bool verifying;
+					static bool installing;
+					static bool launching;
+					static bool didUpdate;
+					static bool signInComplete;
+					static bool signInComplete2;
 					static bool launchDone;
+					static std::string updateState;
+					static HANDLE updateStateEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+
+					auto checkInstall = [this, targetTitle]()
+					{
+						if (signInComplete && installing)
+						{
+							child->SendJSCallback("RGSC_RAISE_UI_EVENT", json::object({ { "EventId", 2 }, // LauncherV3UiEvent
+
+																						{ "Data", json::object({ { "Action", "Install" },
+																								{ "Parameter", json::object({ { "titleName", targetTitle },
+																												{ "location", "C:\\Program Files\\Rockstar Games\\Games" },
+																												{ "desktopShortcut", false },
+																												{ "startMenuShortcut", false } }) } }) } })
+																			.dump());
+
+							signInComplete = false;
+						}
+					};
+
+					auto checkLaunch = [this, targetTitle]()
+					{
+						if (updateState != "notUpdating")
+						{
+							return;
+						}
+
+						if (signInComplete2 && !launched && launching)
+						{
+							launched = true;
+
+							std::thread([this, targetTitle]()
+							{
+								// this timer *should* never actually get hit, but it's a safeguard from 'eternal stuckness'
+								WaitForSingleObject(updateStateEvent, 12500);
+
+								for (int i = 0; i < 4; i++)
+								{
+									if (launchDone || g_launchDone)
+									{
+										break;
+									}
+
+									if (updateState != "notUpdating")
+									{
+										i--;
+										Sleep(500);
+										continue;
+									}
+
+									child->SendJSCallback("RGSC_SET_CLOUD_SAVE_ENABLED", json::object({ { "Enabled", false },
+																									  { "RosTitleName", targetTitle } })
+																						 .dump());
+
+									child->SendJSCallback("RGSC_RAISE_UI_EVENT", json::object({ { "EventId", 2 }, // LauncherV3UiEvent
+
+																							  { "Data", json::object({ { "Action", "Launch" },
+																										{ "Parameter", json::object({ { "titleName", targetTitle },
+																													   { "args", "" } }) } }) } })
+																				 .dump());
+
+									Sleep(10000);
+								}
+							})
+							.detach();
+						}
+					};
 
 					for (json& cmd : j["Commands"])
 					{
 						auto c = cmd.value("Command", "");
 						const json& p = cmd["Parameter"];
 
-						trace("SC JS message: %s -> %s\n", c, p.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace));
+						// additional suffix info
+						std::string pinfo;
 
+						if (c == "SetTitleInfo")
+						{
+							pinfo = fmt::sprintf(" (%s)", p.value("titleName", ""));
+						}
+
+						trace("SC JS message: %s%s -> %s\n", c, pinfo, p.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace));
+
+						// main command loop
 						if (c == "SetGameLaunchState")
 						{
 							if (p.value("launchState", "") == "failed")
 							{
+								BackOffMtl();
+
 								FatalError("Failed to launch through MTL.");
 							}
 
 							launchDone = true;
 						}
+						else if (c == "SignInComplete")
+						{
+#if 0
+							child->SendJSCallback("RGSC_RAISE_UI_EVENT", json::object({ { "EventId", 2 }, // LauncherV3UiEvent
 
-						if (c == "SetTitleInfo") {
+																					  {
+																					  "Data", json::object({ { "Action", "UpdateSetting" },
+																							  { "Parameter", json::object({ { "titles", json::object({ { std::string{ targetTitle }, json::object({ { "autoUpdate", false } }) } }) } }) } }) } })
+																		 .dump());
+#endif
+
+							child->SendJSCallback("RGSC_RAISE_UI_EVENT", json::object({ { "EventId", 2 }, // LauncherV3UiEvent
+
+																					  { "Data", json::object({ { "Action", "EnableDownloading" } }) } })
+																		 .dump());
+
+							signInComplete = true;
+							checkInstall();
+
+							signInComplete2 = true;
+							checkLaunch();
+						}
+						else if (c == "SetTitleInfo") {
 							if (p.value("titleName", "") == targetTitle) {
-								if (p["status"].value("entitlement", false) && !p["status"].value("install", false) && !verified) {
-									if (!verifying) {
-										child->SendJSCallback("RGSC_RAISE_UI_EVENT", json::object({
-											{ "EventId", 2 }, // LauncherV3UiEvent
+								updateState = p["status"].value("updateState", "");
 
-											{"Data", json::object({
-												{"Action", "Install"},
-												{"Parameter", json::object({
-													{"titleName", targetTitle},
-													{"location", "C:\\Program Files\\Rockstar Games\\Red Dead Redemption 2"},
-													{"desktopShortcut", false},
-													{"startMenuShortcut", false}
-												})}
-											})}
-											}).dump());
-
-										verifying = true;
-									}
-
-									if (p["status"].value("updateState", "") == "starting")
+								if (signInComplete2)
+								{
+									if (p["status"].value("updateState", "") == "updateQueued" ||
+										p["status"].value("updateState", "") == "starting")
 									{
-										Sleep(500);
-
-										child->SendJSCallback("RGSC_RAISE_UI_EVENT", json::object({
-											{ "EventId", 2 }, // LauncherV3UiEvent
-
-											{"Data", json::object({
-												{"Action", "Verify"},
-												{"Parameter", json::object({
-													{"titleName", targetTitle},
-												})}
-											})}
-											}).dump());
+										didUpdate = true;
+									}
+									else if (didUpdate && p["status"].value("updateState", "") == "notUpdating")
+									{
+										SetEvent(updateStateEvent);
 									}
 								}
-								else if (p["status"].value("install", false) && (p["status"].value("updateState", "") == "notUpdating" || p["status"].value("updateState", "") == "updateQueued"))
-								{
-									if (verified && !launched)
-									{
-										launched = true;
 
-										for (int i = 0; i < 3; i++)
-										{
-											if (launchDone || g_launchDone)
-											{
-												break;
-											}
-
-											child->SendJSCallback("RGSC_SET_CLOUD_SAVE_ENABLED", json::object({
-												{ "Enabled", false },
-												{ "RosTitleName", targetTitle }
-												}).dump());
-
-											child->SendJSCallback("RGSC_RAISE_UI_EVENT", json::object({
-												{ "EventId", 2 }, // LauncherV3UiEvent
-
-												{"Data", json::object({
-													{"Action", "Launch"},
-													{"Parameter", json::object({
-														{"titleName", targetTitle},
-														{"args", ""}
-													})}
-												})}
-												}).dump());
-
-											Sleep(5000);
-										}
-									}
-									else if (!verified)
-									{
-										child->SendJSCallback("RGSC_RAISE_UI_EVENT", json::object({
-											{ "EventId", 2 }, // LauncherV3UiEvent
-
-											{"Data", json::object({
-												{"Action", "Verify"},
-												{"Parameter", json::object({
-													{"titleName", targetTitle},
-													{"args", ""}
-												})}
-											})}
-											}).dump());
-									}
+								if (p["status"].value("entitlement", false) && !p["status"].value("install", false) &&
+									p["status"].value("releaseState", "preload") == "available") {
+									installing = true;
+									checkInstall();
 								}
-								
-								if (p["status"].value("updateState", "") == "verifying")
+								else if (p["status"].value("install", false) &&
+									(p["status"].value("updateState", "") == "notUpdating" ||
+										p["status"].value("updateState", "") == "updateQueued" ||
+										p["status"].value("updateState", "") == "verifyQueued"))
 								{
-									verified = true;
+									launching = true;
+									checkLaunch();
+								}
+								else if (p["status"].value("install", false) && p["status"].value("updateState", "") == "updatePaused")
+								{
+									Sleep(150);
+
+									child->SendJSCallback("RGSC_RAISE_UI_EVENT", json::object({ { "EventId", 2 }, // LauncherV3UiEvent
+
+																							  { "Data", json::object({ { "Action", "Update" },
+																										{ "Parameter", json::object({ { "titleName", targetTitle } }) } }) } })
+																				 .dump());
 								}
 							}
 						}
@@ -279,8 +359,16 @@ struct MyListener : public IPC::Listener, public IPC::MessageReplyDeserializer
 				}
 			}
 		}
+		else if (type == 0x1000c) // ViewMsg_AddBindOnStartLoading
+		{
+			std::wstring js;
+			iter.ReadString16(&js);
+			bool b;
+			iter.ReadBool(&b);
+		}
 		else if (type == 0xfffffff0)
 		{
+
 			int replyId;
 			iter.ReadInt(&replyId);
 
@@ -292,14 +380,14 @@ struct MyListener : public IPC::Listener, public IPC::MessageReplyDeserializer
 				child = RunListener(ToWide(str));
 
 				{
-					IPC::Message outMsg(1, 0x20008, IPC::Message::PRIORITY_NORMAL);
+					IPC::Message outMsg(1, ViewHostMsg_OnLoadingStateChanged, IPC::Message::PRIORITY_NORMAL);
 					outMsg.WriteInt(1);
 
 					Write(outMsg);
 				}
 
 				{
-					IPC::Message outMsg(1, 0x20013, IPC::Message::PRIORITY_NORMAL);
+					IPC::Message outMsg(1, ViewHostMsg_OnWindowCreated, IPC::Message::PRIORITY_NORMAL);
 					outMsg.WriteInt64(0); // hwnd
 					outMsg.WriteInt64(0); // more hwnd
 
@@ -307,7 +395,7 @@ struct MyListener : public IPC::Listener, public IPC::MessageReplyDeserializer
 				}
 
 				{
-					IPC::Message outMsg(1, 0x20006, IPC::Message::PRIORITY_NORMAL);
+					IPC::Message outMsg(1, ViewHostMsg_OnLoadStart, IPC::Message::PRIORITY_NORMAL);
 					outMsg.WriteString(url);
 					outMsg.WriteInt(1);
 					outMsg.WriteInt(1);
@@ -316,14 +404,14 @@ struct MyListener : public IPC::Listener, public IPC::MessageReplyDeserializer
 				}
 
 				{
-					IPC::Message outMsg(1, 0x2000B, IPC::Message::PRIORITY_NORMAL);
+					IPC::Message outMsg(1, ViewHostMsg_OnAddressBarChanged, IPC::Message::PRIORITY_NORMAL);
 					outMsg.WriteString(url);
 
 					Write(outMsg);
 				}
 
 				{
-					IPC::Message outMsg(1, 0x20007, IPC::Message::PRIORITY_NORMAL);
+					IPC::Message outMsg(1, ViewHostMsg_OnLoadEnd, IPC::Message::PRIORITY_NORMAL);
 					outMsg.WriteString(url);
 					outMsg.WriteInt(1);
 					outMsg.WriteInt(200);
@@ -332,7 +420,7 @@ struct MyListener : public IPC::Listener, public IPC::MessageReplyDeserializer
 				}
 
 				{
-					IPC::Message outMsg(1, 0x20008, IPC::Message::PRIORITY_NORMAL);
+					IPC::Message outMsg(1, ViewHostMsg_OnLoadingStateChanged, IPC::Message::PRIORITY_NORMAL);
 					outMsg.WriteInt(0);
 
 					Write(outMsg);
@@ -376,7 +464,7 @@ struct MyListener : public IPC::Listener, public IPC::MessageReplyDeserializer
 
 	void SendJSCallback(const std::string& name, const std::string& json)
 	{
-		IPC::Message outMsg(1, 0x20009, IPC::Message::PRIORITY_NORMAL);
+		IPC::Message outMsg(1, ViewHostMsg_OnJavascriptCallbackAsync, IPC::Message::PRIORITY_NORMAL);
 		outMsg.WriteString16(ToWide(name));
 		outMsg.WriteString16(ToWide(json));
 
@@ -388,7 +476,7 @@ struct MyListener : public IPC::Listener, public IPC::MessageReplyDeserializer
 
 	void SendJSSync(const std::string& name, const std::string& json, const std::function<void(bool, const std::string&)>& fn)
 	{
-		IPC::SyncMessage outMsg(1, 0x2000A, IPC::Message::PRIORITY_NORMAL, new MyListener());
+		IPC::SyncMessage outMsg(1, ViewHostMsg_OnJavascriptCallbackSync, IPC::Message::PRIORITY_NORMAL, new MyListener());
 		outMsg.WriteString16(ToWide(name));
 		outMsg.WriteString16(ToWide(json));
 
@@ -480,7 +568,7 @@ static MyListener* RunListener(const std::wstring& a)
 		{
 			DWORD bytesRead = 0;
 			uint8_t data[2048];
-
+			
 			OVERLAPPED overlapped = { 0 };
 			overlapped.hEvent = ev;
 

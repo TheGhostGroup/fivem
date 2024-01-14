@@ -11,14 +11,9 @@ end
 
 return function()
 	filter {}
-	configuration {}
-	
-	local jexlEvalDir = path.getabsolute(_ROOTPATH .. '/../ext/jexl-eval/target/release/')
-	
-	if os.isdir(jexlEvalDir) then
-		libdirs { jexlEvalDir }
-		links { 'cfx_jexl_eval' }
-		
-		includedirs { path.getabsolute(jexlEvalDir .. '/../../') }
-	end
+	add_dependencies { 'vendor:folly' }
+
+	removefiles {
+		'components/citizen-server-impl/src/state/**'
+	}
 end

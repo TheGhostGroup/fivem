@@ -19,11 +19,43 @@
 
 #include <Hooking.h>
 
+#include <EntitySystem.h>
+#include <scrEngine.h>
+
+#include <ExceptionToModuleHelper.h>
+
 extern NetLibrary* g_netLibrary;
 
 #include <nutsnbolts.h>
 
 #include <concurrentqueue.h>
+
+static LONG ShouldHandleUnwind(DWORD exceptionCode, uint64_t identifier)
+{
+	// C++ exceptions?
+	if (exceptionCode == 0xE06D7363)
+	{
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+
+template<typename THandler, typename TContext>
+static inline void CallHandler(const THandler& handler, uint64_t nativeIdentifier, TContext& context)
+{
+	// call the original function
+	static void* exceptionAddress;
+
+	__try
+	{
+		handler(context);
+	}
+	__except (exceptionAddress = (GetExceptionInformation())->ExceptionRecord->ExceptionAddress, ShouldHandleUnwind((GetExceptionInformation())->ExceptionRecord->ExceptionCode, nativeIdentifier))
+	{
+		throw std::exception(va("Error executing native 0x%016llx at address %s.", nativeIdentifier, FormatModuleAddress(exceptionAddress)));
+	}
+}
 
 static std::shared_ptr<RpcConfiguration> g_rpcConfiguration;
 
@@ -47,26 +79,33 @@ private:
 	fx::Resource* m_resource;
 };
 
-class RpcNextTickQueue : public fwRefCountable, public fx::IAttached<fx::Resource>
+class RpcNextTickQueue : public fwRefCountable, public fx::IAttached<fx::ResourceManager>
 {
 private:
 	struct QueuedEvent
 	{
+		std::string resource;
 		std::function<void()> fn;
 		std::function<bool()> cond;
 	};
 
 public:
-	virtual void AttachToObject(fx::Resource* resource) override
+	virtual void AttachToObject(fx::ResourceManager* resourceManager) override
 	{
-		resource->OnTick.Connect([=]()
+		resourceManager->OnTick.Connect([=]()
 		{
 			QueuedEvent entry;
 			std::unique_ptr<std::queue<QueuedEvent>> pushQueue;
 
 			while (m_queue.try_dequeue(entry))
 			{
-				ResourceActivationScope activationScope(resource);
+				auto resource = resourceManager->GetResource(entry.resource);
+				if (!resource.GetRef() || resource->GetState() != fx::ResourceState::Started)
+				{
+					continue;
+				}
+
+				ResourceActivationScope activationScope(resource.GetRef());
 
 				if (entry.cond && !entry.cond())
 				{
@@ -86,9 +125,16 @@ public:
 			{
 				while (!pushQueue->empty())
 				{
-					ResourceActivationScope activationScope(resource);
-
 					auto& entry = pushQueue->front();
+
+					auto resource = resourceManager->GetResource(entry.resource);
+					if (!resource.GetRef())
+					{
+						continue;
+					}
+
+					ResourceActivationScope activationScope(resource.GetRef());
+
 					m_queue.enqueue(std::move(entry));
 
 					pushQueue->pop();
@@ -97,9 +143,9 @@ public:
 		});
 	}
 
-	void Enqueue(const std::function<void()>& fn, const std::function<bool()>& condition = {})
+	void Enqueue(fx::Resource* resource, const std::function<void()>& fn, const std::function<bool()>& condition = {})
 	{
-		m_queue.enqueue({ fn, condition });
+		m_queue.enqueue({ resource->GetName(), fn, condition });
 	}
 
 private:
@@ -153,16 +199,20 @@ std::map<int, uint32_t> g_objectIdToCreationToken;
 
 static hook::cdecl_stub<void*(int handle)> getScriptEntity([]()
 {
+#if GTA_FIVE
 	return hook::pattern("44 8B C1 49 8B 41 08 41 C1 F8 08 41 38 0C 00").count(1).get(0).get<void>(-12);
+#elif IS_RDR3
+	return hook::pattern("45 8B C1 41 C1 F8 08 45 38 0C 00 75 ? 8B 42 ? 41 0F AF C0").count(1).get(0).get<void>(-81);
+#endif
 });
 
 extern int getPlayerId();
 
 static InitFunction initFunction([]()
 {
-	fx::Resource::OnInitializeInstance.Connect([](fx::Resource* resource)
+	fx::ResourceManager::OnInitializeInstance.Connect([](fx::ResourceManager* resourceManager)
 	{
-		resource->SetComponent(new RpcNextTickQueue());
+		resourceManager->SetComponent(new RpcNextTickQueue());
 	});
 
 	OnGameFrame.Connect([]()
@@ -182,7 +232,12 @@ static InitFunction initFunction([]()
 			{
 				g_se.AddRef();
 
+				// REDM1S: implement rpc natives
+//#ifdef GTA_FIVE
 				g_rpcConfiguration = RpcConfiguration::Load("citizen:/scripting/rpc_natives.json");
+//#elif IS_RDR3
+				//g_rpcConfiguration = RpcConfiguration::Load("citizen:/scripting/rpc_natives_rdr3.json");
+//#endif
 
 				g_netLibrary->AddReliableHandler("msgRpcEntityCreation", [](const char* data, size_t len)
 				{
@@ -196,6 +251,7 @@ static InitFunction initFunction([]()
 
 				g_netLibrary->AddReliableHandler("msgRpcNative", [](const char* data, size_t len)
 				{
+					static auto getByServerId = fx::ScriptEngine::GetNativeHandler(HashString("GET_PLAYER_FROM_SERVER_ID"));
 					std::shared_ptr<net::Buffer> buf = std::make_shared<net::Buffer>(reinterpret_cast<const uint8_t*>(data), len);
 
 					auto nativeHash = buf->Read<uint64_t>();
@@ -264,7 +320,7 @@ static InitFunction initFunction([]()
 					if (resource)
 					{
 						// gather conditions
-						auto ntq = resource->GetComponent<RpcNextTickQueue>();
+						auto ntq = manager->GetComponent<RpcNextTickQueue>();
 
 						int i = 0;
 
@@ -277,7 +333,15 @@ static InitFunction initFunction([]()
 							{
 							case RpcConfiguration::ArgumentType::Player:
 							{
-								buf->Read<uint8_t>();
+								if (icgi->NetProtoVersion >= 0x202103030422)
+								{
+									buf->Read<uint16_t>();
+								}
+								else
+								{
+									buf->Read<uint8_t>();
+								}
+
 								break;
 							}
 							case RpcConfiguration::ArgumentType::ObjRef:
@@ -316,39 +380,52 @@ static InitFunction initFunction([]()
 							case RpcConfiguration::ArgumentType::Hash:
 							{
 								uint32_t hash = buf->Read<int>();
+								rage::fwModelId idx; // unused
 
-								if (native->GetRpcType() == RpcConfiguration::RpcType::EntityCreate)
+								if (native->GetRpcType() == RpcConfiguration::RpcType::EntityCreate || rage::fwArchetypeManager::GetArchetypeFromHashKey(hash, idx))
 								{
-									ntq->Enqueue([=]()
+									ntq->Enqueue(resource, [=]()
 									{
-										const uint64_t REQUEST_MODEL_GTA5 = 0x963D27A58DF860AC;
+#ifdef GTA_FIVE
+										const uint64_t REQUEST_MODEL = 0x963D27A58DF860AC;
+#elif IS_RDR3
+										const uint64_t REQUEST_MODEL = 0xFA28FE3A6246FC30;
+#endif
 
 										fx::ScriptContextBuffer reqCtx;
 										reqCtx.Push(hash);
 
-										(*fx::ScriptEngine::GetNativeHandler(REQUEST_MODEL_GTA5))(reqCtx);
+										(*fx::ScriptEngine::GetNativeHandler(REQUEST_MODEL))(reqCtx);
 									});
 
 									conditions.push_back([=]()
 									{
-										const uint64_t HAS_MODEL_LOADED_GTA5 = 0x98A4EB5D89A0C952;
+#ifdef GTA_FIVE
+										const uint64_t HAS_MODEL_LOADED = 0x98A4EB5D89A0C952;
+#elif IS_RDR3
+										const uint64_t HAS_MODEL_LOADED = 0x1283B8B89DD5D1B6;
+#endif
 
 										fx::ScriptContextBuffer loadedCtx;
 										loadedCtx.Push(hash);
 
-										(*fx::ScriptEngine::GetNativeHandler(HAS_MODEL_LOADED_GTA5))(loadedCtx);
+										(*fx::ScriptEngine::GetNativeHandler(HAS_MODEL_LOADED))(loadedCtx);
 
 										return loadedCtx.GetResult<bool>();
 									});
 
 									afterCallbacks.push_back([=]()
 									{
-										const uint64_t SET_MODEL_AS_NO_LONGER_NEEDED_GTA5 = 0xE532F5D78798DAAB;
+#ifdef GTA_FIVE
+										const uint64_t SET_MODEL_AS_NO_LONGER_NEEDED = 0xE532F5D78798DAAB;
+#elif IS_RDR3
+										const uint64_t SET_MODEL_AS_NO_LONGER_NEEDED = 0x4AD96EF928BD4F9A;
+#endif
 
 										fx::ScriptContextBuffer releaseCtx;
 										releaseCtx.Push(hash);
 
-										(*fx::ScriptEngine::GetNativeHandler(SET_MODEL_AS_NO_LONGER_NEEDED_GTA5))(releaseCtx);
+										(*fx::ScriptEngine::GetNativeHandler(SET_MODEL_AS_NO_LONGER_NEEDED))(releaseCtx);
 									});
 								}
 
@@ -389,7 +466,7 @@ static InitFunction initFunction([]()
 						}
 
 						// execute native
-						ntq->Enqueue([=]()
+						ntq->Enqueue(resource, [=]()
 						{
 							buf->Seek(startPosition);
 
@@ -404,8 +481,23 @@ static InitFunction initFunction([]()
 								{
 								case RpcConfiguration::ArgumentType::Player:
 								{
-									int id = buf->Read<uint8_t>();
-									executionCtx->Push(uint32_t(id));
+									if (icgi->NetProtoVersion >= 0x202103030422)
+									{
+										uint32_t netId = buf->Read<uint16_t>();
+										auto playerId = FxNativeInvoke::Invoke<uint32_t>(getByServerId, netId);
+
+										if (playerId == 0xFFFFFFFF)
+										{
+											return;
+										}
+
+										executionCtx->Push(playerId);
+									}
+									else
+									{
+										int id = buf->Read<uint8_t>();
+										executionCtx->Push(uint32_t(id));
+									}
 
 									break;
 								}
@@ -462,7 +554,15 @@ static InitFunction initFunction([]()
 
 							if (n)
 							{
-								(*n)(*executionCtx);
+								try
+								{
+									CallHandler(*n, nativeHash, *executionCtx);
+								}
+								catch (std::exception& e)
+								{
+									trace("failure executing native rpc: %s\n", e.what());
+									return;
+								}
 
 								if (native->GetRpcType() == RpcConfiguration::RpcType::EntityCreate)
 								{
@@ -476,7 +576,7 @@ static InitFunction initFunction([]()
 
 										if (object)
 										{
-											auto obj = object->objectId;
+											auto obj = object->GetObjectId();
 
 											g_creationTokenToObjectId[creationToken] = (1 << 16) | obj;
 

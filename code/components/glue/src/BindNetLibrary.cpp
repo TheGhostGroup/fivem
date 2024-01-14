@@ -24,9 +24,11 @@ static InitFunction initFunction([] ()
 {
 	seGetCurrentContext()->AddAccessControlEntry(se::Principal{ "system.internal" }, se::Object{ "builtin" }, se::AccessType::Allow);
 
+	static NetLibrary* netLibrary;
+
 	NetLibrary::OnNetLibraryCreate.Connect([] (NetLibrary* library)
 	{
-		static NetLibrary* netLibrary = library;
+		netLibrary = library;
 		static std::string netLibWarningMessage;
 		static std::mutex netLibWarningMessageLock;
 
@@ -91,13 +93,36 @@ static InitFunction initFunction([] ()
 			Instance<ICoreGameInit>::Get()->ClearVariable("localMode");
 		});
 
+		static std::vector<std::string> convarsCreatedByServer;
+		static std::vector<std::string> convarsModifiedByServer;
+
 		OnKillNetworkDone.Connect([=]()
 		{
-			library->FinalizeDisconnect();
+			library->Disconnect();
 
-			console::GetDefaultContext()->GetVariableManager()->RemoveVariablesWithFlag(ConVar_Replicated);
+			// Remove ConVars created by the server
+			for (const std::string& convarName : convarsCreatedByServer)
+			{
+				console::GetDefaultContext()->GetVariableManager()->Unregister(convarName);
+			}
+
+			auto varManager = console::GetDefaultContext()->GetVariableManager();
+			// Revert values modified by server back to their old values
+			for (const std::string& convarName : convarsModifiedByServer)
+			{
+				auto convar = varManager->FindEntryRaw(convarName);
+				// We don't want to reset convars that are defaulted to ConVar_Replicated (i.e. game_enableFlyThroughWindscreen)
+				if (convar && !(varManager->GetEntryDefaultFlags(convarName) & ConVar_Replicated))
+				{
+					varManager->RemoveEntryFlags(convarName, ConVar_Replicated);
+					convar->SetValue(convar->GetOfflineValue());
+				}
+			}
+			convarsCreatedByServer.clear();
+			convarsModifiedByServer.clear();
 		});
 
+		// Process ConVar values sent from the server
 		library->AddReliableHandler("msgConVars", [](const char* buf, size_t len)
 		{
 			auto unpacked = msgpack::unpack(buf, len);
@@ -106,9 +131,30 @@ static InitFunction initFunction([] ()
 			se::ScopedPrincipal principalScope(se::Principal{ "system.console" });
 			se::ScopedPrincipal principalScopeInternal(se::Principal{ "system.internal" });
 
-			// set variable
 			for (const auto& conVar : conVars)
 			{
+				auto convar = console::GetDefaultContext()->GetVariableManager()->FindEntryRaw(conVar.first);
+				if (convar)
+				{
+					auto flags = console::GetDefaultContext()->GetVariableManager()->GetEntryFlags(conVar.first);
+
+					if (flags & ConVar_UserPref)
+					{
+						console::DPrintf("net", "Blocked convar %s from being set by server.\n", conVar.first);
+						continue;
+					}
+
+					// If the value is not already from the server
+					if (!(flags & ConVar_Replicated))
+					{
+						convar->SaveOfflineValue();	
+					}
+					convarsModifiedByServer.push_back(conVar.first);
+				}
+				else
+				{
+					convarsCreatedByServer.push_back(conVar.first);
+				}
 				console::GetDefaultContext()->ExecuteSingleCommandDirect(ProgramArguments{ "setr", conVar.first, conVar.second });
 			}
 		}, true);
@@ -117,12 +163,17 @@ static InitFunction initFunction([] ()
 	Instance<ICoreGameInit>::Get()->OnGameRequestLoad.Connect([]()
 	{
 		nui::SetMainUI(false);
-
 		nui::DestroyFrame("mpMenu");
+
+		auto context = (netLibrary->GetConnectionState() != NetLibrary::CS_IDLE) ? ("server_" + netLibrary->GetTargetContext()) : "game";
+		nui::SwitchContext(context);
 	});
 
+	// #TODOLIBERTY: ?
+#ifndef GTA_NY
 	OnFirstLoadCompleted.Connect([] ()
 	{
 		g_gameInit.SetGameLoaded();
 	});
+#endif
 });

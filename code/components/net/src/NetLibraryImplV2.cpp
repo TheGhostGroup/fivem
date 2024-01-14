@@ -34,16 +34,16 @@ public:
 
 	virtual void Flush() override;
 
-	virtual void SendConnect(const std::string& connectData) override;
+	virtual void SendConnect(const std::string& m_token, const std::string& connectData) override;
 
 	virtual bool IsDisconnected() override;
 
 	virtual int32_t GetPing() override;
 
+	virtual int32_t GetVariance() override;
+
 private:
 	void ProcessPacket(const uint8_t* data, size_t size, NetPacketMetrics& metrics, ENetPacketFlag flags);
-
-	void SendPacketQueue();
 
 private:
 	std::string m_connectData;
@@ -153,8 +153,18 @@ void NetLibraryImplV2::SendData(const NetAddress& netAddress, const char* data, 
 	enet_socket_send(m_host->socket, &addr, &buffer, 1);
 }
 
+extern int g_serverVersion;
+
 bool NetLibraryImplV2::HasTimedOut()
 {
+	if (!m_serverPeer)
+	{
+		if (g_serverVersion >= 3419)
+		{
+			return true;
+		}
+	}
+
 	return m_timedOut;
 }
 
@@ -170,6 +180,8 @@ void NetLibraryImplV2::Reset()
 	if (m_serverPeer)
 	{
 		enet_peer_disconnect(m_serverPeer, 0);
+		Flush();
+		Flush();
 	}
 }
 
@@ -303,13 +315,16 @@ void NetLibraryImplV2::RunFrame()
 	}
 }
 
-void NetLibraryImplV2::SendConnect(const std::string& connectData)
+void NetLibraryImplV2::SendConnect(const std::string& token, const std::string& connectData)
 {
 	m_timedOut = false;
 	m_connectData = connectData;
 
 	auto addr = m_base->GetCurrentServer().GetENetAddress();
-	m_serverPeer = enet_host_connect(m_host, &addr, 2, 0);
+	m_serverPeer = enet_host_connect(m_host, &addr, 2, HashString(token.c_str()));
+
+	// all-but-disable the backoff-based timeout, and set the hard timeout to 30 seconds (equivalent to server-side check!)
+	enet_peer_timeout(m_serverPeer, 10000000, 10000000, 30000);
 
 #ifdef _DEBUG
 	//enet_peer_timeout(m_serverPeer, 86400 * 1000, 86400 * 1000, 86400 * 1000);
@@ -433,6 +448,16 @@ int32_t NetLibraryImplV2::GetPing()
 	if (m_serverPeer)
 	{
 		return int32_t(m_serverPeer->roundTripTime);
+	}
+
+	return -1;
+}
+
+int32_t NetLibraryImplV2::GetVariance()
+{
+	if (m_serverPeer)
+	{
+		return int32_t(m_serverPeer->roundTripTimeVariance);
 	}
 
 	return -1;

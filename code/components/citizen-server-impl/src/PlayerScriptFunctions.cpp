@@ -13,9 +13,6 @@
 
 #include <MakeClientFunction.h>
 
-#include <state/ServerGameState.h>
-
-
 static void CreatePlayerCommands();
 
 static InitFunction initFunction([]()
@@ -31,6 +28,13 @@ static void CreatePlayerCommands()
 	fx::ScriptEngine::RegisterNativeHandler("GET_PLAYER_NAME", MakeClientFunction([](fx::ScriptContext& context, const fx::ClientSharedPtr& client)
 	{
 		return client->GetName().c_str();
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("DOES_PLAYER_EXIST", MakeClientFunction([](fx::ScriptContext& context, const fx::ClientSharedPtr& client)
+	{
+		auto matchID = atoi(context.CheckArgument<const char*>(0));
+
+		return client->GetNetId() == matchID;
 	}));
 
 	fx::ScriptEngine::RegisterNativeHandler("GET_PLAYER_GUID", MakeClientFunction([](fx::ScriptContext& context, const fx::ClientSharedPtr& client)
@@ -53,6 +57,39 @@ static void CreatePlayerCommands()
 		}
 
 		return client->GetIdentifiers()[idx].c_str();
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_PLAYER_IDENTIFIER_BY_TYPE", MakeClientFunction([](fx::ScriptContext& context, const fx::ClientSharedPtr& client)
+	{
+		const std::vector<std::string>& identifiers = client->GetIdentifiers();
+		std::string_view identifierType = context.CheckArgument<const char*>(1);
+
+		for (int i = 0; i < identifiers.size(); ++i)
+		{
+			if (identifiers[i].rfind(identifierType, 0) != std::string::npos)
+			{
+				return identifiers[i].c_str();
+			}
+		}
+
+		return (const char*)nullptr;
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_NUM_PLAYER_TOKENS", MakeClientFunction([](fx::ScriptContext& context, const fx::ClientSharedPtr& client)
+	{
+		return client->GetTokens().size();
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_PLAYER_TOKEN", MakeClientFunction([](fx::ScriptContext& context, const fx::ClientSharedPtr& client)
+	{
+		int idx = context.GetArgument<int>(1);
+
+		if (idx < 0 || idx >= client->GetTokens().size())
+		{
+			return (const char*)nullptr;
+		}
+
+		return client->GetTokens()[idx].c_str();
 	}));
 
 	fx::ScriptEngine::RegisterNativeHandler("GET_PLAYER_ENDPOINT", MakeClientFunction([](fx::ScriptContext& context, const fx::ClientSharedPtr& client)
@@ -196,94 +233,11 @@ static void CreatePlayerCommands()
 	{
 		try
 		{
-			return std::any_cast<uint32_t>(client->GetData("playerEntity"));
+			return fx::AnyCast<uint32_t>(client->GetData("playerEntity"));
 		}
 		catch (std::bad_any_cast&)
 		{
 			return 0;
 		}
-	}));
-
-	fx::ScriptEngine::RegisterNativeHandler("GET_PLAYER_WANTED_LEVEL", MakeClientFunction([](fx::ScriptContext& context, const fx::ClientSharedPtr& client)
-	{
-		// get the current resource manager
-		auto resourceManager = fx::ResourceManager::GetCurrent();
-
-		// get the owning server instance
-		auto instance = resourceManager->GetComponent<fx::ServerInstanceBaseRef>()->Get();
-
-		// get the server's game state
-		auto gameState = instance->GetComponent<fx::ServerGameState>();
-		
-		try
-		{
-			auto entity = gameState->GetEntity(std::any_cast<uint32_t>(client->GetData("playerEntity")));
-
-			auto node = entity->syncTree->GetPlayerWantedAndLOS();
-			
-			return node ? node->wantedLevel : 0;
-		}
-		catch (std::bad_any_cast&)
-		{
-			return 0;
-		}
-	}));
-
-	fx::ScriptEngine::RegisterNativeHandler("IS_PLAYER_EVADING_WANTED_LEVEL", MakeClientFunction([](fx::ScriptContext& context, const fx::ClientSharedPtr& client)
-	{
-		// get the current resource manager
-		auto resourceManager = fx::ResourceManager::GetCurrent();
-
-		// get the owning server instance
-		auto instance = resourceManager->GetComponent<fx::ServerInstanceBaseRef>()->Get();
-
-		// get the server's game state
-		auto gameState = instance->GetComponent<fx::ServerGameState>();
-
-		try
-		{
-			auto entity = gameState->GetEntity(std::any_cast<uint32_t>(client->GetData("playerEntity")));
-
-			auto node = entity->syncTree->GetPlayerWantedAndLOS();
-
-			return node ? node->isEvading : 0;
-		}
-		catch (std::bad_any_cast&)
-		{
-			return 0;
-		}
-	}));
-	
-	fx::ScriptEngine::RegisterNativeHandler("GET_PLAYER_TIME_IN_PURSUIT", MakeClientFunction([](fx::ScriptContext& context, const fx::ClientSharedPtr& client)
-	{
-		// get the current resource manager
-		auto resourceManager = fx::ResourceManager::GetCurrent();
-
-		// get the owning server instance
-		auto instance = resourceManager->GetComponent<fx::ServerInstanceBaseRef>()->Get();
-
-		// get the server's game state
-		auto gameState = instance->GetComponent<fx::ServerGameState>();
-
-		try
-		{
-			auto entity = gameState->GetEntity(std::any_cast<uint32_t>(client->GetData("playerEntity")));
-
-			auto node = entity->syncTree->GetPlayerWantedAndLOS();
-			bool prevPursuitArg = context.GetArgument<bool>(1);
-
-			if (node)
-				return prevPursuitArg ? node->timeInPrevPursuit : node->timeInPursuit;
-			else
-				return -1;
-		}
-		catch (std::bad_any_cast&) {
-			return -1;
-		}
-	}));
-
-	fx::ScriptEngine::RegisterNativeHandler("GET_PLAYER_UPDATE_CHANNEL", MakeClientFunction([](fx::ScriptContext& context, const fx::ClientSharedPtr& client)
-	{
-		return client->GetUpdateChannel().c_str();
 	}));
 }

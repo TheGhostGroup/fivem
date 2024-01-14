@@ -89,7 +89,7 @@ print("const _rf = Citizen.resultAsFloat();")
 print("const _rl = Citizen.resultAsLong();")
 print("const _s = Citizen.resultAsString();")
 print("const _rv = Citizen.resultAsVector();")
-print("const _ro = Citizen.resultAsObject();")
+print("const _ro = Citizen.resultAsObject2();")
 print("const _in = Citizen.invokeNativeByHash;")
 print("const _ii = Citizen.pointerValueIntInitialized;")
 print("const _fi = Citizen.pointerValueFloatInitialized;")
@@ -99,6 +99,11 @@ print("\tif (typeof hash === 'string') {")
 print("\t\treturn global.GetHashKey(hash);")
 print("\t}\n")
 print("\treturn hash;")
+print("}\n")
+
+print("function _obj(obj) {")
+print("\tconst s = msgpack_pack(obj);")
+print("\treturn [s, s.length];")
 print("}\n")
 
 print("function _ts(num) {")
@@ -112,7 +117,7 @@ print("\treturn num.toString();")
 print("}")
 
 print("function _fv(flt) {")
-print("\treturn flt + 0.0000001;")
+print("\treturn (flt === 0.0) ? flt : (flt + 0.0000001);")
 print("}\n")
 
 print("function _mfr(fn) {")
@@ -175,7 +180,9 @@ local function printArgument(argument, native)
 		return '_fv(' .. printArgumentName(argument.name) .. ')'
 	elseif argument.type.name == 'Hash' then
 		return '_ch(' .. printArgumentName(argument.name) .. ')'
-	elseif argument.type.name == 'charPtr' then
+	elseif argument.type.nativeType == 'object' then
+		return '...(_obj(' .. printArgumentName(argument.name) .. '))'
+	elseif argument.type.nativeType == 'string' then
 		return '_ts(' .. printArgumentName(argument.name) .. ')'
 	end
 
@@ -285,11 +292,6 @@ local function printNative(native)
 
 	local preCall = ''
 	local postCall = ''
-
-	if native.returns and native.returns.nativeType == 'object' then
-		preCall = 'global.msgpack_unpack('
-		postCall = ')'
-	end
 
 	str = str .. string.format("\treturn %s_in(%s)%s;\n", preCall, printInvocationArguments(native), postCall)
 

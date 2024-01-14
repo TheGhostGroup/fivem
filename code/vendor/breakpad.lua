@@ -1,22 +1,23 @@
+local crt = ...
+
 return {
 	include = function()
 		includedirs "../vendor/breakpad/src/"
 
-		configuration "linux"
+		if os.istarget('linux') then
 			includedirs { "vendor/breakpad/src/" }
-
-		configuration {}
+		end
 	end,
 
 	run = function()
 		language "C++"
 		kind "StaticLib"
 
-		if _OPTIONS['game'] ~= 'server' then
+		if _OPTIONS['game'] ~= 'server' and crt then
 			staticruntime 'On'
 		end
 
-		configuration "linux"
+		if os.istarget('linux') then
 			includedirs { "vendor/breakpad/src/" }
 
 			files_project "../vendor/breakpad/src/" {
@@ -46,8 +47,7 @@ return {
 				"common/convert_UTF.cc",
 				"common/linux/breakpad_getcontext.S",
 			}
-
-		configuration "windows"
+		else
 			files_project "../vendor/breakpad/src/" {
 				"client/windows/handler/exception_handler.cc",
 				"client/windows/crash_generation/client_info.cc",
@@ -58,5 +58,6 @@ return {
 				"common/windows/http_upload.cc",
 				"common/windows/string_utils.cc",
 			}
+		end
 	end
 }

@@ -6,7 +6,7 @@ static void** g_parser;
 
 static hook::cdecl_stub<rage::parStructure* (void* parser, uint32_t)> _parser_getStructure([]()
 {
-	return hook::get_pattern("74 30 44 0F B7 41 38 33 D2", -0xB);
+	return hook::get_call(hook::get_pattern("8B 10 E8 ? ? ? ? 4C 8D 5C 24", 2));
 });
 
 namespace rage
@@ -24,5 +24,5 @@ namespace rage
 
 static HookFunction hookFunction([]()
 {
-	g_parser = hook::get_address<void**>(hook::get_pattern("48 8B 0D ? ? ? ? 48 8D 54 24 48 41 B0 01", 3));
+	g_parser = hook::get_address<void**>(hook::get_pattern("45 33 C9 E8 ? ? ? ? 48 8B F0 48 85 C0 74", -18));
 });

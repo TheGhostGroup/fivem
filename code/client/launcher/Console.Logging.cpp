@@ -1,22 +1,11 @@
 #include <StdInc.h>
 #include <concurrentqueue.h>
 
-#include <fmt/time.h>
 #include <filesystem>
+#include <fmt/chrono.h>
 
 #include <HostSharedData.h>
-
-struct TickCountData
-{
-	uint64_t tickCount;
-	SYSTEMTIME initTime;
-
-	TickCountData()
-	{
-		tickCount = GetTickCount64();
-		GetSystemTime(&initTime);
-	}
-};
+#include "TickCountData.h"
 
 static std::string GetProcessName()
 {
@@ -56,10 +45,11 @@ static std::string GetProcessName()
 	return rv;
 }
 
+static auto _GetThreadDescription = (decltype(&GetThreadDescription))GetProcAddress(GetModuleHandle(L"kernel32.dll"), "GetThreadDescription");
+
 static std::string GetThreadName()
 {
-	static auto _GetThreadDescription = (decltype(&GetThreadDescription))GetProcAddress(GetModuleHandle(L"kernel32.dll"), "GetThreadDescription");
-	std::string rv = fmt::sprintf("%d", GetCurrentThreadId());
+	std::string rv = std::to_string(GetCurrentThreadId());
 
 	if (_GetThreadDescription)
 	{
@@ -87,12 +77,20 @@ static std::string GetThreadName()
 
 static void PerformFileLog(const std::tuple<std::string, std::string>& pair)
 {
-	static std::vector<char> lineBuffer(8192);
+	// non-deleted static pointer: process exit order, this vector has to outlive static destructors
+	static std::vector<char>* lineBuffer = new std::vector<char>(8192);
 	static size_t lineIndex;
 	static SRWLOCK logMutex = SRWLOCK_INIT;
 
-	static HostSharedData<TickCountData> initTickCount("CFX_SharedTickCount");
-	static std::string processName = GetProcessName();
+	static TickCountData initTickCountBacking = ([]()
+	{
+		HostSharedData<TickCountData> initTickCountRef("CFX_SharedTickCount");
+		return *initTickCountRef;
+	})();
+
+	auto initTickCount = &initTickCountBacking;
+
+	static std::string* processName = new std::string(GetProcessName());
 
 	{
 		AcquireSRWLockExclusive(&logMutex);
@@ -105,16 +103,16 @@ static void PerformFileLog(const std::tuple<std::string, std::string>& pair)
 				static fwPlatformString dateStamp = fmt::sprintf(L"%04d-%02d-%02dT%02d%02d%02d", initTickCount->initTime.wYear, initTickCount->initTime.wMonth,
 					initTickCount->initTime.wDay, initTickCount->initTime.wHour, initTickCount->initTime.wMinute, initTickCount->initTime.wSecond);
 
-				static fwPlatformString fp = MakeRelativeCitPath(fmt::sprintf(L"logs/CitizenFX_log_%s.log", dateStamp));
+				static fwPlatformString* fp = new fwPlatformString(MakeRelativeCitPath(fmt::sprintf(L"logs/CitizenFX_log_%s.log", dateStamp)));
 
-				FILE* logFile = _wfopen(fp.c_str(), L"ab");
+				FILE* logFile = _wfopen(fp->c_str(), L"ab");
 
 				if (logFile)
 				{
 					// null-terminate the string
-					lineBuffer[lineIndex] = '\0';
+					(*lineBuffer)[lineIndex] = '\0';
 
-					fmt::fprintf(logFile, "[%10lld] [%14s] %20s/ %s\r\n", GetTickCount64() - initTickCount->tickCount, processName, std::get<0>(pair), lineBuffer.data());
+					fmt::fprintf(logFile, "[%10lld] [%14s] %20s/ %s\r\n", GetTickCount64() - initTickCount->tickCount, *processName, std::get<0>(pair), lineBuffer->data());
 					fclose(logFile);
 				}
 
@@ -126,13 +124,13 @@ static void PerformFileLog(const std::tuple<std::string, std::string>& pair)
 			}
 
 			// append the character
-			lineBuffer[lineIndex] = *p;
+			(*lineBuffer)[lineIndex] = *p;
 			++lineIndex;
 
 			// overflow? if so, resize
-			if (lineIndex >= (lineBuffer.size() - 1))
+			if (lineIndex >= (lineBuffer->size() - 1))
 			{
-				lineBuffer.resize(lineBuffer.size() * 2);
+				lineBuffer->resize(lineBuffer->size() * 2);
 			}
 		}
 
@@ -144,7 +142,7 @@ static INIT_ONCE g_initLogFlag = INIT_ONCE_STATIC_INIT;
 static CONDITION_VARIABLE g_logCondVar = CONDITION_VARIABLE_INIT;
 static SRWLOCK g_logMutex = SRWLOCK_INIT;
 
-static moodycamel::ConcurrentQueue<std::tuple<std::string, std::string>> g_logPrintQueue;
+static moodycamel::ConcurrentQueue<std::tuple<std::string, std::string>>* g_logPrintQueue = new moodycamel::ConcurrentQueue<std::tuple<std::string, std::string>>();
 
 struct LoggerInit
 {
@@ -163,7 +161,7 @@ struct LoggerInit
 
 				std::tuple<std::string, std::string> str;
 
-				while (g_logPrintQueue.try_dequeue(str))
+				while (g_logPrintQueue->try_dequeue(str))
 				{
 					PerformFileLog(str);
 				}
@@ -181,7 +179,7 @@ extern "C" DLL_EXPORT void AsyncTrace(const char* string)
 {
 	std::string threadName = GetThreadName();
 
-	g_logPrintQueue.enqueue({ threadName, string });
+	g_logPrintQueue->enqueue({ threadName, string });
 	WakeAllConditionVariable(&g_logCondVar);
 }
 
@@ -196,6 +194,7 @@ void InitLogging()
 
 		CreateDirectory(MakeRelativeCitPath(L"logs/").c_str(), NULL);
 
+#if defined(LAUNCHER_PERSONALITY_MAIN)
 		SYSTEMTIME curTime;
 		GetSystemTime(&curTime);
 
@@ -228,6 +227,7 @@ void InitLogging()
 				}
 			}
 		}
+#endif
 
 		AsyncTrace(fmt::format("--- BEGIN LOGGING AT {:%c} ---\n", fmt::gmtime(time(NULL))).c_str());
 	}

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Resource.h>
+#include <VFSStream.h>
 
 namespace fx
 {
@@ -45,12 +46,16 @@ namespace fx
 
 		virtual void AttachToObject(fx::Resource* object) override;
 
+		virtual void SetCustomValidateFunction(std::function<void(Entry&, fwRefContainer<vfs::Stream>)> func);
+
+		void CheckSizes(int* numWarnings);
+
 	private:
 		bool ShouldUpdateSet();
 
 		bool UpdateSet();
 
-		void ValidateSize(std::string_view name, uint32_t physSize, uint32_t virtSize);
+		void ValidateSize(std::string_view name, uint32_t physSize, uint32_t virtSize, int* numWarnings);
 
 	private:
 		fx::Resource* m_resource;
@@ -58,6 +63,8 @@ namespace fx
 		std::map<std::string, RuntimeEntry> m_resourcePairs;
 
 		std::map<std::string, RuntimeEntry*> m_hashPairs;
+
+		std::function<void(Entry&, fwRefContainer<vfs::Stream>)> m_customValidateFunc;
 	};
 }
 

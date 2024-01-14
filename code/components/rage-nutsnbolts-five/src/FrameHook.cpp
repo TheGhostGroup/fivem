@@ -11,12 +11,17 @@
 #include <Hooking.h>
 
 #include <ICoreGameInit.h>
+#include <CrossBuildRuntime.h>
 
 fwEvent<> OnLookAliveFrame;
+fwEvent<> OnEarlyGameFrame;
 fwEvent<> OnGameFrame;
 fwEvent<> OnMainGameFrame;
 fwEvent<> OnCriticalGameFrame;
 fwEvent<> OnFirstLoadCompleted;
+
+fwEvent<> OnBeginGameFrame;
+fwEvent<> OnEndGameFrame;
 
 static int(*g_appState)(void* fsm, int state, void* unk, int type);
 
@@ -31,7 +36,17 @@ int DoAppState(void* fsm, int state, void* unk, int type)
 		firstLoadCompleted = true;
 	}
 
+	if (state == 2 && type == 1)
+	{
+		OnBeginGameFrame();
+	}
+
 	return g_appState(fsm, state, unk, type);
+}
+
+static void RunEndGameFrame()
+{
+	OnEndGameFrame();
 }
 
 static void WaitThing(int i)
@@ -47,12 +62,28 @@ static bool(*g_origLookAlive)();
 static uint32_t g_lastGameFrame;
 static uint32_t g_lastCriticalFrame;
 static std::mutex g_gameFrameMutex;
+static std::mutex g_earlyGameFrameMutex;
 static std::mutex g_criticalFrameMutex;
 static DWORD g_mainThreadId;
 static bool g_executedOnMainThread;
 
-static void DoGameFrame()
+// NOTE: depends indirectly on GameProfiling.cpp in gta:core!
+static bool g_safeGameFrame;
+
+extern "C" DLL_EXPORT void DoGameFrame()
 {
+	if (g_earlyGameFrameMutex.try_lock())
+	{
+		OnEarlyGameFrame();
+
+		g_earlyGameFrameMutex.unlock();
+	}
+
+	if (!g_safeGameFrame)
+	{
+		return;
+	}
+
 	if (g_gameFrameMutex.try_lock())
 	{
 		OnGameFrame();
@@ -80,36 +111,10 @@ static void DoGameFrame()
 
 static bool* g_isD3DInvalid;
 
-namespace rage
-{
-	static bool(**g_pProjectMainOrDoOneLoop)();
-}
-
-static bool(*g_origLoopFunc)();
-
-static bool LoopFunc()
-{
-	if (Instance<ICoreGameInit>::Get()->GetGameLoaded())
-	{
-		DoGameFrame();
-	}
-
-	return g_origLoopFunc();
-}
-
 // actually: 'should exit game' function called by LookAlive
 static bool OnLookAlive()
 {
-/*	if (Instance<ICoreGameInit>::Get()->GetGameLoaded())
-	{
-		DoGameFrame();
-	}*/
-
-	if (*rage::g_pProjectMainOrDoOneLoop != LoopFunc)
-	{
-		g_origLoopFunc = *rage::g_pProjectMainOrDoOneLoop;
-		*rage::g_pProjectMainOrDoOneLoop = LoopFunc;
-	}
+	g_safeGameFrame = true;
 
 	OnLookAliveFrame();
 
@@ -156,13 +161,26 @@ static void RunCriticalGameLoop()
 	}
 }
 
+#include <MinHook.h>
+
+static void (*g_orig_sysService_UpdateClass)(void*);
+
+static void sysService_UpdateClass(void* self)
+{
+	g_orig_sysService_UpdateClass(self);
+
+	static bool inSysUpdate;
+
+	if (!inSysUpdate)
+	{
+		inSysUpdate = true;
+		OnLookAliveFrame();
+		inSysUpdate = false;
+	}
+}
+
 static HookFunction hookFunction([] ()
 {
-	{
-		auto location = hook::get_pattern<char>("84 C0 74 0F FF 15 ? ? ? ? 84 C0 75 F6 E8", -9);
-		rage::g_pProjectMainOrDoOneLoop = hook::get_address<decltype(rage::g_pProjectMainOrDoOneLoop)>(location + 15);
-	}
-
 	g_mainThreadId = GetCurrentThreadId();
 
 	void* lookAliveFrameCall = hook::pattern("48 81 EC ? 01 00 00 E8 ? ? ? ? 33 F6 48 8D").count(1).get(0).get<void>(7);
@@ -181,12 +199,12 @@ static HookFunction hookFunction([] ()
 
 	location = (char*)(location + *(int32_t*)location + 4);
 
-	location += 32;
+	location += xbr::IsGameBuildOrGreater<2802>() ? 24 : 32;
 
 	void** vt = (void**)location;
 
 	g_appState = (decltype(g_appState))vt[0];
-	vt[0] = DoAppState;
+	hook::put(&vt[0], DoAppState);
 
 	// loading screen render thread function, to 'safely' handle game frames while loading (as a kind of watchdog)
 	void* func = hook::pattern("83 FB 0A 0F 85 80 00 00 00 8B").count(1).get(0).get<void>(-17);
@@ -199,9 +217,18 @@ static HookFunction hookFunction([] ()
 	g_isD3DInvalid = (bool*)(location + *(int32_t*)location + 4);
 
 	// allow resizing window in all cases
-	hook::nop(hook::get_pattern("45 8D 67 01 74 05 41 8B C4", 4), 2);
+	hook::nop(hook::get_pattern("74 05 41 8B C4 EB 0E"), 2);
 
 	std::thread(RunCriticalGameLoop).detach();
+
+	// game end frame (after main thread proc)
+	hook::call(hook::get_pattern("B9 05 00 00 00 E8 ? ? ? ? 48 8D 0D", 5), RunEndGameFrame);
+
+	{
+		MH_Initialize();
+		MH_CreateHook(hook::get_call(hook::get_pattern("B9 01 00 00 00 E8 ? ? ? ? 48 8D 0D ? ? ? ? E8", 17)), sysService_UpdateClass, (void**)&g_orig_sysService_UpdateClass);
+		MH_EnableHook(MH_ALL_HOOKS);
+	}
 
 	//__debugbreak();
 });

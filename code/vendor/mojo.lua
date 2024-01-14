@@ -19,14 +19,37 @@ function gen_typemap_args(path)
 	if cache[path] then return cache[path] end
 	
 	local r, e = os.outputof(table.concat({
-		'python',
+		pythonExecutable,
 		'"' .. prj_root .. '/../vendor/chromium/mojo/public/tools/bindings/format_typemap_generator_args.py"',
 		path
 	}, ' '))
-	
+
+	-- escape any arguments with < or >
+	r = r:gsub('[<>]', function(a) return '^' .. a end)
+	r = r:gsub('type_mappings=(.*)$', function(a)
+		if not a:match('const') then
+			return 'type_mappings=' .. a
+		end
+
+		return '"type_mappings=' .. a .. '"'
+	end)
+
 	cache[path] = r
 	
 	return r
+end
+
+local typemaps = {}
+local old_project = project
+
+function project(x)
+	local p = old_project(x)
+
+	if x then
+		typemaps = {}
+	end
+
+	return p
 end
 
 function files(x)
@@ -37,42 +60,37 @@ function files(x)
 	if type(x) == 'table' then
 		for _, v in ipairs(x) do
 			if v:endswith('.mojom') or v:endswith('.typemap') then
-				if not added then
+				if v:endswith('.typemap') then
+					local m = os.matchfiles(v)
+					for key, value in pairs(m) do
+						table.insert(typemaps, path.getbasename(value))
+					end
+				end
+
+				if not added and not v:endswith('.typemap') then
 					includedirs { '%{cfg and (cfg.buildtarget.directory .. "/gen/") or ""}', '%{cfg and (cfg.buildtarget.directory .. "/gen/vendor/chromium/") or ""}', '%{cfg and (cfg.buildtarget.directory .. "/code/") or ""}' }
 					
 					filter 'files:**.typemap'
 					
 					buildcommands {
+						'echo TYPEMAP %{file.name}',
 						table.concat({
-							'if exist %{path.getabsolute(cfg.buildtarget.directory .. "/gen/typemap_" .. prj.name)} (',
-							'python',
-							'"' .. prj_root .. '/../vendor/chromium/mojo/public/tools/bindings/generate_type_mappings.py"',
-							'%{gen_typemap_args(file.abspath)}',
-							'--dependency',
-							'%{cfg.buildtarget.directory .. "/gen/typemap_" .. prj.name}',
-							'--output',
-							'%{cfg.buildtarget.directory .. "/gen/typemap_" .. prj.name}',
-							')'
-						}, ' '),
-						table.concat({
-							'if not exist %{path.getabsolute(cfg.buildtarget.directory .. "/gen/typemap_" .. prj.name)} (',
-							'python',
+							pythonExecutable,
 							'"' .. prj_root .. '/../vendor/chromium/mojo/public/tools/bindings/generate_type_mappings.py"',
 							'%{gen_typemap_args(file.abspath)}',
 							'--output',
-							'%{cfg.buildtarget.directory .. "/gen/typemap_" .. prj.name}',
-							')'
+							'%{cfg.buildtarget.directory .. "/gen/typemap_" .. prj.name .. "_" .. file.basename}',
 						}, ' '),
 					}
-					
-					buildoutputs { '%{cfg.buildtarget.directory .. "/gen/typemap_" .. prj.name}' }
-					
+
+					buildoutputs { '%{cfg.buildtarget.directory .. "/gen/typemap_" .. prj.name .. "_" .. file.basename}' }
+
 					filter 'files:**.mojom'
 					
 					buildcommands {
 						'echo MOJOP %{file.name}',
 						table.concat({
-							'python',
+							pythonExecutable,
 							'"' .. prj_root .. '/../vendor/chromium/mojo/public/tools/bindings/mojom_bindings_generator.py"',
 							'parse',
 							'-o',
@@ -84,14 +102,21 @@ function files(x)
 							'%{(file and (file.abspath) or ""):remove_null()}'
 						}, ' '),
 					}
-					
+
 					buildoutputs { '%{cfg.buildtarget.directory .. "/gen/" .. path.getrelative("' .. prj_root .. '/../", file.abspath):gsub(".mojom$", "")}.p' }
 					
 					filter 'files:**.p'
 					
 					local function gen_cmd(arg)
+						local typemapArgs = {}
+
+						for _, value in ipairs(typemaps) do
+							table.insert(typemapArgs, '--typemap')
+							table.insert(typemapArgs, '%{cfg.buildtarget.directory .. "/gen/typemap_" .. prj.name .. "_' .. value .. '"}')
+						end
+
 						return table.concat({
-							'python',
+							pythonExecutable,
 							'"' .. prj_root .. '/../vendor/chromium/mojo/public/tools/bindings/mojom_bindings_generator.py"',
 							'generate',
 							'-g',
@@ -102,8 +127,7 @@ function files(x)
 							'%{path.getrelative(".", cfg.buildtarget.directory .. "/gen/")}',
 							'-d',
 							'%{path.getrelative(".", "' .. prj_root .. '/../")}',
-							'--typemap',
-							'%{cfg.buildtarget.directory .. "/gen/typemap_" .. prj.name}',
+							table.concat(typemapArgs, ' '),
 							'-o',
 							'%{path.getrelative(".", cfg.buildtarget.directory .. "/gen/")}',
 							arg or '',
@@ -120,7 +144,9 @@ function files(x)
 						gen_cmd('--generate_non_variant_code --generate_message_ids')
 					}
 					
-					buildinputs { '%{cfg.buildtarget.directory .. "/gen/typemap_" .. prj.name}' }
+					for _, val in ipairs(typemaps) do
+						buildinputs { '%{cfg.buildtarget.directory .. "/gen/typemap_" .. prj.name .. "_' .. val .. '"}' }
+					end
 
 					buildoutputs { '%{file.abspath:gsub(".p$", ".mojom")}.cc' }
 
@@ -153,13 +179,14 @@ return {
 	run = function()
 		language 'C++'
 		kind 'SharedLib'
+		dependson 'CfxPrebuild' -- for py dependencies
 		
 		links { 'ws2_32', 'userenv', 'delayimp' }
 		
 		prebuildcommands {
 			'{MKDIR} %{path.getrelative(".", cfg.buildtarget.directory .. "/gen/")}',
 			table.concat({
-				'python',
+				pythonExecutable,
 				'"' .. prj_root .. '/../vendor/chromium/mojo/public/tools/bindings/mojom_bindings_generator.py"',
 				'precompile',
 				'-o',
@@ -170,7 +197,7 @@ return {
 		if os.istarget('windows') then
 			buildoptions { '/wd4251', '/wd4275', '/wd4067', '/wd4267', '/wd4996', '/MP' }
 			linkoptions { '/DELAYLOAD:powrprof.dll' }
-			defines { "NOMINMAX", "WIN32_LEAN_AND_MEAN", "COMPONENT_BUILD", "IS_MOJO_CPP_PLATFORM_IMPL=1", "IS_MOJO_CPP_BINDINGS_IMPL=1", "IS_MOJO_CPP_BINDINGS_BASE_IMPL=1", "IS_MOJO_BASE_MOJOM_IMPL=1", "IS_MOJO_BASE_IMPL=1", "IS_MOJO_CORE_EMBEDDER_IMPL=1", "IS_IPC_IMPL=1", "BASE_IMPLEMENTATION=1", "WIN32", "IPC_MESSAGE_SUPPORT_IMPL=1", "MOJO_SYSTEM_IMPL_IMPLEMENTATION=1", "MOJO_CPP_SYSTEM_IMPLEMENTATION=1" }
+			defines { "NOMINMAX", "WIN32_LEAN_AND_MEAN", "DCHECK_ALWAYS_ON", "COMPONENT_BUILD", "IS_MOJO_CPP_PLATFORM_IMPL=1", "IS_MOJO_CPP_BINDINGS_IMPL=1", "IS_MOJO_CPP_BINDINGS_BASE_IMPL=1", "IS_MOJO_BASE_MOJOM_IMPL=1", "IS_MOJO_BASE_IMPL=1", "IS_MOJO_CORE_EMBEDDER_IMPL=1", "IS_IPC_IMPL=1", "BASE_IMPLEMENTATION=1", "WIN32", "IPC_MESSAGE_SUPPORT_IMPL=1", "MOJO_SYSTEM_IMPL_IMPLEMENTATION=1", "MOJO_CPP_SYSTEM_IMPLEMENTATION=1" }
 		end
 		
 		

@@ -235,7 +235,7 @@ void *mz_stream_vfs_get_interface(void)
 namespace vfs
 {
 	ZipFile::ZipFile()
-		: m_parentHandle(InvalidHandle), m_parentNonBulkHandle(InvalidHandle)
+		: m_parentHandle(InvalidHandle), m_parentNonBulkHandle(InvalidHandle), m_handles(128)
 	{
 
 	}
@@ -343,22 +343,33 @@ namespace vfs
 
 	ZipFile::HandleData* ZipFile::AllocateHandle(THandle* outHandle)
 	{
-		for (int i = 0; i < _countof(m_handles); i++)
+		std::unique_lock _(m_handlesMutex);
+
+		for (int i = 0; i < m_handles.size(); i++)
 		{
 			if (!m_handles[i].valid)
 			{
 				*outHandle = i;
 
-				return &m_handles[i];
+				auto handle = &m_handles[i];
+				handle->valid = true;
+				return handle;
 			}
 		}
 
-		return nullptr;
+		m_handles.push_back({});
+
+		auto handleIdx = m_handles.size() - 1;
+		*outHandle = handleIdx;
+
+		auto handle = &m_handles[handleIdx];
+		handle->valid = true;
+		return handle;
 	}
 
 	ZipFile::HandleData* ZipFile::GetHandle(THandle inHandle)
 	{
-		if (inHandle >= 0 && inHandle < _countof(m_handles))
+		if (inHandle >= 0 && inHandle < m_handles.size())
 		{
 			if (m_handles[inHandle].valid)
 			{
@@ -382,7 +393,6 @@ namespace vfs
 
 				if (handleData)
 				{
-					handleData->valid = true;
 					handleData->entry = *entry;
 					handleData->curOffset = 0;
 

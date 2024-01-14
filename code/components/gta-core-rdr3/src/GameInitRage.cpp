@@ -18,6 +18,7 @@
 #include <gameSkeleton.h>
 
 #include <Error.h>
+#include <CrossBuildRuntime.h>
 
 RageGameInit g_gameInit;
 fwEvent<const char*> OnKillNetwork;
@@ -161,7 +162,7 @@ static InitFunction initFunctionTwo([]()
 		{
 			while (!canContinueLoad || (g_callBeforeLoad && !g_callBeforeLoad()))
 			{
-				Sleep(0);
+				Sleep(50);
 
 				_doLookAlive();
 
@@ -254,6 +255,16 @@ static HookFunction hookFunctionNet([]()
 
 	// player can-clone SP model skip
 	hook::jump(hook::get_pattern("84 C0 74 04 32 C0 EB 0E 4C 8B C7 48 8B D6", -0x1D), ReturnTrueAndForcePedMPFlag);
+	hook::jump(hook::get_pattern("40 8A F2 48 8B F9 E8 ? ? ? ? 84 C0 74", -0x12), ReturnTrueAndForcePedMPFlag);
+
+	if (xbr::IsGameBuildOrGreater<1436>())
+	{
+		// nop checks used for not syncing some "unwanted" metaped components
+		hook::nop(hook::get_pattern("8B 40 18 3D CC E2 69 9D"), 0x2F);
+
+		// skip tunable checks for explosion/fire related natives
+		hook::jump(hook::get_pattern("B9 BD C5 AF E3 BA B2 A0 A7 92", -0x14), Return1);
+	}
 
 	//hook::jump(0x1406B50E8, LogStubLog1);
 
@@ -270,4 +281,7 @@ static HookFunction hookFunctionNet([]()
 
 	// don't block ped loco for MP peds if not in MP mode (or SP peds if not in SP mode)
 	hook::jump(hook::get_pattern("75 05 83 FB 01 EB 03 83 FB 02", -0x1C), Return1);
+
+	// ignore collision-related archetype flag in /CREATE_OBJECT(_NO_OFFSET)?/
+	hook::nop(hook::get_pattern("8B 48 50 48 C1 E9 11 F6 C1 01 0F 84 ? ? 00 00 45", 10), 6);
 });

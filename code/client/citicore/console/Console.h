@@ -67,6 +67,8 @@ public:
 
 	virtual void ExecuteBuffer();
 
+	virtual void SaveConfiguration(const std::string& path);
+
 	virtual void SaveConfigurationIfNeeded(const std::string& path);
 
 	virtual void SetVariableModifiedFlags(int flags);
@@ -146,7 +148,7 @@ void ExecuteSingleCommand(const std::string& command);
 
 void ExecuteSingleCommandDirect(const ProgramArguments& arguments);
 
-ProgramArguments Tokenize(const std::string& line);
+CORE_EXPORT ProgramArguments Tokenize(const std::string& line);
 
 void AddToBuffer(const std::string& text);
 

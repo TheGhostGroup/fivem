@@ -28,6 +28,22 @@ static rage::scrThread*(*g_origGetThreadById)(uint32_t hash);
 static std::map<uint32_t, rage::scrThread*> g_customThreads;
 static std::map<uint32_t, std::string> g_customThreadsToNames;
 
+static bool* CTheScripts__ms_bUpdatingScriptThreads;
+
+UpdatingScriptThreadsScope::UpdatingScriptThreadsScope(bool newState)
+{
+	m_lastProcessTick = *CTheScripts__ms_bUpdatingScriptThreads;
+	*CTheScripts__ms_bUpdatingScriptThreads = newState;
+}
+
+UpdatingScriptThreadsScope::~UpdatingScriptThreadsScope()
+{
+	if (m_lastProcessTick)
+	{
+		*CTheScripts__ms_bUpdatingScriptThreads = *m_lastProcessTick;
+	}
+}
+
 static rage::scrThread* GetThreadById(uint32_t hash)
 {
 	auto it = g_customThreads.find(hash);
@@ -104,9 +120,20 @@ static HookFunction hookFunction([] ()
 		g_customThreadsToNames.erase(thread->GetContext()->ThreadId);
 	});
 
-	// 1868+
-	if (Is2060())
+	if (xbr::IsGameBuildOrGreater<2372>())
 	{
+		// FF 50 18 48 8B CE 48 8B D0 E8 ? ? ? ? 84
+		// FF 50 18                call    qword ptr [rax+18h]
+		// 48 8B CE                mov     rcx, rsi
+		// 48 8B D0                mov     rdx, rax
+		// E8 1F 97 FF FF          call    sub_7FF713538288
+		// 84 C0                   test    al, al
+		// 0F 84 AC 01 00 00       jz      loc_7FF71353ED1D   <---------------
+		hook::nop(hook::get_pattern("FF 50 18 48 8B CE 48 8B D0 E8 ? ? ? ? 84", 16), 6);
+	}
+	else if (xbr::IsGameBuildOrGreater<2060>())
+	{
+		// [74] 19  jz short loc_140A3ABA3 -- 0xEB unconditional jmp
 		hook::put<uint8_t>(hook::get_pattern("74 19 FF C1 48 83 C0 04"), 0xEB);
 	}
 });
@@ -220,6 +247,8 @@ static HookFunction hookFunctionVtbl([]()
 		auto vtable = hook::get_address<uintptr_t*>(hook::get_pattern("41 83 C8 FF 48 89 03 89 53 70 88 53 74 4C 89 4B", -11));
 
 		g_origDetachScript = ((decltype(g_origDetachScript))vtable[11]);
-		vtable[11] = (uintptr_t)WrapDetachScript;
+		hook::put<uintptr_t>(&vtable[11], (uintptr_t)WrapDetachScript);
 	}
+
+	CTheScripts__ms_bUpdatingScriptThreads = hook::get_address<bool*>(hook::get_pattern("45 33 F6 41 8A F0 8B EA 44 38 35", 11));
 });

@@ -8,6 +8,9 @@
 
 #include <Resource.h>
 #include <fxScripting.h>
+#include <CL2LaunchMode.h>
+
+#include <Error.h>
 
 leveldb::Env* GetVFSEnvironment();
 
@@ -21,7 +24,8 @@ struct DatabaseHolder
 		options.env = GetVFSEnvironment();
 		options.create_if_missing = true;
 
-		auto status = leveldb::DB::Open(options, "fxd:/kvs/", &dbPointer);
+		std::string dbName = IsCL2() ? "fxd:/kvs_cl2/" : "fxd:/kvs/";
+		auto status = leveldb::DB::Open(options, dbName, &dbPointer);
 
 		if (!status.ok())
 		{
@@ -32,23 +36,26 @@ struct DatabaseHolder
 				repairOptions.create_if_missing = true;
 				repairOptions.env = GetVFSEnvironment();
 				
-				status = leveldb::RepairDB("fxd:/kvs/", repairOptions);
+				status = leveldb::RepairDB(dbName, repairOptions);
 
 				if (status.ok())
 				{
-					status = leveldb::DB::Open(options, "fxd:/kvs/", &dbPointer);
+					status = leveldb::DB::Open(options, dbName, &dbPointer);
 				}
 
 				if (!status.ok())
 				{
-					status = leveldb::DestroyDB("fxd:/kvs/", options);
+					status = leveldb::DestroyDB(dbName, options);
 
-					status = leveldb::DB::Open(options, "fxd:/kvs/", &dbPointer);
+					status = leveldb::DB::Open(options, dbName, &dbPointer);
 				}
 			}
 		}
 
-		assert(status.ok());
+		if (!status.ok())
+		{
+			FatalError("Failed to open client KVS LevelDB %s: %s", dbName, status.ToString());
+		}
 
 		db = std::unique_ptr<leveldb::DB>(dbPointer);
 		dbPointer = nullptr; // as the unique_ptr 'owns' it now
@@ -181,10 +188,9 @@ struct SerializeValue<RawType>
 };
 
 template<typename T>
-static void GetResourceKvp(fx::ScriptContext& context)
+static void GetResourceKvp_Impl(const std::string& key, fx::ScriptContext& context)
 {
 	auto db = EnsureDatabase();
-	auto key = FormatKey(context.GetArgument<const char*>(0));
 
 	std::string value;
 	if (db->Get(leveldb::ReadOptions{}, key, &value).IsNotFound())
@@ -196,12 +202,29 @@ static void GetResourceKvp(fx::ScriptContext& context)
 	SerializeValue<T>::Deserialize(context, value);
 }
 
+template<typename T>
+static void GetResourceKvp(fx::ScriptContext& context)
+{
+	auto key = FormatKey(context.CheckArgument<const char*>(0));
+
+	return GetResourceKvp_Impl<T>(key, context);
+}
+
+template<typename T>
+static void GetExternalKvp(fx::ScriptContext& context)
+{
+	auto key = FormatKey(context.CheckArgument<const char*>(1), context.CheckArgument<const char*>(0));
+
+	return GetResourceKvp_Impl<T>(key, context);
+}
+
 #include <memory>
 
 struct FindHandle
 {
 	std::shared_ptr<leveldb::Iterator> dbIter;
 	std::string key;
+	size_t prefixLength = 0;
 };
 
 static FindHandle g_handles[64];
@@ -219,10 +242,9 @@ static FindHandle* GetFindHandle()
 	return nullptr;
 }
 
-static void StartFindKvp(fx::ScriptContext& context)
+static void StartFindKvp_Impl(const std::string& key, size_t prefixLength, fx::ScriptContext& context)
 {
 	auto db = EnsureDatabase();
-	auto key = FormatKey(context.GetArgument<const char*>(0));
 
 	auto handle = GetFindHandle();
 
@@ -236,8 +258,22 @@ static void StartFindKvp(fx::ScriptContext& context)
 	handle->dbIter->Seek(key);
 
 	handle->key = key;
+	handle->prefixLength = prefixLength;
 
 	context.SetResult(handle - g_handles);
+}
+
+static void StartFindKvp(fx::ScriptContext& context)
+{
+	auto key = FormatKey(context.CheckArgument<const char*>(0));
+	return StartFindKvp_Impl(key, FormatKey("").length(), context);
+}
+
+static void StartFindExternalKvp(fx::ScriptContext& context)
+{
+	auto resourceName = context.CheckArgument<const char*>(0);
+	auto key = FormatKey(context.CheckArgument<const char*>(1), resourceName);
+	return StartFindKvp_Impl(key, FormatKey("", resourceName).length(), context);
 }
 
 static void FindKvp(fx::ScriptContext& context)
@@ -262,7 +298,7 @@ static void FindKvp(fx::ScriptContext& context)
 	static std::string keyName;
 	std::string k(handle->dbIter->key().data(), handle->dbIter->key().size());
 
-	keyName = k.substr(FormatKey("").size());
+	keyName = k.substr(handle->prefixLength);
 
 	context.SetResult<const char*>(keyName.c_str());
 
@@ -286,7 +322,7 @@ static void EndFindKvp(fx::ScriptContext& context)
 static void DeleteResourceKvp(fx::ScriptContext& context)
 {
 	auto db = EnsureDatabase();
-	auto key = FormatKey(context.GetArgument<const char*>(0));
+	auto key = FormatKey(context.CheckArgument<const char*>(0));
 
 	db->Delete(leveldb::WriteOptions{}, key);
 }
@@ -368,7 +404,7 @@ struct KvpBulkStream
 
 	size_t ReadBulk(uint64_t ptr, void* outBuffer, size_t size)
 	{
-		size_t toRead = std::min(m_value.size() - ptr, size);
+		size_t toRead = std::min(size_t(m_value.size() - ptr), size);
 		memcpy(outBuffer, m_value.data() + ptr, toRead);
 
 		return toRead;
@@ -533,16 +569,21 @@ static InitFunction initFunction([]()
 	fx::ScriptEngine::RegisterNativeHandler("GET_RESOURCE_KVP_INT", GetResourceKvp<int>);
 	fx::ScriptEngine::RegisterNativeHandler("GET_RESOURCE_KVP_STRING", GetResourceKvp<const char*>);
 	fx::ScriptEngine::RegisterNativeHandler("GET_RESOURCE_KVP_FLOAT", GetResourceKvp<float>);
-	fx::ScriptEngine::RegisterNativeHandler("GET_RESOURCE_RAW_KVP", GetResourceKvp<RawType>);
+	//fx::ScriptEngine::RegisterNativeHandler("GET_RESOURCE_RAW_KVP", GetResourceKvp<RawType>);
 
 	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP", SetResourceKvp<const char*>);
 	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP_INT", SetResourceKvp<int>);
 	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP_FLOAT", SetResourceKvp<float>);
-	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_RAW_KVP", SetResourceKvpRaw);
+	//fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_RAW_KVP", SetResourceKvpRaw);
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_EXTERNAL_KVP_INT", GetExternalKvp<int>);
+	fx::ScriptEngine::RegisterNativeHandler("GET_EXTERNAL_KVP_STRING", GetExternalKvp<const char*>);
+	fx::ScriptEngine::RegisterNativeHandler("GET_EXTERNAL_KVP_FLOAT", GetExternalKvp<float>);
 
 	fx::ScriptEngine::RegisterNativeHandler("DELETE_RESOURCE_KVP", DeleteResourceKvp);
 
 	fx::ScriptEngine::RegisterNativeHandler("START_FIND_KVP", StartFindKvp);
+	fx::ScriptEngine::RegisterNativeHandler("START_FIND_EXTERNAL_KVP", StartFindExternalKvp);
 	fx::ScriptEngine::RegisterNativeHandler("FIND_KVP", FindKvp);
 	fx::ScriptEngine::RegisterNativeHandler("END_FIND_KVP", EndFindKvp);
 });

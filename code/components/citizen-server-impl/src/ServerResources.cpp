@@ -3,21 +3,24 @@
 #include <ResourceManager.h>
 #include <ResourceEventComponent.h>
 #include <ResourceMetaDataComponent.h>
+#include <ResourceManagerConstraintsComponent.h>
+#include <ResourceScriptingComponent.h>
 
 #include <fxScripting.h>
 
 #include <ServerInstanceBase.h>
 #include <ServerInstanceBaseRef.h>
 
+#include "ServerResourceList.h"
+
 #include <GameServer.h>
 #include <ServerEventComponent.h>
+
+#include <GameBuilds.h>
 
 #include <RelativeDevice.h>
 
 #include <VFSManager.h>
-
-#include <skyr/url.hpp>
-#include <skyr/percent_encode.hpp>
 
 #include <PrintListener.h>
 
@@ -28,7 +31,15 @@
 
 #include <StructuredTrace.h>
 
-#include <filesystem>
+#include <ScriptEngine.h>
+
+#include <cfx_version.h>
+
+#include <boost/algorithm/string.hpp>
+
+#if defined(_DEBUG) && defined(_WIN32)
+#include <shellapi.h>
+#endif
 
 // a set of resources that are system-managed and should not be stopped from script
 static std::set<std::string> g_managedResources = {
@@ -39,55 +50,6 @@ static std::set<std::string> g_managedResources = {
 	"sessionmanager",
 	"webadmin",
 	"monitor"
-};
-
-class LocalResourceMounter : public fx::ResourceMounter
-{
-public:
-	LocalResourceMounter(fx::ResourceManager* manager)
-		: m_manager(manager)
-	{
-		
-	}
-
-	virtual bool HandlesScheme(const std::string& scheme) override
-	{
-		return (scheme == "file");
-	}
-
-	virtual pplx::task<fwRefContainer<fx::Resource>> LoadResource(const std::string& uri) override
-	{
-		auto uriParsed = skyr::make_url(uri);
-
-		fwRefContainer<fx::Resource> resource;
-
-		if (uriParsed)
-		{
-			auto pathRef = uriParsed->pathname();
-			auto fragRef = uriParsed->hash().substr(1);
-
-			if (!pathRef.empty() && !fragRef.empty())
-			{
-#ifdef _WIN32
-				std::string pr = pathRef.substr(1);
-#else
-				std::string pr = pathRef;
-#endif
-
-				resource = m_manager->CreateResource(fragRef, this);
-				if (!resource->LoadFrom(*skyr::percent_decode(pr)))
-				{
-					m_manager->RemoveResource(resource);
-					resource = nullptr;
-				}
-			}
-		}
-
-		return pplx::task_from_result<fwRefContainer<fx::Resource>>(resource);
-	}
-
-private:
-	fx::ResourceManager* m_manager;
 };
 
 static void HandleServerEvent(fx::ServerInstanceBase* instance, const fx::ClientSharedPtr& client, net::Buffer& buffer)
@@ -103,6 +65,7 @@ static void HandleServerEvent(fx::ServerInstanceBase* instance, const fx::Client
 	static fx::RateLimiterStore<uint32_t, false> netEventRateLimiterStore{ instance->GetComponent<console::Context>().GetRef() };
 	static auto netEventRateLimiter = netEventRateLimiterStore.GetRateLimiter("netEvent", fx::RateLimiterDefaults{ 50.f, 200.f });
 	static auto netFloodRateLimiter = netEventRateLimiterStore.GetRateLimiter("netEventFlood", fx::RateLimiterDefaults{ 75.f, 300.f });
+	static auto netEventSizeRateLimiter = netEventRateLimiterStore.GetRateLimiter("netEventSize", fx::RateLimiterDefaults{ 128 * 1024.0, 384 * 1024.0 });
 
 	uint32_t netId = client->GetNetId();
 
@@ -125,6 +88,19 @@ static void HandleServerEvent(fx::ServerInstanceBase* instance, const fx::Client
 
 	uint32_t dataLength = buffer.GetRemainingBytes();
 
+	if (!netEventSizeRateLimiter->Consume(netId, double(dataLength)))
+	{
+		std::string eventName(eventNameBuffer.begin(), eventNameBuffer.end());
+		gscomms_execute_callback_on_main_thread([client, instance, eventName]()
+		{
+			// if this happens, try increasing rateLimiter_netEventSize_rate and rateLimiter_netEventSize_burst
+			// preferably, fix client scripts to not have this large a set of events with high frequency
+			instance->GetComponent<fx::GameServer>()->DropClient(client, "Reliable network event size overflow: %s", eventName);
+		});
+
+		return;
+	}
+
 	std::vector<uint8_t> data(dataLength);
 	buffer.Read(data.data(), data.size());
 
@@ -138,151 +114,119 @@ static void HandleServerEvent(fx::ServerInstanceBase* instance, const fx::Client
 	);
 }
 
+static void CheckResourceGlobs(fx::Resource* resource, int* numWarnings)
+{
+	auto metaDataComponent = resource->GetComponent<fx::ResourceMetaDataComponent>();
+
+	for (auto type : { "client_script", "server_script", "shared_script", "file" })
+	{
+		metaDataComponent->GlobMissingEntries(type, [resource, type, numWarnings](const fx::ResourceMetaDataComponent::MissingEntry& entry)
+		{
+			if (entry.wasPrefix)
+			{
+				auto channel = fmt::sprintf("resources:%s", resource->GetName());
+				auto file = entry.source.file;
+
+				if (auto slash = file.rfind('/'); slash != std::string::npos)
+				{
+					file = file.substr(slash + 1);
+				}
+
+				console::PrintWarning(channel, "could not find %s `%s` (defined in %s:%d)\n", type, entry.value, file, entry.source.line);
+				++*numWarnings;
+			}
+		});
+	}
+}
+
 static std::shared_ptr<ConVar<std::string>> g_citizenDir;
-static std::map<std::string, std::set<std::string>> g_resourcesByComponent;
 
 static void ScanResources(fx::ServerInstanceBase* instance)
 {
 	auto resMan = instance->GetComponent<fx::ResourceManager>();
+	auto serverResourceList = resMan->GetComponent<fx::resources::ServerResourceList>();
 
 	std::string resourceRoot(instance->GetRootPath() + "/resources/");
 	std::string systemResourceRoot(g_citizenDir->GetValue() + "/system_resources/");
 
-	auto resourceRootPath = std::filesystem::u8path(resourceRoot).lexically_normal();
-	auto systemResourceRootPath = std::filesystem::u8path(systemResourceRoot).lexically_normal();
+	console::Printf("resources", "^2Scanning resources.^7\n");
 
-	std::queue<std::string> pathsToIterate;
-	pathsToIterate.push(resourceRoot);
-	pathsToIterate.push(systemResourceRoot);
+	fx::resources::ScanResult result;
+	serverResourceList->ScanResources(resourceRoot, &result);
+	serverResourceList->ScanResources(systemResourceRoot, &result);
 
-	std::vector<pplx::task<fwRefContainer<fx::Resource>>> tasks;
+	int errorCount = 0, warningCount = 0;
 
-	// save scanned resource names so we don't scan them twice
-	std::set<std::string> scannedNow;
-
-	while (!pathsToIterate.empty())
+	for (const auto& message : result.messages)
 	{
-		std::string thisPath = pathsToIterate.front();
-		pathsToIterate.pop();
+		auto channel = fmt::sprintf("resources:%s", message.resource);
 
-		auto vfsDevice = vfs::GetDevice(thisPath);
-
-		vfs::FindData findData;
-		auto handle = vfsDevice->FindFirst(thisPath, &findData);
-
-		if (handle != INVALID_DEVICE_HANDLE)
+		if (message.type == fx::resources::ScanMessageType::Error)
 		{
-			do
-			{
-				if (findData.name[0] == '.')
-				{
-					continue;
-				}
-
-				// TODO(fxserver): non-win32
-				if (findData.attributes & FILE_ATTRIBUTE_DIRECTORY)
-				{
-					std::string resPath(thisPath + "/" + findData.name);
-
-					// is this a category?
-					if (findData.name[0] == '[' && findData.name[findData.name.size() - 1] == ']')
-					{
-						pathsToIterate.push(resPath);
-					}
-					// it's a resource
-					else if (scannedNow.find(findData.name) == scannedNow.end())
-					{
-						scannedNow.insert(findData.name);
-
-						auto oldRes = resMan->GetResource(findData.name, false);
-
-						if (oldRes.GetRef())
-						{
-							oldRes->GetComponent<fx::ResourceMetaDataComponent>()->LoadMetaData(resPath);
-						}
-						else
-						{
-							trace("Found new resource %s in %s\n", findData.name, resPath);
-
-							auto path = std::filesystem::u8path(resPath);
-
-							// determine which root we're relative to
-							std::error_code ec;
-							auto refPath = path.lexically_normal();
-
-							std::filesystem::path* rootRef = nullptr;
-
-							auto [relEnd, _] = std::mismatch(resourceRootPath.begin(), resourceRootPath.end(), refPath.begin());
-							auto rpEnd = --resourceRootPath.end();
-
-							if (relEnd != rpEnd)
-							{
-								auto [relEnd, _] = std::mismatch(systemResourceRootPath.begin(), systemResourceRootPath.end(), refPath.begin());	
-								auto rpEnd = --systemResourceRootPath.end();
-
-								if (relEnd == rpEnd)
-								{
-									rootRef = &systemResourceRootPath;
-								}
-							}
-							else
-							{
-								rootRef = &resourceRootPath;
-							}
-							
-							// get the relative path to the root
-							std::vector<std::string> components;
-
-							if (rootRef)
-							{
-								auto relPath = std::filesystem::relative(path, *rootRef, ec);
-
-								if (!ec)
-								{
-									for (const auto& component : relPath)
-									{
-										auto name = component.filename().string();
-
-										if (name[0] == '[' && name[name.size() - 1] == ']')
-										{
-											components.push_back(name);
-										}
-									}
-								}
-							}
-
-							skyr::url_record record;
-							record.scheme = "file";
-
-							skyr::url url{ std::move(record) };
-							url.set_pathname(*skyr::percent_encode(resPath, skyr::encode_set::path));
-							url.set_hash(*skyr::percent_encode(findData.name, skyr::encode_set::fragment));
-
-							auto task = resMan->AddResource(url.href())
-										.then([components = std::move(components)](fwRefContainer<fx::Resource> resource)
-										{
-											if (resource.GetRef())
-											{
-												for (const auto& component : components)
-												{
-													g_resourcesByComponent[component].insert(resource->GetName());
-												}
-											}
-
-											return resource;
-										});
-
-							tasks.push_back(task);
-						}
-					}
-				}
-			} while (vfsDevice->FindNext(handle, &findData));
-
-			vfsDevice->FindClose(handle);
+			errorCount++;
+			console::PrintError(channel, "%s\n", message.Format());
+		}
+		else if (message.type == fx::resources::ScanMessageType::Warning)
+		{
+			warningCount++;
+			console::PrintWarning(channel, "%s\n", message.Format());
+		}
+		else
+		{
+			console::Printf(channel, "%s\n", message.Format());
 		}
 	}
 
-	pplx::when_all(tasks.begin(), tasks.end()).wait();
+	if (result.reloadedResources > 0)
+	{
+		console::Printf("resources", "^2Found %d new resources, and refreshed %d/%d resources.^7\n", result.newResources, result.updatedResources, result.reloadedResources);
+	}
+	else
+	{
+		console::Printf("resources", "^2Found %d resources.^7\n", result.newResources);
+	}
+
+	auto quickPlural = [](int number, std::string_view singular, std::string_view plural)
+	{
+		if (number == 1)
+		{
+			return fmt::sprintf("%d %s", number, singular);
+		}
+		else
+		{
+			return fmt::sprintf("%d %s", number, plural);
+		}
+	};
+
+	if (errorCount > 0 && warningCount > 0)
+	{
+		console::Printf("resources",
+			"^1%s and %s were encountered.^7\n",
+			quickPlural(warningCount, "warning", "warnings"),
+			quickPlural(errorCount, "error", "errors"));
+	}
+	else if (errorCount > 0)
+	{
+		console::Printf("resources", "^1%s encountered.^7\n", quickPlural(errorCount, "error was", "errors were"));
+	}
+	else if (warningCount > 0)
+	{
+		console::Printf("resources", "^3%s encountered.^7\n", quickPlural(warningCount, "warning was", "warnings were"));
+	}
+
+	// mount discovered resources for later use in VFS (e.g. from `exec`)
+	for (const auto& resource : result.resources)
+	{
+		auto mountPath = fmt::sprintf("@%s/", resource->GetName());
+
+		fwRefContainer<vfs::RelativeDevice> relativeDevice = new vfs::RelativeDevice(resource->GetPath() + "/");
+		vfs::Unmount(mountPath);
+		vfs::Mount(relativeDevice, mountPath);
+	}
+
+	// reset rate limiters for clients downloading stuff in bursts
+	auto trl = instance->GetComponent<fx::TokenRateLimiter>();
+	trl->Update(1.0, std::max(double(result.newResources + result.reloadedResources), 3.0));
 
 	/*NETEV onResourceListRefresh SERVER
 	/#*
@@ -313,6 +257,33 @@ public:
 		}
 	}
 
+	virtual bool LimitEvent(int source) override
+	{
+		static fx::RateLimiterStore<uint32_t, false> netEventRateLimiterStore{ instance->GetComponent<console::Context>().GetRef() };
+		static auto netEventRateLimiter = netEventRateLimiterStore.GetRateLimiter("netEvent", fx::RateLimiterDefaults{ 50.f, 200.f });
+		static auto netFloodRateLimiter = netEventRateLimiterStore.GetRateLimiter("netEventFlood", fx::RateLimiterDefaults{ 75.f, 300.f });
+
+		if (!netEventRateLimiter->Consume(source))
+		{
+			if (!netFloodRateLimiter->Consume(source))
+			{
+				gscomms_execute_callback_on_main_thread([this, source]()
+				{
+					auto client = instance->GetComponent<fx::ClientRegistry>()->GetClientByNetID(source);
+
+					if (client)
+					{
+						instance->GetComponent<fx::GameServer>()->DropClient(client, "Unreliable network event overflow.");
+					}
+				}, true);
+			}
+
+			return true;
+		}
+
+		return false;
+	}
+
 public:
 	fx::ServerInstanceBase* instance;
 } g_reassemblySink;
@@ -325,17 +296,112 @@ inline std::string ToNarrow(const std::string& str)
 std::shared_mutex g_resourceStartOrderLock;
 std::list<std::string> g_resourceStartOrder;
 
+extern fwRefContainer<fx::ResourceMounter> MakeServerResourceMounter(const fwRefContainer<fx::ResourceManager>& resman);
+
 static InitFunction initFunction([]()
 {
 	fx::ServerInstanceBase::OnServerCreate.Connect([](fx::ServerInstanceBase* instance)
 	{
+		{
+			g_citizenDir = instance->AddVariable<std::string>("citizen_dir", ConVar_None, ToNarrow(MakeRelativeCitPath(L"citizen")));
+
+			// create cache directory if needed
+			auto device = vfs::GetDevice(instance->GetRootPath());
+			auto cacheDir = instance->GetRootPath() + "/cache/";
+
+			if (device.GetRef())
+			{
+				device->CreateDirectory(cacheDir);
+
+				// precreate cache/files/ so that later components won't have to
+				device->CreateDirectory(cacheDir + "files/");
+			}
+
+			vfs::Mount(new vfs::RelativeDevice(g_citizenDir->GetValue() + "/"), "citizen:/");
+			vfs::Mount(new vfs::RelativeDevice(cacheDir), "cache:/");
+		}
+
 		instance->SetComponent(fx::CreateResourceManager());
 		instance->SetComponent(new fx::ServerEventComponent());
+		instance->SetComponent(new fx::TokenRateLimiter(1.0f, 3.0f));
 
 		fwRefContainer<fx::ResourceManager> resman = instance->GetComponent<fx::ResourceManager>();
 		resman->SetComponent(new fx::ServerInstanceBaseRef(instance));
 		resman->SetComponent(instance->GetComponent<console::Context>());
 		resman->SetComponent(fx::EventReassemblyComponent::Create());
+
+		{
+			auto concom = resman->GetComponent<fx::ResourceManagerConstraintsComponent>();
+			concom->SetEnforcingConstraints(true);
+
+			std::string serverVersion = GIT_TAG;
+			constexpr const auto prefixLen = std::string_view{ "v1.0.0." }.length();
+
+			concom->RegisterConstraint("server", atoi((serverVersion.length() > prefixLen) ? (serverVersion.c_str() + prefixLen) : "99999"));
+			concom->RegisterConstraint("onesync", [instance](std::string_view onesyncCheck, std::string* error) -> bool
+			{
+				if (fx::IsOneSync())
+				{
+					return true;
+				}
+
+				if (error)
+				{
+					*error = "OneSync needs to be enabled";
+				}
+
+				return false;
+			});
+
+			concom->RegisterConstraint("gameBuild", [instance](std::string_view gameBuildCheck, std::string* error) -> bool
+			{
+				auto enforcedBuild = fx::GetEnforcedGameBuildNumber();
+
+				if (enforcedBuild)
+				{
+					fx::GameBuild minBuild;
+
+					if (ConsoleArgumentType<fx::GameBuild>::Parse(std::string(gameBuildCheck), &minBuild))
+					{
+						int minBuildNum = atoi(minBuild.c_str());
+
+						if (enforcedBuild >= minBuildNum)
+						{
+							return true;
+						}
+						else
+						{
+							if (error)
+							{
+								*error = fmt::sprintf("sv_enforceGameBuild needs to be at least %d (current is %d)", minBuildNum, enforcedBuild);
+							}
+						}
+					}
+				}
+
+				return false;
+			});
+
+			concom->RegisterConstraint("native", [](std::string_view nativeHash, std::string* error)
+			{
+				if (nativeHash.length() > 2 && nativeHash.substr(0, 2) == "0x")
+				{
+					uint64_t nativeNum = strtoull(std::string(nativeHash.substr(2)).c_str(), nullptr, 16);
+
+					if (fx::ScriptEngine::GetNativeHandler(nativeNum))
+					{
+						return true;
+					}
+
+					if (error)
+					{
+						*error = fmt::sprintf("native 0x%X isn't supported", nativeNum);
+					}
+				}
+
+				return false;
+			});
+		}
 
 		// TODO: not instanceable
 		auto rac = resman->GetComponent<fx::EventReassemblyComponent>();
@@ -373,7 +439,8 @@ static InitFunction initFunction([]()
 			rac->NetworkTick();
 		});
 
-		resman->AddMounter(new LocalResourceMounter(resman.GetRef()));
+		resman->AddMounter(MakeServerResourceMounter(resman));
+		resman->SetComponent(new fx::resources::ServerResourceList);
 
 		fx::Resource::OnInitializeInstance.Connect([](fx::Resource* resource)
 		{
@@ -389,8 +456,21 @@ static InitFunction initFunction([]()
 				bool allowed = true;
 
 				// store the game name
-				std::string gameNameString = (gameServer->GetGameName() == fx::GameName::GTA5) ? "gta5" :
-					(gameServer->GetGameName() == fx::GameName::RDR3) ? "rdr3" : "unknown";
+				std::string gameNameString;
+				switch (gameServer->GetGameName())
+				{
+				case fx::GameName::GTA4:
+					gameNameString = "gta4";
+					break;
+				case fx::GameName::GTA5:
+					gameNameString = "gta5";
+					break;
+				case fx::GameName::RDR3:
+					gameNameString = "rdr3";
+					break;
+				default:
+					gameNameString = "unknown";
+				}
 
 				// if is FXv2
 				auto isCfxV2 = md->GetEntries("is_cfxv2");
@@ -453,7 +533,21 @@ static InitFunction initFunction([]()
 
 			resource->OnStart.Connect([=]()
 			{
-				trace("Started resource %s\n", resource->GetName());
+				int numWarnings = 0;
+				CheckResourceGlobs(resource, &numWarnings);
+
+				auto streamComponent = resource->GetComponent<fx::ResourceStreamComponent>();
+				streamComponent->CheckSizes(&numWarnings);
+				
+				if (numWarnings == 0)
+				{
+					console::Printf("resources", "Started resource %s\n", resource->GetName());
+				}
+				else
+				{
+					console::Printf("resources", "Started resource %s (%d warning%s)\n",
+						resource->GetName(), numWarnings, numWarnings == 1 ? "" : "s");
+				}
 
 				auto metaData = resource->GetComponent<fx::ResourceMetaDataComponent>();
 				auto iv = metaData->GetEntries("server_only");
@@ -477,7 +571,7 @@ static InitFunction initFunction([]()
 
 				clientRegistry->ForAllClients([&](const fx::ClientSharedPtr& client)
 				{
-					client->SendPacket(0, outBuffer, NetPacketType_ReliableReplayed);
+					client->SendPacket(0, outBuffer, NetPacketType_Reliable);
 
 					trl->ReturnToken(client->GetConnectionToken());
 				});
@@ -485,7 +579,7 @@ static InitFunction initFunction([]()
 
 			resource->OnStop.Connect([=]()
 			{
-				trace("Stopping resource %s\n", resource->GetName());
+				console::Printf("resources", "Stopping resource %s\n", resource->GetName());
 
 				auto metaData = resource->GetComponent<fx::ResourceMetaDataComponent>();
 				auto iv = metaData->GetEntries("server_only");
@@ -512,31 +606,30 @@ static InitFunction initFunction([]()
 
 				clientRegistry->ForAllClients([&](const fx::ClientSharedPtr& client)
 				{
-					client->SendPacket(0, outBuffer, NetPacketType_ReliableReplayed);
+					client->SendPacket(0, outBuffer, NetPacketType_Reliable);
 				});
 			}, -1000);
 		});
 
+		ScanResources(instance);
+
+		static auto isCategory = [](std::string_view resourceName)
 		{
-			g_citizenDir = instance->AddVariable<std::string>("citizen_dir", ConVar_None, ToNarrow(MakeRelativeCitPath(L"citizen")));
+			return (!resourceName.empty() && resourceName[0] == '[' && resourceName[resourceName.size() - 1] == ']');
+		};
 
-			// create cache directory if needed
-			auto device = vfs::GetDevice(instance->GetRootPath());
-			auto cacheDir = instance->GetRootPath() + "/cache/";
+		static auto findByComponent = [resman](const std::string& resourceName) -> std::set<std::string>
+		{
+			auto resourceList = resman->GetComponent<fx::resources::ServerResourceList>();
+			auto resources = resourceList->FindByPathComponent(resourceName);
 
-			if (device.GetRef())
+			if (resources.empty())
 			{
-				device->CreateDirectory(cacheDir);
-
-				// precreate cache/files/ so that later components won't have to
-				device->CreateDirectory(cacheDir + "files/");
+				trace("^3Couldn't find resource category %s.^7\n", resourceName);
 			}
 
-			vfs::Mount(new vfs::RelativeDevice(g_citizenDir->GetValue() + "/"), "citizen:/");
-			vfs::Mount(new vfs::RelativeDevice(cacheDir), "cache:/");
-		}
-
-		ScanResources(instance);
+			return resources;
+		};
 
 		static auto commandRef = instance->AddCommand("start", [=](const std::string& resourceName)
 		{
@@ -545,9 +638,9 @@ static InitFunction initFunction([]()
 				return;
 			}
 
-			if (resourceName[0] == '[' && resourceName[resourceName.size() - 1] == ']')
+			if (isCategory(resourceName))
 			{
-				for (const auto& resource : g_resourcesByComponent[resourceName])
+				for (const auto& resource : findByComponent(resourceName))
 				{
 					auto conCtx = instance->GetComponent<console::Context>();
 					conCtx->ExecuteSingleCommandDirect(ProgramArguments{ "start", resource });
@@ -581,9 +674,9 @@ static InitFunction initFunction([]()
 				return;
 			}
 
-			if (resourceName[0] == '[' && resourceName[resourceName.size() - 1] == ']')
+			if (isCategory(resourceName))
 			{
-				for (const auto& resource : g_resourcesByComponent[resourceName])
+				for (const auto& resource : findByComponent(resourceName))
 				{
 					auto conCtx = instance->GetComponent<console::Context>();
 					conCtx->ExecuteSingleCommandDirect(ProgramArguments{ "stop", resource });
@@ -631,21 +724,9 @@ static InitFunction initFunction([]()
 			conCtx->ExecuteSingleCommandDirect(ProgramArguments{ "start", resourceName });
 		});
 
-		static bool configured = false;
-
-		static auto ensureCommandRef = instance->AddCommand("ensure", [=](const std::string& resourceName)
+#if defined(_DEBUG) && defined(_WIN32)
+		static auto openCommandRef = instance->AddCommand("open", [=](const std::string& resourceName)
 		{
-			if (resourceName[0] == '[' && resourceName[resourceName.size() - 1] == ']')
-			{
-				for (const auto& resource : g_resourcesByComponent[resourceName])
-				{
-					auto conCtx = instance->GetComponent<console::Context>();
-					conCtx->ExecuteSingleCommandDirect(ProgramArguments{ "ensure", resource });
-				}
-
-				return;
-			}
-
 			auto resource = resman->GetResource(resourceName);
 
 			if (!resource.GetRef())
@@ -654,21 +735,59 @@ static InitFunction initFunction([]()
 				return;
 			}
 
-			auto conCtx = instance->GetComponent<console::Context>();
+			ShellExecuteW(NULL, L"open", ToWide(resource->GetPath()).c_str(), NULL, NULL, SW_SHOWNORMAL);
+		});
+#endif
 
-			// don't allow `ensure` to restart a resource if we're still configuring (e.g. executing a startup script)
-			// this'll lead to issues when, say, the following script runs:
-			//     ensure res2
-			//     ensure res1
-			//
-			// if res2 depends on res1, res1 restarting will lead to res2 stopping but not being started again
-			// #TODO: restarting behavior of stopped dependencies at runtime
-			if (configured && resource->GetState() == fx::ResourceState::Started)
+		static bool configured = false;
+
+		static auto ensureCommandRef = instance->AddCommand("ensure", [=](const std::string& resourceName)
+		{
+			auto doEnsure = [&](const std::string& resourceName)
 			{
-				conCtx->ExecuteSingleCommandDirect(ProgramArguments{ "stop", resourceName });
+				auto resource = resman->GetResource(resourceName);
+
+				if (!resource.GetRef())
+				{
+					trace("^3Couldn't find resource %s.^7\n", resourceName);
+					return false;
+				}
+
+				auto conCtx = instance->GetComponent<console::Context>();
+
+				// don't allow `ensure` to restart a resource if we're still configuring (e.g. executing a startup script)
+				// this'll lead to issues when, say, the following script runs:
+				//     ensure res2
+				//     ensure res1
+				//
+				// if res2 depends on res1, res1 restarting will lead to res2 stopping but not being started again
+				// #TODO: restarting behavior of stopped dependencies at runtime
+				if (configured && resource->GetState() == fx::ResourceState::Started)
+				{
+					conCtx->ExecuteSingleCommandDirect(ProgramArguments{ "stop", resourceName });
+				}
+
+				conCtx->ExecuteSingleCommandDirect(ProgramArguments{ "start", resourceName });
+
+				return true;
+			};
+
+			if (isCategory(resourceName))
+			{
+				for (const auto& resource : findByComponent(resourceName))
+				{
+					if (!doEnsure(resource))
+					{
+						// break out of loop if failed
+						break;
+					}
+				}
+
+				return;
 			}
 
-			conCtx->ExecuteSingleCommandDirect(ProgramArguments{ "start", resourceName });
+			// if not a category, just plain ensure
+			doEnsure(resourceName);
 		});
 
 		instance->OnInitialConfiguration.Connect([]()
@@ -705,7 +824,7 @@ static InitFunction initFunction([]()
 
 				try
 				{
-					return eventComponent->TriggerEvent2("__cfx_internal:commandFallback", { "net:" + context }, rawCommand);
+					return eventComponent->TriggerEvent2("__cfx_internal:commandFallback", { "internal-net:" + context }, rawCommand);
 				}
 				catch (std::bad_any_cast& e)
 				{
@@ -747,9 +866,14 @@ static InitFunction initFunction([]()
 
 			std::string printString;
 
-			fx::PrintListenerContext context([&](const std::string_view& print)
+			fx::PrintListenerContext context([&printString](std::string_view print)
 			{
 				printString += print;
+			});
+
+			fx::PrintFilterContext filterContext([&client](ConsoleChannel& channel, std::string_view print)
+			{
+				channel = fmt::sprintf("forward:%d/%s", client->GetNetId(), channel);
 			});
 
 			fx::ScopeDestructor destructor([&]()
@@ -783,7 +907,7 @@ static InitFunction initFunction([]()
 #include <ScriptEngine.h>
 #include <optional>
 
-void fx::ServerEventComponent::TriggerClientEvent(const std::string_view& eventName, const void* data, size_t dataLen, const std::optional<std::string_view>& targetSrc, bool replayed)
+void fx::ServerEventComponent::TriggerClientEvent(const std::string_view& eventName, const void* data, size_t dataLen, const std::optional<std::string_view>& targetSrc)
 {
 	// build the target event
 	net::Buffer outBuffer;
@@ -813,14 +937,14 @@ void fx::ServerEventComponent::TriggerClientEvent(const std::string_view& eventN
 		if (client)
 		{
 			// TODO(fxserver): >MTU size?
-			client->SendPacket(0, outBuffer, (!replayed) ? NetPacketType_Reliable : NetPacketType_ReliableReplayed);
+			client->SendPacket(0, outBuffer, NetPacketType_Reliable);
 		}
 	}
 	else
 	{
 		clientRegistry->ForAllClients([&](const fx::ClientSharedPtr& client)
 		{
-			client->SendPacket(0, outBuffer, (!replayed) ? NetPacketType_Reliable : NetPacketType_ReliableReplayed);
+			client->SendPacket(0, outBuffer, NetPacketType_Reliable);
 		});
 	}
 }
@@ -835,7 +959,20 @@ static InitFunction initFunction2([]()
 		{
 			auto j = nlohmann::json::parse(jsonData);
 
-			StructuredTrace({ "type", "script_structured_trace" }, { "payload", j });
+			auto resourceName = nlohmann::json(nullptr);
+			fx::OMPtr<IScriptRuntime> runtime;
+
+			if (FX_SUCCEEDED(fx::GetCurrentScriptRuntime(&runtime)))
+			{
+				fx::Resource* resource = reinterpret_cast<fx::Resource*>(runtime->GetParentObject());
+
+				if (resource)
+				{
+					resourceName = resource->GetName();
+				}
+			}
+
+			StructuredTrace({ "type", "script_structured_trace" }, { "payload", j }, { "resource", resourceName });
 		}
 		catch (std::exception& e)
 		{
@@ -952,7 +1089,9 @@ static InitFunction initFunction2([]()
 			if (resource.GetRef())
 			{
 				resource->GetManager()->MakeCurrent();
-				resource->Tick();
+
+				// #TODOTICKLESS: handle bookmark-based resources
+				resource->GetComponent<fx::ResourceScriptingComponent>()->Tick();
 			}
 		}, true);
 	});
@@ -1087,7 +1226,14 @@ static InitFunction initFunction2([]()
 		}
 		else
 		{
-			context.SetResult(atoi(var->GetValue().c_str()));
+			auto value = var->GetValue();
+
+			if (value == "true")
+			{
+				value = "1";
+			}
+
+			context.SetResult(atoi(value.c_str()));
 		}
 	});
 

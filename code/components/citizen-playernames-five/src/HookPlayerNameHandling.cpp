@@ -14,41 +14,60 @@
 #include <ResourceEventComponent.h>
 
 #include <msgpack.hpp>
+#include <netPeerAddress.h>
 
 static NetLibrary* g_netLibrary;
 static std::unordered_map<int, std::string> g_netIdToNames;
 static std::unordered_map<int, int> g_netIdToSlots;
 
-// needs to be kept in sync with gta:net:five
-struct ScInAddr
-{
-	uint64_t unkKey1;
-	uint64_t unkKey2;
-	uint32_t secKeyTime; // added in 393
-	uint32_t ipLan;
-	uint16_t portLan;
-	uint32_t ipUnk;
-	uint16_t portUnk;
-	uint32_t ipOnline;
-	uint16_t portOnline;
-	uint16_t pad3;
-	uint32_t newVal; // added in 372
-	uint64_t rockstarAccountId; // 463/505
-};
-
-static const char* GetPlayerNameFromScAddr(ScInAddr* addr)
+static const char* GetPlayerNameFromScAddr(void* addr)
 {
 	if (addr == (void*)0x20)
 	{
 		return "** Invalid **";
 	}
 
-	if (addr->ipLan != addr->ipOnline || addr->ipLan != addr->ipUnk)
+	int netId = 0;
+
+	if (xbr::IsGameBuildOrGreater<2824>())
 	{
-		return (char*)addr + sizeof(ScInAddr) + (92 - 64);
+		auto address = (PeerAddress<2824>*)addr;
+		netId = (address->localAddr().ip.addr & 0xFFFF) ^ 0xFEED;
+	}
+	else if (xbr::IsGameBuildOrGreater<2372>())
+	{
+		auto address = (PeerAddress<2372>*)addr;
+
+		if (address->relayAddr().ip.addr != address->localAddr().ip.addr || address->relayAddr().ip.addr != address->publicAddr().ip.addr)
+		{
+			return (char*)addr + sizeof(PeerAddress<2372>) + 36;
+		}
+
+		netId = (address->relayAddr().ip.addr & 0xFFFF) ^ 0xFEED;
+	}
+	else if (xbr::IsGameBuildOrGreater<2060>())
+	{
+		auto address = (PeerAddress<2060>*)addr;
+
+		if (address->relayAddr().ip.addr != address->localAddr().ip.addr || address->relayAddr().ip.addr != address->publicAddr().ip.addr)
+		{
+			return (char*)addr + sizeof(PeerAddress<2060>) + (92 - 64);
+		}
+
+		netId = (address->relayAddr().ip.addr & 0xFFFF) ^ 0xFEED;
+	}
+	else
+	{
+		auto address = (PeerAddress<1604>*)addr;
+
+		if (address->relayAddr().ip.addr != address->localAddr().ip.addr || address->relayAddr().ip.addr != address->publicAddr().ip.addr)
+		{
+			return (char*)addr + sizeof(PeerAddress<1604>) + (92 - 64);
+		}
+
+		netId = (address->relayAddr().ip.addr & 0xFFFF) ^ 0xFEED;
 	}
 
-	int netId = (addr->ipLan & 0xFFFF) ^ 0xFEED;
 	auto it = g_netIdToNames.find(netId);
 
 	if (it == g_netIdToNames.end())
@@ -67,9 +86,16 @@ static char* _getPackfileName(char* packfile)
 static HookFunction hookFunction([] ()
 {
 	// function that (hopefully) is only used for getting names from SC data blocks
-	void* playerNameGetter = hook::pattern("49 8B CE FF 50 30 48 8B C8 E8 ? ? ? ? 48 8D").count(1).get(0).get<void>(9);
-
-	hook::jump(hook::get_call(playerNameGetter), GetPlayerNameFromScAddr);
+	if (xbr::IsGameBuildOrGreater<2944>())
+	{
+		void* playerNameGetter = hook::pattern("E8 ? ? ? ? 48 8D 94 24 ? ? ? ? 49 8D 4E 68").count(1).get(0).get<void>(0);
+		hook::jump(hook::get_call(playerNameGetter), GetPlayerNameFromScAddr);
+	}
+	else
+	{
+		void* playerNameGetter = hook::pattern("49 8B CE FF 50 ? 48 8B C8 E8 ? ? ? ? 48 8D").count(1).get(0).get<void>(9);
+		hook::jump(hook::get_call(playerNameGetter), GetPlayerNameFromScAddr);
+	}
 
 	// 505 changes cause this to conflict with (at least) packfile naming - change that one therefore
 	{

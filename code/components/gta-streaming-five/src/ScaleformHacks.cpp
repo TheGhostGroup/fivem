@@ -4,7 +4,9 @@
 #include <nutsnbolts.h>
 #include <sfFontStuff.h>
 
+#include <CoreConsole.h>
 #include <Streaming.h>
+#include <CrossBuildRuntime.h>
 
 struct GFxObjectInterface
 {
@@ -13,7 +15,7 @@ struct GFxObjectInterface
 
 struct GFxValue;
 
-static hook::cdecl_stub<bool(GFxObjectInterface*, void*, GFxValue*, const char*)> __GFxObjectInterface_CreateEmptyMovieClip([]()
+static hook::cdecl_stub<bool(GFxObjectInterface*, void*, GFxValue*, const char*, int)> __GFxObjectInterface_CreateEmptyMovieClip([]()
 {
 	return hook::get_pattern("4D 8B E0 4C 8B F9 48 85 DB 75 18 48", -0x25);
 });
@@ -34,8 +36,13 @@ struct GFxDisplayInfo
 	double FOV;
 	float ViewMatrix3D[4][4];
 	float ProjectionMatrix3D[4][4];
-	uint8_t VarsSet;
+	uint16_t VarsSet;
 };
+
+static hook::cdecl_stub<bool(GFxObjectInterface*, void*, GFxDisplayInfo*)> __GFxObjectInterface_GetDisplayInfo([]()
+{
+	return hook::get_pattern("83 65 9B 00 83 65 97 00 F2", -0x60);
+});
 
 static hook::cdecl_stub<bool(GFxObjectInterface*, void*, const GFxDisplayInfo&)> __GFxObjectInterface_SetDisplayInfo([]()
 {
@@ -117,9 +124,20 @@ struct GFxValue
 		}
 	}
 
+	inline ValueType GetType() const
+	{
+		return ValueType(Type & VTC_TypeMask);
+	}
+
 	inline bool IsDisplayObject() const
 	{
 		return (Type & VTC_TypeMask) == VT_DisplayObject;
+	}
+
+	inline double GetNumber() const
+	{
+		assert(GetType() == VT_Number);
+		return mValue.NValue;
 	}
 
 	inline const char* GetString() const
@@ -138,9 +156,20 @@ struct GFxValue
 		pObjectInterface = nullptr;
 	}
 
-	inline bool CreateEmptyMovieClip(GFxValue* movieClip, const char* instanceName)
+	inline bool CreateEmptyMovieClip(GFxValue* movieClip, const char* instanceName, int depth)
 	{
-		return __GFxObjectInterface_CreateEmptyMovieClip(pObjectInterface, mValue.pData, movieClip, instanceName);
+		// CreateEmptyMovieClip will fail if depth >0x7EFFFFFD
+		if (depth > 0x7EFFFFFD)
+		{
+			depth = 0x7EFFFFFD;
+		}
+
+		return __GFxObjectInterface_CreateEmptyMovieClip(pObjectInterface, mValue.pData, movieClip, instanceName, depth);
+	}
+
+	inline bool GetDisplayInfo(GFxDisplayInfo* info)
+	{
+		return __GFxObjectInterface_GetDisplayInfo(pObjectInterface, mValue.pData, info);
 	}
 
 	inline bool SetDisplayInfo(const GFxDisplayInfo& info)
@@ -296,7 +325,7 @@ static void SetupTerritories()
 	
 	overlayRootClip = {};
 
-	g_foregroundOverlay3D->CreateEmptyMovieClip(&overlayRootClip, "asTestClip3D");
+	g_foregroundOverlay3D->CreateEmptyMovieClip(&overlayRootClip, "asTestClip3D", -1);
 
 	auto movie = _getScaleformMovie(*g_gfxId);
 
@@ -308,9 +337,15 @@ static void SetupTerritories()
 	movie->SetVariable("TIMELINE.OVERLAY_METHOD", overlayMethodValue, 1);
 }
 
-static std::map<std::string, int> g_swfLoadQueue;
-static std::set<int> g_swfRemoveQueue;
-static int g_swfId;
+struct MinimapOverlayLoadRequest
+{
+	int sfwId;
+	int depth;
+};
+
+static std::map<std::string, MinimapOverlayLoadRequest> g_minimapOverlayLoadQueue;
+static std::set<int> g_minimapOverlayRemoveQueue;
+static int g_minimapOverlaySwfId;
 
 static hook::cdecl_stub<void(const char*, bool)> _gfxPushString([]()
 {
@@ -329,17 +364,18 @@ static hook::cdecl_stub<bool(uint32_t, int, const char*, int, int)> _setupGfxCal
 
 namespace sf
 {
-	int AddMinimapOverlay(const std::string& swfName)
+	int AddMinimapOverlay(const std::string& swfName, int depth)
 	{
-		auto id = ++g_swfId;
-		g_swfLoadQueue.insert({ swfName, id });
+		auto id = ++g_minimapOverlaySwfId;
+
+		g_minimapOverlayLoadQueue.insert({ swfName, { id, depth } });
 
 		return id;
 	}
 
 	void RemoveMinimapOverlay(int swfId)
 	{
-		g_swfRemoveQueue.insert(swfId);
+		g_minimapOverlayRemoveQueue.insert(swfId);
 	}
 
 	bool HasMinimapLoaded(int swfId)
@@ -378,56 +414,113 @@ namespace sf
 	}
 }
 
+namespace sf::logging
+{
+	const char* const g_scriptTypes[] = {
+		"GENERIC_TYPE",
+		"SCRIPT_TYPE",
+		"HUD_TYPE",
+		"MINIMAP_TYPE",
+		"WEB_TYPE",
+		"CUTSCENE_TYPE",
+		"PAUSE_TYPE",
+		"STORE",
+		"GAMESTREAM",
+		"SF_BASE_CLASS_VIDEO_EDITOR",
+		"SF_BASE_CLASS_MOUSE",
+		"SF_BASE_CLASS_TEXT_INPUT",
+	};
+
+	static bool g_scaleformDebugLog = 0;
+	static ConVar<bool> g_scaleformDebugLogVar("game_enableScaleformDebugLog", ConVar_Archive | ConVar_UserPref, false, &g_scaleformDebugLog);
+
+	static void (*g_origSfCallGameFromFlash)(void* _this, void* movieView, const char* methodName, const GFxValue* args, uint32_t argCount);
+	static void SfCallGameFromFlash(void* _this, void* movieView, const char* methodName, const GFxValue* args, uint32_t argCount)
+	{
+		// only print debug log calls
+		if ((g_scaleformDebugLog && argCount >= 2 && strcmp(methodName, "DEBUG_LOG") == 0))
+		{
+			if (args[0].GetType() == GFxValue::ValueType::VT_Number)
+			{
+				if (args[1].GetType() == GFxValue::ValueType::VT_String)
+				{
+					uint32_t scriptType = (int32_t)args[0].GetNumber(); // uint32 requires only 1 check
+					trace("[%s] %s\n", scriptType < std::size(g_scriptTypes) ? g_scriptTypes[scriptType] : "UNKNOWN", args[1].GetString());
+				}
+			}
+		}
+
+		g_origSfCallGameFromFlash(_this, movieView, methodName, args, argCount);
+	}
+}
+
 static HookFunction hookFunction([]()
 {
 	OnMainGameFrame.Connect([]()
 	{
-		std::set<std::string> toRemove;
+		std::set<std::string> toRemoveFromMinimapOverlayLoadQueue;
 
 		auto cstreaming = streaming::Manager::GetInstance();
 
-		for (const auto& swf : g_swfLoadQueue)
+		for (const auto& [gfxFileName, request] : g_minimapOverlayLoadQueue)
 		{
-			auto val = std::make_shared<GFxValue>();
-			overlayRootClip.CreateEmptyMovieClip(val.get(), va("id%d", swf.second));
+			auto swf = std::make_shared<GFxValue>();
 
-			GFxValue rv;
+			auto instanceName = va("id%d", request.sfwId);
 
-			GFxValue args(swf.first.c_str());
-			val->Invoke("loadMovie", &rv, &args, 1);
+			overlayRootClip.CreateEmptyMovieClip(swf.get(), instanceName, request.depth);
 
-			g_overlayClips[swf.second] = val;
+			GFxValue result;
+			GFxValue args(gfxFileName.c_str());
 
-			toRemove.insert(swf.first);
+			swf->Invoke("loadMovie", &result, &args, 1);
+
+			g_overlayClips[request.sfwId] = swf;
+
+			toRemoveFromMinimapOverlayLoadQueue.insert(gfxFileName);
 		}
 
-		for (const auto& swf : toRemove)
+		for (const auto& gfxFileName : toRemoveFromMinimapOverlayLoadQueue)
 		{
-			g_swfLoadQueue.erase(swf);
+			g_minimapOverlayLoadQueue.erase(gfxFileName);
 		}
 
-		for (int swfKey : g_swfRemoveQueue)
+		for (int swfId : g_minimapOverlayRemoveQueue)
 		{
-			auto swf = g_overlayClips[swfKey];
-
-			if (swf)
+			if (auto swf = g_overlayClips[swfId]; swf)
 			{
 				swf->Invoke("removeMovieClip", nullptr, nullptr, 0);
 			}
 		}
 
-		g_swfRemoveQueue.clear();
+		g_minimapOverlayRemoveQueue.clear();
 	});
 
 	{
 		auto location = hook::get_pattern<char>("74 3B E8 ? ? ? ? 33 C9 E8", 0x31);
 
-		g_foregroundOverlay3D = hook::get_address<decltype(g_foregroundOverlay3D)>(hook::get_call(location) + 0x1C);
+		g_foregroundOverlay3D = hook::get_address<decltype(g_foregroundOverlay3D)>(hook::get_call(location) + (xbr::IsGameBuildOrGreater<2372>() ? 0x18 : 0x1C));
 
 		hook::set_call(&g_origSetupTerritories, location);
 		hook::call(location, SetupTerritories);
 	}
 
-	g_gfxId = hook::get_address<uint32_t*>(hook::get_pattern("66 C7 45 E4 01 01 E8", 0x2A));
+	if (xbr::IsGameBuildOrGreater<2372>())
+	{
+		g_gfxId = hook::get_address<uint32_t*>(hook::get_pattern("C6 45 F0 01 48 89 4D D0 48 8D 4D", 0x17));
+	}
+	else
+	{
+		g_gfxId = hook::get_address<uint32_t*>(hook::get_pattern("66 C7 45 E4 01 01 E8", 0x2A));
+	}
+
 	g_gfxMemoryHeap = hook::get_address<GFxMemoryHeap**>(hook::get_pattern("F0 FF 4A 08 75 0E 48 8B 0D", 9));
+
+
+	// scaleform -> game call hook, for debug logging
+	{
+		void** sfCallGameFromFlashVTable = hook::get_address<void**>(hook::get_pattern<char>("48 8D 0D ? ? ? ? C7 40 ? ? ? ? ? 48 89 08 89 68 08", 3));
+		hook::put(&sf::logging::g_origSfCallGameFromFlash, sfCallGameFromFlashVTable[1]);
+		hook::put(&sfCallGameFromFlashVTable[1], &sf::logging::SfCallGameFromFlash);
+	}
 });

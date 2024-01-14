@@ -13,7 +13,7 @@ namespace fx
 
 	void ScriptEngine::RegisterNativeHandler(uint64_t nativeIdentifier, TNativeHandler function)
 	{
-		g_nativeHandlers.insert({ nativeIdentifier, function });
+		g_nativeHandlers[nativeIdentifier] = function;
 	}
 
 	boost::optional<TNativeHandler> ScriptEngine::GetNativeHandler(uint64_t nativeIdentifier)
@@ -21,6 +21,12 @@ namespace fx
 		auto it = g_nativeHandlers.find(nativeIdentifier);
 
 		return (it == g_nativeHandlers.end()) ? boost::optional<TNativeHandler>() : it->second;
+	}
+
+	TNativeHandler* ScriptEngine::GetNativeHandlerPtr(uint64_t nativeIdentifier)
+	{
+		auto it = g_nativeHandlers.find(nativeIdentifier);
+		return it != g_nativeHandlers.end() ? &it->second : nullptr;
 	}
 }
 

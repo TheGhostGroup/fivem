@@ -16,6 +16,7 @@
 
 #include <ComponentHolder.h>
 
+#include <rapidjson/document.h>
 #include <tl/expected.hpp>
 
 #include <msgpack.hpp>
@@ -124,12 +125,6 @@ public:
 	//
 	virtual void MakeCurrent() = 0;
 
-private:
-	struct pass
-	{
-		template<typename ...T> pass(T...) {}
-	};
-
 public:
 	//
 	// Calls a formatted function reference.
@@ -151,7 +146,7 @@ public:
 
 		// pack the argument pack as array
 		packer.pack_array(sizeof...(args));
-		pass{ (packer.pack(args), 0)... };
+		(packer.pack(args), ...);
 
 		std::string retval = CallReferenceInternal(functionReference, std::string(buf.data(), buf.size()));
 
@@ -168,6 +163,8 @@ public:
 	fwEvent<> OnTick;
 
 	fwEvent<> OnAfterReset;
+
+	fwEvent<rapidjson::Document&> OnContentManifestDownloaded;
 
 public:
 	//

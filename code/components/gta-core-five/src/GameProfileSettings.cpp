@@ -200,7 +200,12 @@ static hook::cdecl_stub<void(int idx, int, int)> _updatePref([]()
 		return (void*)nullptr;
 	}
 
-	return hook::get_pattern("83 F9 62 0F 8F ? ? 00 00 83 F9 61 0F", (Is2060()) ? -0x29 : -0x23);
+	if (xbr::IsGameBuildOrGreater<2944>())
+	{
+		return hook::get_pattern("48 2B E0 44 8B F2 BB 8B 00 00 00 83 F9 63 0F 8F", -0x29);
+	}
+
+	return hook::get_pattern("83 F9 62 0F 8F ? ? 00 00 83 F9 61 0F", (xbr::IsGameBuildOrGreater<2060>()) ? -0x29 : -0x23);
 });
 
 void ProfileSettingsInit()
@@ -248,6 +253,12 @@ void ProfileSettingsInit()
 					continue;
 				}
 
+				// profile_gfx* is also a pretty bad one
+				if (name.find("profile_gfx") == 0)
+				{
+					continue;
+				}
+
 				auto setting = g_prefs[field->index];
 				_profileConVars[field->index] = std::make_shared<ProfileConVar>(name, setting);
 			}
@@ -279,8 +290,101 @@ void ProfileSettingsInit()
 	});
 }
 
+static bool (*g_orig_parSettingsLoad)(void* parManager, const char* filename, const char* ext, void* outStruct, void* handle);
+
+static bool parser_SettingsLoad(void* parManager, const char* filename, const char* ext, char* outStruct, void* handle)
+{
+	bool rv = g_orig_parSettingsLoad(parManager, filename, ext, outStruct, handle);
+
+	if (rv)
+	{
+		int& shadowQuality = *(int*)(outStruct + 40);
+
+		if (shadowQuality < 0 || shadowQuality > 3)
+		{
+			shadowQuality = 1;
+		}
+	}
+
+	return rv;
+}
+
 static HookFunction hookFunction([]()
 {
 	g_prefs = hook::get_address<int*>(hook::get_pattern("8D 0C 9B 8B 14 AA 8D 3C 4A 83 F8 FF 0F 84", -4));
 	g_profileSettings = hook::get_address<void**>(hook::get_pattern("44 38 7B 20 0F 84 ? ? 00 00 41 8D 7F 02", -4));
+
+	// reset shadow quality to 'normal' if it has had -1 saved
+	{
+		auto location = hook::get_pattern("4C 8B C7 48 89 44 24 20 E8 ? ? ? ? 84 C0 75 14", 8);
+		hook::set_call(&g_orig_parSettingsLoad, location);
+		hook::call(location, parser_SettingsLoad);
+	}
+	
+	// Patches enabling ShadowQuality=OFF in pausemenu
+	if (xbr::IsGameBuildOrGreater<2802>())
+	{
+		// 44 8B C6      mov     r8d, esi
+		// FF CA         dec     edx    <---------------
+		hook::nop(hook::get_pattern<unsigned char>("44 8B C6 FF CA", 3), 2);
+	}
+	else
+	{
+		// 8D 4B 42      lea     ecx, [rbx+42h]
+		// FF CA         dec     edx    <---------------
+		hook::nop(hook::get_pattern<unsigned char>("8D 4B 42 FF CA", 3), 2);
+	}
+
+	// 8B 45 88      mov     eax, [rbp+0D0h+var_148]
+    // FF C8         dec     eax   <--------------
+    // 3B C1         cmp     eax, ecx
+	hook::nop(hook::get_pattern<unsigned char>("8B 45 ? FF C8 3B C1", 3), 2);
+
+	// 8B 44 24 68   mov     eax, [rsp+300h+var_298]
+    // FF C8         dec     eax   <----------------
+    // 3B C1         cmp     eax, ecx
+	hook::nop(hook::get_pattern<unsigned char>("8B 44 ? ? FF C8 3B C1", 4), 2);
+
+	// *This is where the Game converts the value from profile/preferences in the pausemenu to the CGraphicsSettings in the CSettingsManager*
+	// 89 43 5C             mov     [rbx+5Ch], eax
+    // 8B 05 04 E3 ED 01    mov     eax, cs:pref_shadowQuality
+    // FF C0                inc     eax  <---------------
+	hook::nop(hook::get_pattern<unsigned char>("89 43 ? 8B 05 ? ? ? ? FF C0 89", 9), 2);
+
+	// Most of the checks are done via the game's internal settings, but there is one here in the pausemenu for another option(#93)
+	// 83 3D 92 A2 EC 01 02   cmp     cs:pref_shadowQuality, 2  <--------------- (this should be 3 now)
+	// 41 0F 9D C4            setnl   r12b
+	unsigned char *cmp2 = hook::get_pattern<unsigned char>("83 3D ? ? ? ? 02 41 0F 9D C4", 6);
+	hook::put<uint8_t>(cmp2, 0x03);
+
+	// Crash fix (connecticut-texas-carbon) for `_updatePref()` (settings->display->safezone-size)
+	// The game doesn't check for nullptr here, but does in other places...
+
+	// Conveniently, there is a function [1604]sub_14018014C() that checks null and sets=1 for us
+	unsigned char* checkAndSetFuncAddr = hook::get_pattern<unsigned char>("48 8B 05 ? ? ? ? 48 85 C0 74 ? C6 80 AC 00 00 00 01 C3");
+
+	if (!xbr::IsGameBuildOrGreater<2372>())
+	{
+		// 48 8B 05 EB 74 E7 01    mov     rax, cs:qword_14206E448
+		// 40 88 B8 AC 00 00 00    mov     [rax+0ACh], dil(value=1)
+		unsigned char* crashAddr = hook::get_pattern<unsigned char>("48 8B 05 ? ? ? ? 40 88 B8 AC 00 00 00");
+		hook::nop(crashAddr, 14);
+		hook::call(crashAddr, checkAndSetFuncAddr);
+	}
+	else
+	{
+		// this area was somewhat re-worked in 2372.
+		// The pointer is now retrieved via a function ex: auto ptr = GetPointer();
+		// And then ptr+172 is set with another Function ex: SetBool172(ptr);
+		// however the functions are simple 1-liners, it still doesn't seem to check for null.
+
+		// E8 E2 9A 2A 00                          call    GetPointer
+		// 48 8B C8                                mov     rcx, rax
+		// E8 C2 0A 2B 00                          call    SetBool172  <-------------------
+		// E8 B5 DD 13 00                          call    sub_7FF712DE62B4
+		// 48 8B 0D AA 11 E0 01                    mov     rcx, cs:qword_7FF714AA96
+
+		unsigned char* setBool172 = hook::get_pattern<unsigned char>("E8 ? ? ? ? 48 8B C8 E8 ? ? ? ? E8 ? ? ? ? 48 8B 0D", 8);
+		hook::call(setBool172, checkAndSetFuncAddr);
+	}
 });

@@ -12,7 +12,7 @@
 #include <NetBuffer.h>
 #include <StructuredTrace.h>
 
-#include <state/ServerGameState.h>
+#include <state/ServerGameStatePublic.h>
 
 #include <PrintListener.h>
 
@@ -41,13 +41,17 @@
 #include <ResumeComponent.h>
 #endif
 
+#include <InfoHttpHandler.h>
+
+constexpr const char kDefaultServerList[] = "https://servers-ingress-live.fivem.net/ingress";
+
 static fx::GameServer* g_gameServer;
 
 extern fwEvent<> OnEnetReceive;
 
 namespace fx
 {
-	extern bool IsOneSync();
+	DLL_EXPORT object_pool<GameServerPacket> m_packetPool;
 
 	GameServer::GameServer()
 		: m_residualTime(0), m_serverTime(msec().count()), m_nextHeartbeatTime(0), m_hasSettled(false)
@@ -73,7 +77,7 @@ namespace fx
 	{
 		m_instance = instance;
 
-		m_gamename = instance->AddVariable<GameName>("gamename", ConVar_ServerInfo, GameName::GTA5);
+		m_gamename = std::make_shared<ConVar<GameName>>("gamename", ConVar_ServerInfo, GameName::GTA5);
 		m_lastGameName = m_gamename->GetHelper()->GetValue();
 
 #ifdef _WIN32
@@ -103,7 +107,7 @@ namespace fx
 
 		m_rconPassword = instance->AddVariable<std::string>("rcon_password", ConVar_None, "");
 		m_hostname = instance->AddVariable<std::string>("sv_hostname", ConVar_ServerInfo, "default FXServer");
-		m_masters[0] = instance->AddVariable<std::string>("sv_master1", ConVar_None, "https://servers-ingress-live.fivem.net/ingress");
+		m_masters[0] = instance->AddVariable<std::string>("sv_master1", ConVar_None, kDefaultServerList);
 		m_masters[1] = instance->AddVariable<std::string>("sv_master2", ConVar_None, "");
 		m_masters[2] = instance->AddVariable<std::string>("sv_master3", ConVar_None, "");
 		m_listingIpOverride = instance->AddVariable<std::string>("sv_listingIpOverride", ConVar_None, "");
@@ -186,7 +190,7 @@ namespace fx
 
 					auto loop = m_mainThreadLoop->GetLoop();
 
-					// periodic timer for network ticks
+					// periodic timer for main ticks
 					auto frameTime = 1000 / 20;
 
 					auto mpd = mainData.get();
@@ -228,6 +232,12 @@ namespace fx
 					{
 						m_mainThreadCallbacks->Run();
 					}));
+
+					// run remaining callbacks before we remove this callback list
+					if (m_mainThreadCallbacks)
+					{
+						m_mainThreadCallbacks->Run();
+					}
 
 					m_mainThreadCallbacks = std::make_unique<CallbackListUv>(mainData->callbackAsync);
 					m_mainThreadCallbacks->AttachToThread();
@@ -585,20 +595,6 @@ namespace fx
 
 	void GameServer::InternalSendPacket(fx::Client* client, int peer, int channel, const net::Buffer& buffer, NetPacketType type)
 	{
-		// TODO: think of a more uniform way to determine null peers
-		NetPeerStackBuffer stackBuffer;
-		m_net->GetPeer(peer, stackBuffer);
-		if (stackBuffer.GetBase()->GetPing() == -1)
-		{
-			if (type == NetPacketType_ReliableReplayed)
-			{
-				client->PushReplayPacket(channel, buffer);
-			}
-
-			return;
-		}
-
-
 		GameServerPacket* packet = m_packetPool.construct(peer, channel, buffer, type);
 		m_netSendList.push(&packet->queueKey);
 	}
@@ -672,7 +668,7 @@ namespace fx
 						return;
 					}
 
-					if (!client->GetData("passedValidation").has_value())
+					if (!client->GetData("passedValidation"))
 					{
 						SendOutOfBand(peer->GetAddress(), "error Invalid connection.");
 
@@ -715,6 +711,8 @@ namespace fx
 
 					auto host = m_clientRegistry->GetHost();
 
+					uint32_t bigModeSlot = (m_instance->GetComponent<fx::GameServer>()->GetGameName() == fx::GameName::GTA5) ? 128 : 16;
+
 					auto outStr = fmt::sprintf(
 						" %d %d %d %d %lld",
 						client->GetNetId(),
@@ -722,7 +720,7 @@ namespace fx
 						(host) ? host->GetNetBase() : -1,
 						(IsOneSync())
 							? ((fx::IsBigMode())
-								? 128
+								? bigModeSlot
 								: client->GetSlotId())
 							: -1,
 						(IsOneSync()) ? msec().count() : -1);
@@ -730,8 +728,6 @@ namespace fx
 					outMsg.Write(outStr.c_str(), outStr.size());
 
 					client->SendPacket(0, outMsg, NetPacketType_Reliable);
-
-					client->ReplayPackets();
 
 					if (wasNew)
 					{
@@ -742,7 +738,7 @@ namespace fx
 
 						if (IsOneSync())
 						{
-							m_instance->GetComponent<fx::ServerGameState>()->SendObjectIds(client, fx::IsBigMode() ? 4 : 64);
+							m_instance->GetComponent<fx::ServerGameStatePublic>()->SendObjectIds(client, fx::IsBigMode() ? 4 : 64);
 						}
 
 						ForceHeartbeatSoon();
@@ -766,6 +762,10 @@ namespace fx
 			m_packetHandler(msgType, client, msg);
 		}
 
+		if (client->GetNetworkMetricsRecvCallback())
+		{
+			client->GetNetworkMetricsRecvCallback()(client.get(), msgType, msg);
+		}
 		client->Touch();
 	}
 
@@ -877,27 +877,35 @@ namespace fx
 		{
 			std::vector<fx::ClientSharedPtr> toRemove;
 
-			bool lockdownMode = m_instance->GetComponent<fx::ServerGameState>()->GetEntityLockdownMode() == fx::EntityLockdownMode::Strict;
+			uint8_t syncStyle = (uint8_t)m_instance->GetComponent<fx::ServerGameStatePublic>()->GetSyncStyle();
 
-			m_clientRegistry->ForAllClients([&](const fx::ClientSharedPtr& client)
+			m_clientRegistry->ForAllClients([&](fx::ClientSharedPtr client)
 			{
 				auto peer = client->GetPeer();
 
 				if (peer)
 				{
-					const auto& lm = client->GetData("lockdownMode");
-					const auto& lf = client->GetData("lastFrame");
+					auto lm = client->GetData("lockdownMode");
+					auto lf = client->GetData("lastFrame");
+					auto ss = client->GetData("syncStyle");
 
-					if (!lm.has_value() || std::any_cast<bool>(lm) != lockdownMode || !lf.has_value() || (m_serverTime - std::any_cast<uint64_t>(lf)) > 1000)
+					bool lockdownMode = m_instance->GetComponent<fx::ServerGameStatePublic>()->GetEntityLockdownMode(client) == fx::EntityLockdownMode::Strict;
+
+					if (!lm || fx::AnyCast<bool>(lm) != lockdownMode ||
+						!ss || fx::AnyCast<uint8_t>(ss) != syncStyle ||
+						!lf ||
+						(m_serverTime - fx::AnyCast<uint64_t>(lf)) > 1000)
 					{
 						net::Buffer outMsg;
 						outMsg.Write(HashRageString("msgFrame"));
 						outMsg.Write<uint32_t>(0);
 						outMsg.Write<uint8_t>(lockdownMode);
+						outMsg.Write<uint8_t>(syncStyle);
 
 						client->SendPacket(0, outMsg, NetPacketType_Reliable);
 
 						client->SetData("lockdownMode", lockdownMode);
+						client->SetData("syncStyle", syncStyle);
 						client->SetData("lastFrame", m_serverTime);
 					}
 				}
@@ -911,13 +919,106 @@ namespace fx
 
 			for (auto& client : toRemove)
 			{
-				DropClient(client, "Timed out after %d seconds.", std::chrono::duration_cast<std::chrono::seconds>(CLIENT_DEAD_TIMEOUT).count());
+				auto lastSeen = (msec() - client->GetLastSeen());
+
+				// if this happened fairly early, try to find out why
+				if (lastSeen < 1500ms)
+				{
+					auto timeoutInfo = m_net->GatherTimeoutInfo(client->GetPeer());
+
+					if (!timeoutInfo.bigCommandList.empty())
+					{
+						std::stringstream commandListFormat;
+						for (const auto& bigCmd : timeoutInfo.bigCommandList)
+						{
+							std::string name = (bigCmd.eventName.empty()) ? fmt::sprintf("%08x", bigCmd.type) : bigCmd.eventName;
+
+							commandListFormat << fmt::sprintf("%s (%d B, %d msec ago)\n", name, bigCmd.size, bigCmd.timeAgo);
+						}
+
+						DropClient(client, "Server->client connection timed out. Pending commands: %d.\nCommand list:\n%s", timeoutInfo.pendingCommands, commandListFormat.str());
+						continue;
+					}
+				}
+
+				DropClient(client, "Server->client connection timed out. Last seen %d msec ago.", lastSeen.count());
 			}
 		}
 
 		// if we should heartbeat
 		if (msec() >= m_nextHeartbeatTime)
 		{
+			auto sendHttpHeartbeat = [this](std::string_view masterName, bool isPrivate)
+			{
+				auto var = m_instance->GetComponent<console::Context>()->GetVariableManager()->FindEntryRaw("sv_licenseKeyToken");
+
+				if (var && !var->GetValue().empty())
+				{
+					console::DPrintf("citizen-server-impl", "Sending heartbeat to %s\n", masterName);
+
+					nlohmann::json playersJson, infoJson, dynamicJson;
+					auto ihh = m_instance->GetComponent<InfoHttpHandlerComponent>();
+					ihh->GetJsonData(&infoJson, &dynamicJson, &playersJson);
+
+					auto json = nlohmann::json::object({
+						{ "port", m_instance->GetComponent<fx::TcpListenManager>()->GetPrimaryPort() },
+						{ "listingToken", m_instance->GetComponent<ServerLicensingComponent>()->GetListingToken() },
+						{ "ipOverride", m_listingIpOverride->GetValue() },
+						{ "forceIndirectListing", m_forceIndirectListing->GetValue() },
+						{ "private", isPrivate },
+						{ "fallbackData", nlohmann::json::object({
+							{ "players", playersJson },
+							{ "info", infoJson },
+							{ "dynamic", dynamicJson },
+						})}
+					});
+
+					if (!m_listingHostOverride->GetValue().empty())
+					{
+						json["hostOverride"] = m_listingHostOverride->GetValue();
+					}
+
+					HttpRequestOptions ro;
+					ro.ipv4 = true;
+					ro.headers = std::map<std::string, std::string>{
+						{ "Content-Type", "application/json; charset=utf-8" }
+					};
+					ro.addErrorBody = true;
+
+					static bool firstRun = true;
+
+					Instance<HttpClient>::Get()->DoPostRequest(std::string{ masterName }, json.dump(), ro, [](bool success, const char* d, size_t s)
+					{
+						if (!success)
+						{
+							console::DPrintf("citizen-server-impl", "error submitting to ingress: %s\n", std::string{ d, s });
+							return;
+						}
+
+						try
+						{
+							// don't return a query error for the first run (may be residual)
+							if (!firstRun)
+							{
+								auto j = nlohmann::json::parse(d, d + s);
+								if (j.is_object() && j.contains("lastError"))
+								{
+									auto lastError = j["lastError"].get<std::string>();
+									console::Printf("citizen-server-impl", "^1Server list query returned an error: %s^7\n", lastError.substr(0, lastError.find_first_of("\r\n")));
+								}
+							}
+						}
+						catch (...)
+						{
+						}
+
+						firstRun = false;
+					});
+				}
+			};
+
+			bool isPrivate = true;
+
 			// loop through each master
 			for (auto& master : m_masters)
 			{
@@ -936,47 +1037,21 @@ namespace fx
 							// send a heartbeat to the master
 							SendOutOfBand(it->second, "heartbeat DarkPlaces\n");
 
-							trace("Sending heartbeat to %s\n", masterName);
+							console::DPrintf("citizen:server:impl", "Sending (old style) heartbeat to %s\n", masterName);
 						}
+					}
+					else if (masterName != kDefaultServerList)
+					{
+						sendHttpHeartbeat(masterName, isPrivate);
 					}
 					else
 					{
-						auto var = m_instance->GetComponent<console::Context>()->GetVariableManager()->FindEntryRaw("sv_licenseKeyToken");
-
-						if (var && !var->GetValue().empty())
-						{
-							trace("Sending heartbeat to %s\n", masterName);
-
-							auto json = nlohmann::json::object({
-								{ "port", m_instance->GetComponent<fx::TcpListenManager>()->GetPrimaryPort() },
-								{ "listingToken", m_instance->GetComponent<ServerLicensingComponent>()->GetListingToken() },
-								{ "ipOverride", m_listingIpOverride->GetValue() },
-								{ "forceIndirectListing", m_forceIndirectListing->GetValue() },
-								});
-
-							if (!m_listingHostOverride->GetValue().empty())
-							{
-								json["hostOverride"] = m_listingHostOverride->GetValue();
-							}
-
-							HttpRequestOptions ro;
-							ro.ipv4 = true;
-							ro.headers = std::map<std::string, std::string>{
-								{ "Content-Type", "application/json; charset=utf-8" }
-							};
-
-							Instance<HttpClient>::Get()->DoPostRequest(masterName, json.dump(), ro, [](bool success, const char* d, size_t s)
-							{
-								if (!success)
-								{
-									trace("error submitting to ingress: %s\n", std::string{ d, s });
-								}
-							});
-						}
+						isPrivate = false;
 					}
 				}
 			}
 
+			sendHttpHeartbeat(kDefaultServerList, isPrivate);
 			m_nextHeartbeatTime = msec() + 3min;
 		}
 
@@ -1010,6 +1085,21 @@ namespace fx
 			realReason = "Dropped.";
 		}
 
+		if (client->IsDropping())
+		{
+			return;
+		}
+
+		client->SetDropping();
+
+		gscomms_execute_callback_on_main_thread([this, client, realReason]()
+		{
+			DropClientInternal(client, realReason);
+		});
+	}
+
+	void GameServer::DropClientInternal(const fx::ClientSharedPtr& client, const std::string& realReason)
+	{
 		// send an out-of-band error to the client
 		if (client->GetPeer())
 		{
@@ -1022,15 +1112,21 @@ namespace fx
 		// ensure mono thread attachment (if this was a worker thread)
 		MonoEnsureThreadAttached();
 
-		// trigger a event signaling the player's drop
-		m_instance
-			->GetComponent<fx::ResourceManager>()
-			->GetComponent<fx::ResourceEventManagerComponent>()
-			->TriggerEvent2(
-				"playerDropped",
-				{ fmt::sprintf("net:%d", client->GetNetId()) },
-				realReason
-			);
+		// verify if the client is still using a TempID
+		bool isFinal = (client->GetNetId() < 0xFFFF);
+
+		// trigger a event signaling the player's drop, if final
+		if (isFinal)
+		{
+			m_instance
+				->GetComponent<fx::ResourceManager>()
+				->GetComponent<fx::ResourceEventManagerComponent>()
+				->TriggerEvent2(
+					"playerDropped",
+					{ fmt::sprintf("internal-net:%d", client->GetNetId()) },
+					realReason
+				);
+		}
 
 		// remove the host if this was the host
 		if (m_clientRegistry->GetHost() == client)
@@ -1047,18 +1143,16 @@ namespace fx
 		}
 
 		// signal a drop
-		client->SetDropping();
-
 		client->OnDrop();
 
 		{
 			// for name handling, send player state
 			fwRefContainer<ServerEventComponent> events = m_instance->GetComponent<ServerEventComponent>();
 
-			if (!fx::IsBigMode())
+			if (!fx::IsBigMode() && isFinal)
 			{
 				// send every player information about the dropping client
-				events->TriggerClientEventReplayed("onPlayerDropped", std::optional<std::string_view>(), client->GetNetId(), client->GetName(), client->GetSlotId());
+				events->TriggerClientEvent("onPlayerDropped", std::optional<std::string_view>(), client->GetNetId(), client->GetName(), client->GetSlotId());
 			}
 		}
 
@@ -1074,9 +1168,9 @@ namespace fx
 	void GameServer::ForceHeartbeatSoon()
 	{
 		auto now = msec();
-		auto soon = (now + 10s);
+		auto soon = (now + 15s);
 
-		// if the next heartbeat is close to the automatically-queued keepalive time (~3mins from last)
+		// if the next heartbeat is not sooner-than-soon...
 		if (m_nextHeartbeatTime > soon)
 		{
 			// set it to execute soon
@@ -1104,15 +1198,8 @@ namespace fx
 
 	FxPrintListener printListener;
 
-	thread_local std::function<void(const std::string_view& cb)> FxPrintListener::listener;
-
 	namespace ServerDecorators
 	{
-		struct pass
-		{
-			template<typename ...T> pass(T...) {}
-		};
-
 		fwRefContainer<fx::GameServer> NewGameServer()
 		{
 			return new fx::GameServer();
@@ -1164,7 +1251,7 @@ namespace fx
 			{
 				auto limiter = server->GetInstance()->GetComponent<fx::PeerAddressRateLimiterStore>()->GetRateLimiter("getinfo", fx::RateLimiterDefaults{ 2.0, 10.0 });
 
-				if (!limiter->Consume(from))
+				if (!fx::IsProxyAddress(from) && !limiter->Consume(from))
 				{
 					return;
 				}
@@ -1204,7 +1291,7 @@ namespace fx
 			{
 				auto limiter = server->GetInstance()->GetComponent<fx::PeerAddressRateLimiterStore>()->GetRateLimiter("getstatus", fx::RateLimiterDefaults{ 1.0, 5.0 });
 
-				if (!limiter->Consume(from))
+				if (!fx::IsProxyAddress(from) && !limiter->Consume(from))
 				{
 					return;
 				}
@@ -1258,7 +1345,7 @@ namespace fx
 			{
 				auto limiter = server->GetInstance()->GetComponent<fx::PeerAddressRateLimiterStore>()->GetRateLimiter("rcon", fx::RateLimiterDefaults{ 0.2, 5.0 });
 
-				if (!limiter->Consume(from))
+				if (!fx::IsProxyAddress(from) && !limiter->Consume(from))
 				{
 					return;
 				}
@@ -1301,14 +1388,19 @@ namespace fx
 						}
 
 						// log rcon request
-						trace("Rcon from %s\n%s\n", from.ToString(), command);
+						console::Printf("rcon", "Rcon from %s\n%s\n", from.ToString(), command);
 
 						// reset rate limit for this key
 						limiter->Reset(from);
 
-						PrintListenerContext context([&](const std::string_view& print)
+						PrintListenerContext context([&printString](std::string_view print)
 						{
 							printString += print;
+						});
+
+						fx::PrintFilterContext filterContext([](ConsoleChannel& channel, std::string_view print)
+						{
+							channel = fmt::sprintf("rcon/%s", channel);
 						});
 
 						auto ctx = server->GetInstance()->GetComponent<console::Context>();
@@ -1347,7 +1439,7 @@ namespace fx
 
 						gscomms_execute_callback_on_sync_thread([instance, client, packetData]()
 						{
-							instance->GetComponent<fx::ServerGameState>()->ParseGameStatePacket(client, packetData);
+							instance->GetComponent<fx::ServerGameStatePublic>()->ParseGameStatePacket(client, packetData);
 						});
 
 						return;
@@ -1402,7 +1494,7 @@ namespace fx
 					hostBroadcast.Write(client->GetNetBase());
 
 					gameServer->Broadcast(hostBroadcast);
-					//client->SendPacket(1, hostBroadcast, NetPacketType_ReliableReplayed);
+					//client->SendPacket(1, hostBroadcast, NetPacketType_Reliable);
 				}
 			}
 
@@ -1417,11 +1509,15 @@ namespace fx
 			std::map<uint32_t, int> voteCounts;
 		};
 
-		// TODO: replace with system using dissectors
 		struct HeHostPacketHandler
 		{
 			inline static void Handle(ServerInstanceBase* instance, const fx::ClientSharedPtr& client, net::Buffer& packet)
 			{
+				if (IsOneSync())
+				{
+					return;
+				}
+
 				auto clientRegistry = instance->GetComponent<fx::ClientRegistry>();
 				auto gameServer = instance->GetComponent<fx::GameServer>();
 
@@ -1540,18 +1636,36 @@ DECLARE_INSTANCE_TYPE(fx::ServerDecorators::HostVoteCount);
 #include <decorators/WithProcessTick.h>
 #include <decorators/WithPacketHandler.h>
 
-void gscomms_execute_callback_on_main_thread(const std::function<void()>& fn, bool force)
+DLL_EXPORT void gscomms_execute_callback_on_main_thread(const std::function<void()>& fn, bool force)
 {
+	if (!g_gameServer)
+	{
+		fn();
+		return;
+	}
+
 	g_gameServer->InternalAddMainThreadCb(fn, force);
 }
 
 void gscomms_execute_callback_on_net_thread(const std::function<void()>& fn)
 {
+	if (!g_gameServer)
+	{
+		fn();
+		return;
+	}
+
 	g_gameServer->InternalAddNetThreadCb(fn);
 }
 
 void gscomms_execute_callback_on_sync_thread(const std::function<void()>& fn)
 {
+	if (!g_gameServer)
+	{
+		fn();
+		return;
+	}
+
 	g_gameServer->InternalAddSyncThreadCb(fn);
 }
 
@@ -1568,9 +1682,9 @@ void gscomms_send_packet(fx::Client* client, int peer, int channel, const net::B
 	g_gameServer->InternalSendPacket(client, peer, channel, buffer, flags);
 }
 
-void gscomms_get_peer(int peer, fx::NetPeerStackBuffer& stacKBuffer)
+void gscomms_get_peer(int peer, fx::NetPeerStackBuffer& stackBuffer)
 {
-	g_gameServer->InternalGetPeer(peer, stacKBuffer);
+	g_gameServer->InternalGetPeer(peer, stackBuffer);
 }
 
 static InitFunction initFunction([]()

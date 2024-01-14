@@ -101,8 +101,8 @@ boost::optional<PeerAddress> PeerAddress::FromString(const std::string& str, int
 	else
 	{
 		in_addr addr;
+		in6_addr addr6;
 
-		// #TODO: IPv6 support
 		if (inet_pton(AF_INET, resolveName.c_str(), &addr) == 1)
 		{
 			sockaddr_in inAddr;
@@ -113,6 +113,16 @@ boost::optional<PeerAddress> PeerAddress::FromString(const std::string& str, int
 			inAddr.sin_port = htons(port);
 
 			retval = PeerAddress((sockaddr*)&inAddr, sizeof(inAddr));
+		}
+		else if (inet_pton(AF_INET6, resolveName.c_str(), &addr6) == 1) {
+			sockaddr_in6 in6Addr;
+			memset(&in6Addr, 0, sizeof(in6Addr));
+
+			in6Addr.sin6_family = AF_INET6;
+			in6Addr.sin6_addr = addr6;
+			in6Addr.sin6_port = htons(port);
+
+			retval = PeerAddress((sockaddr*)&in6Addr, sizeof(in6Addr));
 		}
 	}
 
@@ -168,6 +178,52 @@ std::string PeerAddress::GetHost() const
 	}
 
 	return (family == AF_INET6) ? fmt::sprintf("[%s]", stringBuf) : stringBuf;
+}
+
+std::array<uint8_t, 16> PeerAddress::GetHostBytes() const
+{
+	std::array<uint8_t, 16> hostBytes;
+	memset(hostBytes.data(), 0, hostBytes.size());
+
+	int family = m_addr.addr.ss_family;
+
+	switch (family)
+	{
+		case AF_INET:
+			*(in_addr*)(hostBytes.data()) = m_addr.in4.sin_addr;
+			break;
+
+		case AF_INET6:
+			*(in6_addr*)(hostBytes.data()) = m_addr.in6.sin6_addr;
+			break;
+	}
+
+	return hostBytes;
+}
+
+std::array<uint8_t, 16> PeerAddress::GetHostBytesV6() const
+{
+	std::array<uint8_t, 16> hostBytes;
+	memset(hostBytes.data(), 0, hostBytes.size());
+
+	int family = m_addr.addr.ss_family;
+
+	switch (family)
+	{
+		case AF_INET:
+		{
+			auto in6addr = (uint8_t*)hostBytes.data();
+			*(uint32_t*)(&in6addr[12]) = m_addr.in4.sin_addr.s_addr;
+			*(uint16_t*)(&in6addr[10]) = 0xFFFF;
+			break;
+		}
+
+		case AF_INET6:
+			*(in6_addr*)(hostBytes.data()) = m_addr.in6.sin6_addr;
+			break;
+	}
+
+	return hostBytes;
 }
 
 int PeerAddress::GetPort() const

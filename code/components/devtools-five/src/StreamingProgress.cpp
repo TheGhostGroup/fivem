@@ -17,6 +17,8 @@
 #include <ResourceCacheDeviceV2.h>
 #include <VFSManager.h>
 
+#include <ICoreGameInit.h>
+
 struct StreamingDownloadProgress
 {
 	size_t downloadDone;
@@ -59,8 +61,15 @@ static void StreamingProgress_OnDownload(const std::string& fileName, size_t don
 
 static hook::cdecl_stub<rage::fiCollection* ()> getRawStreamer([]()
 {
-	return hook::get_call(hook::get_pattern("48 8B D3 4C 8B 00 48 8B C8 41 FF 90 ? 01 00 00", -5));
+	return hook::get_call(hook::get_pattern("48 8B D3 4C 8B 00 48 8B C8 41 FF 90 ? 01 00 00 8B D8 E8", -5));
 });
+
+#include <atHashMap.h>
+
+struct strRequestInfo
+{
+	uint64_t pad[3];
+};
 
 static void StreamingProgress_Update()
 {
@@ -70,7 +79,25 @@ static void StreamingProgress_Update()
 
 	std::set<std::string> foundNow;
 
-	for (uint32_t idx = 0; idx < streaming->numEntries; idx++)
+	std::vector<uint32_t> loadingOrRequestedList;
+	loadingOrRequestedList.reserve(64);
+
+	// gather loading/requested list rather than looping over every index
+	atMap<uint32_t, bool>* loadingList = (atMap<uint32_t, bool>*)((char*)streaming + 152); // see rage::strStreamingInfoManager::SetObjectToLoading
+	loadingList->ForAllEntriesWithHash([&loadingOrRequestedList](uint32_t idx, bool*)
+	{
+		loadingOrRequestedList.push_back(idx);
+	});
+
+	// request list
+	atMap<uint32_t, strRequestInfo>* requestList = (atMap<uint32_t, strRequestInfo>*)((char*)streaming + 64); // see rage::strInfoStatus::AddRequest
+	requestList->ForAllEntriesWithHash([&loadingOrRequestedList](uint32_t idx, strRequestInfo*)
+	{
+		loadingOrRequestedList.push_back(idx);
+	});
+
+	// loop over loading/requested list
+	for (uint32_t idx : loadingOrRequestedList)
 	{
 		auto data = &streaming->Entries[idx];
 		auto flags = data->flags & 3;
@@ -190,11 +217,11 @@ static void StreamingProgress_Update()
 
 		std::string str = fmt::sprintf("Downloading assets (%d of %d)... (%.2f/%.2f MB)", std::min(g_downloadDone.size(), g_downloadList.size()), g_downloadList.size(), std::min(downloadDone, downloadSize) / 1024.0 / 1024.0, downloadSize / 1024.0 / 1024.0);
 
-		ActivateStatusText(str.c_str(), 5, 2);
+		ActivateStatusText(str.c_str(), 5, 3);
 	}
 	else
 	{
-		DeactivateStatusText(2);
+		DeactivateStatusText(3);
 
 		g_downloadList.clear();
 		g_downloadDone.clear();
@@ -211,9 +238,24 @@ static InitFunction initFunction([]()
 
 	OnMainGameFrame.Connect([]()
 	{
-		static ConVar<bool> useStreamingProgress("game_showStreamingProgress", ConVar_Archive, false);
+		static ConVar<bool> useStreamingProgress("game_showStreamingProgress", ConVar_Archive | ConVar_UserPref, false);
 
 		if (useStreamingProgress.GetValue())
+		{
+			StreamingProgress_Update();
+		}
+		else if (Instance<ICoreGameInit>::Get()->HasVariable("networkInited"))
+		{
+			DeactivateStatusText(3);
+
+			g_downloadList.clear();
+			g_downloadDone.clear();
+		}
+	});
+
+	OnLookAliveFrame.Connect([]()
+	{
+		if (!Instance<ICoreGameInit>::Get()->HasVariable("networkInited"))
 		{
 			StreamingProgress_Update();
 		}

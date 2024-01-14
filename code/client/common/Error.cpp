@@ -6,7 +6,11 @@
  */
 
 #include "StdInc.h"
-//#include "GameInit.h"
+#include <Error.h>
+
+#if defined(COMPILING_LAUNCH) && !defined(LAUNCHER_PERSONALITY_MAIN) && !defined(COMPILING_DIAG)
+#define NON_CRT_LAUNCHER
+#endif
 
 #if !defined(COMPILING_LAUNCH) && !defined(COMPILING_CONSOLE) && !defined(IS_FXSERVER)
 #include <ICoreGameInit.h>
@@ -14,9 +18,31 @@
 
 #include <fnv.h>
 
-#include <json.hpp>
+#if !defined(IS_FXSERVER)
+#define RAPIDJSON_ASSERT(x) (void)0
+#include <rapidjson/document.h>
+#include <rapidjson/writer.h>
 
-using json = nlohmann::json;
+template<typename T>
+static std::string FormatErrorPickup(std::string_view buffer, const T& thisError)
+{
+	rapidjson::Document document;
+	document.SetObject();
+	document.AddMember("message", rapidjson::Value(buffer.data(), rapidjson::SizeType(buffer.length())), document.GetAllocator());
+	document.AddMember("file", rapidjson::Value(std::get<0>(thisError).data(), rapidjson::SizeType(std::get<0>(thisError).length())), document.GetAllocator());
+	document.AddMember("line", rapidjson::Value(std::get<1>(thisError)), document.GetAllocator());
+	document.AddMember("sigHash", rapidjson::Value(std::get<2>(thisError)), document.GetAllocator());
+
+	rapidjson::StringBuffer sbuffer;
+	rapidjson::Writer<rapidjson::StringBuffer> writer(sbuffer);
+
+	document.Accept(writer);
+
+	return std::string{ sbuffer.GetString(), sbuffer.GetSize() };
+}
+#endif
+
+#include <CrossBuildRuntime.h>
 
 #define ERR_NORMAL 0 // will continue game execution, but not here
 #define ERR_FATAL 1
@@ -25,9 +51,18 @@ using json = nlohmann::json;
 
 #ifdef _WIN32
 #include <wtsapi32.h>
+#else
+#include <signal.h>
 #endif
 
-static thread_local std::tuple<const char*, int, uint32_t> g_thisError;
+#if defined(ERROR_CRASH_MAGIC) && defined(_WIN32)
+bool IsErrorException(PEXCEPTION_POINTERS ep)
+{
+	return (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->ExceptionInformation[1] == ERROR_CRASH_MAGIC);
+}
+#endif
+
+static thread_local std::tuple<std::string_view, int, uint32_t> g_thisError;
 
 static bool IsUserConnected()
 {
@@ -60,18 +95,14 @@ static bool IsUserConnected()
 	return true;
 }
 
+#if defined(COMPILING_LAUNCH) && !defined(COMPILING_DIAG)
+extern bool MinidumpInitialized();
+#endif
+
 static int SysError(const char* buffer)
 {
 #ifdef WIN32
-	HWND wnd = FindWindowW(
-#ifdef GTA_FIVE
-		L"grcWindow"
-#elif defined(IS_RDR3)
-		L"sgaWindow"
-#else
-		L"UNKNOWN_WINDOW"
-#endif
-	, nullptr);
+	HWND wnd = CoreGetGameWindow();
 
 #if !defined(COMPILING_LAUNCH) && !defined(COMPILING_CONSOLE)
 	if (CoreIsDebuggerPresent())
@@ -82,22 +113,26 @@ static int SysError(const char* buffer)
 		__debugbreak();
 	}
 
-#if !defined(COMPILING_LAUNCH) && !defined(COMPILING_CONSOLE) && !defined(IS_FXSERVER)
-	json o = json::object();
-	o["message"] = buffer;
-	o["file"] = std::get<0>(g_thisError);
-	o["line"] = std::get<1>(g_thisError);
-	o["sigHash"] = std::get<2>(g_thisError);
-
-	FILE* f = _wfopen(MakeRelativeCitPath(L"cache\\error-pickup").c_str(), L"wb");
+#if !defined(COMPILING_CONSOLE) && !defined(IS_FXSERVER)
+	auto errorPickup = FormatErrorPickup(buffer, g_thisError);
+	FILE* f = _wfopen(MakeRelativeCitPath(L"data\\cache\\error-pickup").c_str(), L"wb");
 
 	if (f)
 	{
-		fprintf(f, "%s", o.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace).c_str());
+		fprintf(f, "%s", errorPickup.c_str());
 		fclose(f);
 
-		return -1;
+#if defined(COMPILING_LAUNCH) && !defined(COMPILING_DIAG)
+		if (MinidumpInitialized())
+#endif
+		{
+			return -1;
+		}
 	}
+#endif
+
+#if defined(IS_FXSERVER)
+	fprintf(stderr, "Fatal Error: %s", buffer);
 #endif
 
 	if (IsUserConnected())
@@ -115,25 +150,91 @@ static int SysError(const char* buffer)
 #else
 	fprintf(stderr, "%s", buffer);
 
-	abort();
+	raise(SIGTERM);
 #endif
 
 	return 0;
 }
 
+struct ErrorDataPerProcess
+{
+	bool inFatalError = false;
+	std::string lastFatalError;
+};
+
+struct ErrorData
+{
+	ErrorDataPerProcess* perProcess;
+
+	bool inRecursiveError = false;
+	std::string lastRecursiveError;
+
+	bool inError = false;
+	std::string lastError;
+};
+
+#if defined(COMPILING_CORE) || defined(COMPILING_LAUNCH)
+extern "C" DLL_EXPORT ErrorData* GetErrorData()
+{
+	static thread_local ErrorData errorData;
+	if (!errorData.perProcess)
+	{
+		static ErrorDataPerProcess edpp;
+		errorData.perProcess = &edpp;
+	}
+
+	return &errorData;
+}
+#elif defined(_WIN32)
+inline ErrorData* GetErrorData()
+{
+	using TCoreFunc = decltype(&GetErrorData);
+
+	static TCoreFunc func;
+
+	if (!func)
+	{
+		auto hCore = GetModuleHandleW(L"CoreRT.dll");
+
+		if (hCore)
+		{
+			func = (TCoreFunc)GetProcAddress(hCore, "GetErrorData");
+		}
+	}
+
+	return (func) ? func() : 0;
+}
+#else
+extern "C" ErrorData* GetErrorData();
+#endif
+
 static int GlobalErrorHandler(int eType, const char* buffer)
 {
-	static thread_local bool inError = false;
-	static thread_local std::string lastError;
-	static bool inFatalError = false;
-	static std::string lastFatalError;
+	auto errorData = GetErrorData();
+
+	if (!errorData)
+	{
+		static thread_local ErrorData dummyErrorData;
+		if (!dummyErrorData.perProcess)
+		{
+			static ErrorDataPerProcess edpp;
+			dummyErrorData.perProcess = &edpp;
+		}
+
+		errorData = &dummyErrorData;
+	}
+
+	bool& inError = errorData->inError;
+	std::string& lastError = errorData->lastError;
+	bool& inFatalError = errorData->perProcess->inFatalError;
+	std::string& lastFatalError = errorData->perProcess->lastFatalError;
 
 	trace("Error: %s\n", buffer);
 
 	if (inError || (eType == ERR_FATAL && inFatalError))
 	{
-		static thread_local bool inRecursiveError = false;
-		static thread_local std::string lastRecursiveError;
+		bool& inRecursiveError = errorData->inRecursiveError;
+		std::string& lastRecursiveError = errorData->lastRecursiveError;
 
 		if (inRecursiveError)
 		{
@@ -193,18 +294,25 @@ static int GlobalErrorHandler(int eType, const char* buffer)
 
 struct ScopedError
 {
-	ScopedError(const char* file, int line, uint32_t stringHash)
+	ScopedError(std::string_view file, int line, uint32_t stringHash)
 	{
 		g_thisError = std::make_tuple(file, line, stringHash);
 	}
 
 	~ScopedError()
 	{
-		g_thisError = std::make_tuple(nullptr, 0, 0);
+		g_thisError = std::make_tuple(std::string_view{}, 0, 0);
 	}
 };
 
-#if !defined(COMPILING_LAUNCH) && !defined(COMPILING_CONSOLE) && !defined(COMPILING_SHARED_LIBC)
+#if defined(COMPILING_LAUNCHER)
+void FatalErrorV(const char* string, fmt::printf_args formatList)
+{
+	GlobalErrorHandler(ERR_FATAL, fmt::vsprintf(string, formatList).c_str());
+}
+#endif
+
+#if (!defined(COMPILING_DIAG) && !defined(COMPILING_CONSOLE) && !defined(COMPILING_SHARED_LIBC)) || defined(NON_CRT_LAUNCHER)
 int GlobalErrorRealV(const char* file, int line, uint32_t stringHash, const char* string, fmt::printf_args formatList)
 {
 	ScopedError error(file, line, stringHash);
@@ -219,24 +327,8 @@ int FatalErrorRealV(const char* file, int line, uint32_t stringHash, const char*
 
 int FatalErrorNoExceptRealV(const char* file, int line, uint32_t stringHash, const char* string, fmt::printf_args formatList)
 {
-#ifndef IS_FXSERVER
-	auto msg = fmt::vsprintf(string, formatList);
-	trace("NoExcept: %s\n", msg);
-
-	json o = json::object();
-	o["message"] = msg;
-	o["file"] = file;
-	o["line"] = line;
-	o["sigHash"] = stringHash;
-
-	FILE* f = _wfopen(MakeRelativeCitPath(L"cache\\error-pickup").c_str(), L"wb");
-
-	if (f)
-	{
-		fprintf(f, "%s", o.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace).c_str());
-		fclose(f);
-	}
-
+#if !defined(IS_FXSERVER) && !defined(COMPILING_LAUNCH)
+	FatalErrorRealV(file, line, stringHash, string, formatList);
 	return -1;
 #endif
 
@@ -254,8 +346,9 @@ void FatalErrorV(const char* string, fmt::printf_args formatList)
 }
 #endif
 
-#if defined(COMPILING_LAUNCH) || defined(COMPILING_CONSOLE) || defined(COMPILING_SHARED_LIBC)
+#if (defined(COMPILING_LAUNCH) || defined(COMPILING_CONSOLE) || defined(COMPILING_SHARED_LIBC)) && !defined(NON_CRT_LAUNCHER)
 #undef _wassert
+#undef NDEBUG
 
 #include <assert.h>
 

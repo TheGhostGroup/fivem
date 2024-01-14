@@ -8,6 +8,9 @@
 
 #include <ServerInstanceBase.h>
 
+#include <UvLoopHolder.h>
+#include <uvw.hpp>
+
 namespace fx
 {
 using TCallbackMap = std::map<std::string, fx::ResourceCallbackComponent::CallbackRef>;
@@ -24,6 +27,8 @@ public:
 	ClientDeferral(fx::ServerInstanceBase* instance, const fx::ClientSharedPtr& client);
 
 	virtual ~ClientDeferral();
+
+	void StartTimer();
 
 	inline void SetResolveCallback(const TResolveCallback& callback)
 	{
@@ -68,6 +73,8 @@ public:
 
 	void UpdateDeferrals();
 
+	void RanEvents();
+
 	TCallbackMap GetCallbacks();
 
 private:
@@ -91,6 +98,8 @@ private:
 		}
 	};
 
+	void StartTimerOnLoopThread();
+
 private:
 	TResolveCallback m_resolveCallback;
 	TRejectCallback m_rejectCallback;
@@ -103,8 +112,15 @@ private:
 	std::map<std::string, DeferralState> m_deferralStates;
 	std::map<std::string, std::string> m_handoverData;
 
+	std::string m_nextCard;
+
 	bool m_completed;
+	bool m_ranEvents = false;
+	bool m_pending = false;
 
 	fx::ServerInstanceBase* m_instance;
+
+	fwRefContainer<net::UvLoopHolder> m_loop;
+	std::shared_ptr<uvw::TimerHandle> m_keepAliveTimer;
 };
 }

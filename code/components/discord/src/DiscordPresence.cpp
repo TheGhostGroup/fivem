@@ -1,16 +1,23 @@
-﻿#include <StdInc.h>
-#include <discord-rpc.h>
+#include <StdInc.h>
+#include <discord_rpc.h>
 
+#include <optional>
 #include <nutsnbolts.h>
 
 #include <GameInit.h>
 #include <NetLibrary.h>
 
 #include <ScriptEngine.h>
-#include <scrEngine.h>
 
+#ifdef GTA_FIVE
 #define DEFAULT_APP_ID "382624125287399424"
 #define DEFAULT_APP_ASSET "fivem_large"
+#elif defined(IS_RDR3)
+#define DEFAULT_APP_ID "879627773839278110"
+#define DEFAULT_APP_ASSET "redm_large"
+#endif
+
+#if defined(DEFAULT_APP_ID)
 #define DEFAULT_APP_ASSET_SMALL ""
 #define DEFAULT_APP_ASSET_TEXT ""
 #define DEFAULT_APP_ASSET_SMALL_TEXT ""
@@ -45,6 +52,8 @@ static std::string g_discordAppAssetText;
 
 static std::string g_discordAppAssetSmallText;
 
+static std::optional<std::tuple<std::pair<std::string, std::string>, std::pair<std::string, std::string>>> g_buttons;
+
 static void UpdatePresence()
 {
 	if (g_richPresenceChanged)
@@ -60,12 +69,19 @@ static void UpdatePresence()
 			g_richPresenceValues[7]
 		);
 
-		std::string line1 = formattedRichPresence.substr(formattedRichPresence.find_first_of("\n") + 1);
-		std::string line2 = formattedRichPresence.substr(0, formattedRichPresence.find_first_of("\n"));
-
 		if (!g_richPresenceOverride.empty())
 		{
-			line1 = g_richPresenceOverride;
+			formattedRichPresence = g_richPresenceOverride;
+		}
+
+		auto lineOff = formattedRichPresence.find_first_of("\n");
+
+		std::string line1 = formattedRichPresence.substr(0, lineOff);
+		std::string line2;
+
+		if (lineOff != std::string::npos)
+		{
+			line2 = formattedRichPresence.substr(lineOff + 1);
 		}
 
 		if (g_discordAppId != g_lastDiscordAppId) 
@@ -119,6 +135,18 @@ static void UpdatePresence()
 			discordPresence.smallImageText = g_discordAppAssetSmallText.c_str();
 		}
 
+		DiscordButton buttons[2];
+
+		if (g_buttons)
+		{
+			buttons[0].label = std::get<0>(*g_buttons).first.c_str();
+			buttons[0].url = std::get<0>(*g_buttons).second.c_str();
+			buttons[1].label = std::get<1>(*g_buttons).first.c_str();
+			buttons[1].url = std::get<1>(*g_buttons).second.c_str();
+
+			discordPresence.buttons = buttons;
+		}
+
 		Discord_UpdatePresence(&discordPresence);
 
 		g_richPresenceChanged = false;
@@ -141,18 +169,24 @@ static InitFunction initFunction([]()
 	{
 		g_startTime = time(nullptr);
 
-		g_richPresenceTemplate = text;
+		if (g_richPresenceTemplate != text)
+		{
+			g_richPresenceTemplate = text;
 
-		g_richPresenceChanged = true;
+			g_richPresenceChanged = true;
+		}
 	});
 
 	OnRichPresenceSetValue.Connect([](int idx, const std::string& value)
 	{
 		assert(idx >= 0 && idx < _countof(g_richPresenceValues));
 
-		g_richPresenceValues[idx] = value;
+		if (g_richPresenceValues[idx] != value)
+		{
+			g_richPresenceValues[idx] = value;
 
-		g_richPresenceChanged = true;
+			g_richPresenceChanged = true;
+		}
 	});
 
 	OnRichPresenceSetTemplate("In the menus\n");
@@ -172,6 +206,7 @@ static InitFunction initFunction([]()
 		g_richPresenceOverrideAssetSmall = DEFAULT_APP_ASSET_SMALL;
 		g_richPresenceOverrideAssetText = DEFAULT_APP_ASSET_TEXT;
 		g_richPresenceOverrideAssetSmallText = DEFAULT_APP_ASSET_SMALL_TEXT;
+		g_buttons = {};
 		g_richPresenceChanged = true;
 
 		OnRichPresenceSetTemplate("In the menus\n");
@@ -179,17 +214,52 @@ static InitFunction initFunction([]()
 
 	fx::ScriptEngine::RegisterNativeHandler("SET_RICH_PRESENCE", [](fx::ScriptContext& context)
 	{
-		const char* str = context.GetArgument<const char*>(0);
+		std::string newValue;
 
-		if (str)
+		if (const char* str = context.GetArgument<const char*>(0))
 		{
-			g_richPresenceOverride = str;
-		}
-		else
-		{
-			g_richPresenceOverride = "";
+			newValue = str;
 		}
 
+		if (g_richPresenceOverride != newValue)
+		{
+			g_richPresenceOverride = newValue;
+			g_richPresenceChanged = true;
+		}
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("SET_DISCORD_RICH_PRESENCE_ACTION", [](fx::ScriptContext& context)
+	{
+		int idx = context.GetArgument<int>(0);
+		std::string label = context.CheckArgument<const char*>(1);
+		std::string url = context.CheckArgument<const char*>(2);
+
+		if (idx < 0 || idx >= 2)
+		{
+			return;
+		}
+
+		if (url.find("https://") != 0 && url.find("fivem://connect/") != 0)
+		{
+			return;
+		}
+
+		std::decay_t<decltype(*g_buttons)> buttons;
+		if (g_buttons)
+		{
+			buttons = *g_buttons;
+		}
+
+		if (idx == 0)
+		{
+			std::get<0>(buttons) = { label, url };
+		}
+		else if (idx == 1)
+		{
+			std::get<1>(buttons) = { label, url };
+		}
+
+		g_buttons = buttons;
 		g_richPresenceChanged = true;
 	});
 
@@ -273,3 +343,4 @@ static InitFunction initFunction([]()
 		g_richPresenceChanged = true;
 	});
 });
+#endif

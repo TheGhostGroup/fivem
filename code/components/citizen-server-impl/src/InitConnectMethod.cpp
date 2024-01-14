@@ -30,6 +30,7 @@
 #include <ServerIdentityProvider.h>
 
 #include <MonoThreadAttachment.h>
+#include <GameBuilds.h>
 
 #include <json.hpp>
 
@@ -44,6 +45,8 @@
 #include <folly/String.h>
 #include <boost/algorithm/string.hpp>
 
+#include <utf8.h>
+
 using json = nlohmann::json;
 
 static std::forward_list<fx::ServerIdentityProviderBase*> g_serverProviders;
@@ -56,22 +59,24 @@ void RegisterServerIdentityProvider(ServerIdentityProviderBase* provider)
 	g_serverProviders.push_front(provider);
 	g_providersByType.insert({ provider->GetIdentifierPrefix(), provider });
 }
-
-extern bool IsOneSync();
-extern bool IsLengthHack();
 }
 
 static std::mutex g_ticketMapMutex;
 static std::unordered_set<std::tuple<uint64_t, uint64_t>> g_ticketList;
 static std::chrono::milliseconds g_nextTicketGc;
 
-static bool VerifyTicket(const std::string& guid, const std::string& ticket)
+static bool VerifyTicket(const std::string& guid, const std::string& ticket, std::string* error = nullptr)
 {
 	auto ticketData = Botan::base64_decode(ticket);
 
 	// validate ticket length
 	if (ticketData.size() < 20 + 4 + 128)
 	{
+		if (error)
+		{
+			*error = "Invalid ticket length.";
+		}
+
 		return false;
 	}
 
@@ -79,6 +84,11 @@ static bool VerifyTicket(const std::string& guid, const std::string& ticket)
 
 	if (length != 16)
 	{
+		if (error)
+		{
+			*error = "Invalid ticket length. (2)";
+		}
+
 		return false;
 	}
 
@@ -94,6 +104,11 @@ static bool VerifyTicket(const std::string& guid, const std::string& ticket)
 	// verify
 	if (ticketExpiry < timeVal)
 	{
+		if (error)
+		{
+			*error = "Ticket expired. Please check your server's system time.";
+		}
+
 		console::DPrintf("server", "Connecting player: ticket expired\n");
 		return false;
 	}
@@ -103,6 +118,11 @@ static bool VerifyTicket(const std::string& guid, const std::string& ticket)
 
 	if (realGuid != ticketGuid)
 	{
+		if (error)
+		{
+			*error = "Mismatching GUID.";
+		}
+
 		console::DPrintf("server", "Connecting player: ticket GUID not matching\n");
 		return false;
 	}
@@ -112,6 +132,11 @@ static bool VerifyTicket(const std::string& guid, const std::string& ticket)
 
 		if (g_ticketList.find({ ticketExpiry, ticketGuid }) != g_ticketList.end())
 		{
+			if (error)
+			{
+				*error = "Reused ticket.";
+			}
+
 			return false;
 		}
 
@@ -129,6 +154,11 @@ static bool VerifyTicket(const std::string& guid, const std::string& ticket)
 
 	if (sigLength != 128)
 	{
+		if (error)
+		{
+			*error = "Invalid signature length.";
+		}
+
 		return false;
 	}
 
@@ -157,6 +187,11 @@ static bool VerifyTicket(const std::string& guid, const std::string& ticket)
 
 	if (!valid)
 	{
+		if (error)
+		{
+			*error = "Invalid ticket signature.";
+		}
+
 		console::DPrintf("server", "Connecting player: ticket RSA signature not matching\n");
 		return false;
 	}
@@ -180,7 +215,7 @@ static std::optional<TicketData> VerifyTicketEx(const std::string& ticket)
 		return {};
 	}
 
-	uint32_t length = *(uint32_t*)&ticketData[20 + 4 + 128];
+	size_t length = static_cast<size_t>(*(uint32_t*)&ticketData[20 + 4 + 128]);
 
 	// validate full length
 	if (ticketData.size() < 20 + 4 + 128 + 4 + length)
@@ -257,7 +292,7 @@ static std::optional<TicketData> VerifyTicketEx(const std::string& ticket)
 }
 
 extern std::shared_ptr<ConVar<bool>> g_oneSyncVar;
-std::string g_enforcedGameBuild;
+fx::GameBuild g_enforcedGameBuild;
 
 static InitFunction initFunction([]()
 {
@@ -269,24 +304,37 @@ static InitFunction initFunction([]()
 		auto maxVarianceVar = instance->AddVariable<int>("sv_authMaxVariance", ConVar_None, 5);
 		maxVarianceVar->GetHelper()->SetConstraints(1, 5);
 
+		auto pureVar = instance->AddVariable<int>("sv_pureLevel", ConVar_ServerInfo, 0);
 		auto shVar = instance->AddVariable<bool>("sv_scriptHookAllowed", ConVar_ServerInfo, false);
 		auto ehVar = instance->AddVariable<bool>("sv_enhancedHostSupport", ConVar_ServerInfo, false);
 
+		// list of space-separated endpoints that can but don't have to include a port
+		// for example: sv_endpoints "123.123.123.123 124.124.124.124"
+		auto srvEndpoints = instance->AddVariable<std::string>("sv_endpoints", ConVar_None, "");
 		auto lanVar = instance->AddVariable<bool>("sv_lan", ConVar_ServerInfo, false);
 
-		auto enforceGameBuildVar = instance->AddVariable<std::string>("sv_enforceGameBuild", ConVar_ReadOnly, "", &g_enforcedGameBuild);
+		g_enforcedGameBuild = "1604";
+		auto enforceGameBuildVar = instance->AddVariable<fx::GameBuild>("sv_enforceGameBuild", ConVar_ReadOnly | ConVar_ServerInfo, "1604", &g_enforcedGameBuild);
 
-		instance->GetComponent<fx::GameServer>()->OnTick.Connect([instance]()
+		instance->GetComponent<fx::GameServer>()->OnTick.Connect([instance, enforceGameBuildVar]()
 		{
+			if (instance->GetComponent<fx::GameServer>()->GetGameName() == fx::GameName::RDR3)
+			{
+				if (g_enforcedGameBuild == "1604")
+				{
+					enforceGameBuildVar->GetHelper()->SetRawValue("1311");
+				}
+			}
+
 			auto clientRegistry = instance->GetComponent<fx::ClientRegistry>();
 
 			clientRegistry->ForAllClients([](const fx::ClientSharedPtr& client)
 			{
 				auto deferralAny = client->GetData("deferralPtr");
 
-				if (deferralAny.has_value())
+				if (deferralAny)
 				{
-					auto weakDeferral = std::any_cast<std::weak_ptr<fx::ClientDeferral>>(deferralAny);
+					auto weakDeferral = fx::AnyCast<std::weak_ptr<fx::ClientDeferral>>(deferralAny);
 
 					if (!weakDeferral.expired())
 					{
@@ -296,7 +344,7 @@ static InitFunction initFunction([]()
 			});
 		});
 
-		instance->GetComponent<fx::ClientMethodRegistry>()->AddHandler("getEndpoints", [instance](const std::map<std::string, std::string>& postMap, const fwRefContainer<net::HttpRequest>& request, const std::function<void(const json&)>& cb)
+		instance->GetComponent<fx::ClientMethodRegistry>()->AddHandler("getEndpoints", [instance, srvEndpoints](const std::map<std::string, std::string>& postMap, const fwRefContainer<net::HttpRequest>& request, const std::function<void(const json&)>& cb)
 		{
 			auto sendError = [=](const std::string& error)
 			{
@@ -314,17 +362,13 @@ static InitFunction initFunction([]()
 
 			auto clientRegistry = instance->GetComponent<fx::ClientRegistry>();
 			auto client = clientRegistry->GetClientByConnectionToken(tokenIt->second);
-			// list of space-separated endpoints that can but don't have to include a port
-			// for example: sv_endpoints "123.123.123.123 124.124.124.124"
-			auto srvEndpoints = instance->AddVariable<std::string>("sv_endpoints", ConVar_None, "");
-			auto endpointList = srvEndpoints->GetValue();
-
 			if (!client)
 			{
-				cb(json{ false });
+				cb(false);
 			}
 			else
 			{
+				auto endpointList = srvEndpoints->GetValue();
 				if (endpointList.empty()) 
 				{
 					cb(json::array());
@@ -377,7 +421,6 @@ static InitFunction initFunction([]()
 			auto guidIt = postMap.find("guid");
 			auto gameBuildIt = postMap.find("gameBuild");
 			auto gameNameIt = postMap.find("gameName");
-			auto updateChannelIt = postMap.find("updateChannel");
 
 			auto protocolIt = postMap.find("protocol");
 
@@ -392,21 +435,12 @@ static InitFunction initFunction([]()
 			auto protocol = atoi(protocolIt->second.c_str());
 			auto gameBuild = (gameBuildIt != postMap.end()) ? gameBuildIt->second : "0";
 			auto gameName = (gameNameIt != postMap.end()) ? gameNameIt->second : "";
-			auto updateChannel = (updateChannelIt != postMap.end()) ? updateChannelIt->second : "production";
 
-			if (protocol < 6)
+			if (protocol < 12)
 			{
-				sendError("Client/server version mismatch.");
+				sendError("Client/server version mismatch. Restart your game client to update. If that did not help, "
+					"this server is using too new a version for the current game client.");
 				return;
-			}
-
-			if (fx::IsOneSync())
-			{
-				if (protocol < 9)
-				{
-					sendError("Client/server version mismatch.");
-					return;
-				}
 			}
 
 			// verify game name
@@ -415,6 +449,14 @@ static InitFunction initFunction([]()
 
 			switch (instance->GetComponent<fx::GameServer>()->GetGameName())
 			{
+			case fx::GameName::GTA4:
+				intendedGameName = "gta4";
+
+				if (gameName == "gta4")
+				{
+					validGameName = true;
+				}
+				break;
 			case fx::GameName::GTA5:
 				intendedGameName = "gta5";
 
@@ -442,8 +484,24 @@ static InitFunction initFunction([]()
 			// limit name length
 			if (name.length() >= 200)
 			{
-				// TODO: cut this off at a sane UTF-8 position
 				name = name.substr(0, 200);
+			}
+
+			// replace invalid UTF8 sequences in name
+			{
+				std::string validName;
+
+				try
+				{
+					utf8::replace_invalid(name.begin(), name.end(), std::back_inserter(validName));
+				}
+				catch (std::exception& e)
+				{
+					sendError("Parsing name failed.");
+					return;
+				}
+
+				name = validName;
 			}
 
 			TicketData ticketData;
@@ -454,15 +512,17 @@ static InitFunction initFunction([]()
 
 				if (ticketIt == postMap.end())
 				{
-					sendError("No CitizenFX ticket was specified. If this is an offline server, maybe set sv_lan?");
+					sendError("No authentication ticket was specified.");
 					return;
 				}
 
 				try
 				{
-					if (!VerifyTicket(guid, ticketIt->second))
+					std::string ticketError;
+
+					if (!VerifyTicket(guid, ticketIt->second, &ticketError))
 					{
-						sendError("CitizenFX ticket authorization failed.");
+						sendError(fmt::sprintf("Ticket authorization failed. %s", ticketError));
 						return;
 					}
 
@@ -470,7 +530,7 @@ static InitFunction initFunction([]()
 
 					if (!optionalTicket)
 					{
-						sendError("CitizenFX ticket authorization failed. (2)");
+						sendError("Ticket authorization failed. (2)");
 						return;
 					}
 
@@ -478,7 +538,7 @@ static InitFunction initFunction([]()
 				}
 				catch (const std::exception& e)
 				{
-					sendError(fmt::sprintf("Parsing error while verifying CitizenFX ticket. %s", e.what()));
+					sendError(fmt::sprintf("Parsing error while verifying ticket. %s", e.what()));
 					return;
 				}
 			}
@@ -487,7 +547,8 @@ static InitFunction initFunction([]()
 
 			json data = json::object();
 			data["protocol"] = 5;
-			data["bitVersion"] = 0x202007151853;
+			data["bitVersion"] = 0x202103292050;
+			data["pure"] = pureVar->GetValue();
 			data["sH"] = shVar->GetValue();
 			data["enhancedHostSupport"] = ehVar->GetValue() && !fx::IsOneSync();
 			data["onesync"] = fx::IsOneSync();
@@ -520,7 +581,6 @@ static InitFunction initFunction([]()
 			client->SetConnectionToken(token);
 			client->SetTcpEndPoint(ra.substr(0, ra.find_last_of(':')));
 			client->SetNetId(0x10000 + tempId);
-			client->SetUpdateChannel(updateChannel);
 
 			// add the entitlement hash if needed
 			if (ticketData.entitlementHash)
@@ -573,6 +633,39 @@ static InitFunction initFunction([]()
 			auto it = g_serverProviders.begin();
 
 			fx::ClientWeakPtr clientWeak{ client };
+
+			struct ClientHolder
+			{
+				explicit ClientHolder(fx::ClientRegistry* clientRegistry, fx::ClientWeakPtr client)
+					: clientRegistry(clientRegistry), client(client)
+				{
+
+				}
+
+				void Disown()
+				{
+					client = {};
+				}
+
+				~ClientHolder()
+				{
+					if (client)
+					{
+						if (auto clientPtr = client.lock())
+						{
+							clientRegistry->RemoveClient(clientPtr);
+						}
+					}
+				}
+
+			private:
+				fx::ClientRegistry* clientRegistry;
+
+				fx::ClientWeakPtr client;
+			};
+
+			auto clientHolder = std::make_shared<ClientHolder>(clientRegistry.GetRef(), clientWeak);
+
 			auto done = [=]()
 			{
 				auto lockedClient = clientWeak.lock();
@@ -586,11 +679,13 @@ static InitFunction initFunction([]()
 
 				auto allowClient = [=]()
 				{
+					clientHolder->Disown();
+
 					auto client = clientWeak.lock();
 
 					if (client)
 					{
-						client->SetData("deferralPtr", std::any());
+						client->SetData("deferralPtr", nullptr);
 						client->SetData("passedValidation", true);
 						client->SetData("canBeDead", false);
 					}
@@ -609,7 +704,17 @@ static InitFunction initFunction([]()
 
 					for (const auto& [ key, value ] : deferrals->GetHandoverData())
 					{
-						handoverData[key] = json::parse(value);
+						std::vector<char> handoverValue;
+						utf8::replace_invalid(value.begin(), value.end(), std::back_inserter(handoverValue));
+
+						try
+						{
+							handoverData[key] = json::parse(handoverValue);
+						}
+						catch (std::exception&)
+						{
+
+						}
 					}
 
 					data["handover"] = std::move(handoverData);
@@ -633,21 +738,21 @@ static InitFunction initFunction([]()
 
 				if (maxTrust < minTrustVar->GetValue() || minVariance > maxVarianceVar->GetValue())
 				{
-					clientRegistry->RemoveClient(lockedClient);
-
 					sendError("You can not join this server due to your identifiers being insufficient. Please try starting Steam or another identity provider and try again.");
 					return;
 				}
 
-				if (!enforceGameBuildVar->GetValue().empty() && enforceGameBuildVar->GetValue() != gameBuild)
-				{
-					clientRegistry->RemoveClient(lockedClient);
+				auto svGame = instance->GetComponent<fx::GameServer>()->GetGameName();
+				bool canEnforceBuild = (svGame == fx::GameName::GTA5 || svGame == fx::GameName::RDR3);
 
+				if (canEnforceBuild && !enforceGameBuildVar->GetValue().empty() && enforceGameBuildVar->GetValue() != gameBuild)
+				{
 					sendError(
 						fmt::sprintf(
-							"This server requires a different game build (%s) from the one you're using (%s). Tell the server owner to remove this check.",
+							"This server requires a different game build (%s) from the one you're using (%s).%s",
 							enforceGameBuildVar->GetValue(),
-							gameBuild
+							gameBuild,
+							(svGame == fx::GameName::GTA5) ? " Tell the server owner to remove this check." : ""
 						)
 					);
 
@@ -676,7 +781,7 @@ static InitFunction initFunction([]()
 
 					if (ref1)
 					{
-						(*ref1)(json::object({ { "defer", true }, { "message", message }, { "deferVersion", 2 } }));
+						(*ref1)(json::object({ { "defer", true }, { "message", message.empty() ? json(nullptr) : json(message) }, { "deferVersion", 2 } }));
 					}
 				});
 
@@ -713,13 +818,24 @@ static InitFunction initFunction([]()
 					*deferrals = nullptr;
 				});
 
-				(*deferrals)->SetRejectCallback([deferrals, cbRef, clientWeak, clientRegistry](const std::string& message)
+				auto earlyReject = std::make_shared<bool>(false);
+				auto weakEarlyReject = std::weak_ptr(earlyReject);
+				auto weakNoReason = std::weak_ptr(noReason);
+
+				(*deferrals)->SetRejectCallback([deferrals, cbRef, clientWeak, weakEarlyReject, weakNoReason](const std::string& message)
 				{
+					auto earlyReject = weakEarlyReject.lock();
+					auto noReason = weakNoReason.lock();
+
+					if (earlyReject && noReason)
+					{
+						*noReason = std::make_shared<std::string>(message);
+						*earlyReject = true;
+					}
+
 					auto newLockedClient = clientWeak.lock();
 					if (newLockedClient)
 					{
-						clientRegistry->RemoveClient(newLockedClient);
-
 						auto ref1 = *cbRef;
 
 						if (ref1)
@@ -733,116 +849,123 @@ static InitFunction initFunction([]()
 					*deferrals = nullptr;
 				});
 
-				request->SetCancelHandler([cbRef, deferrals, clientWeak, clientRegistry, didSucceed]()
+				request->SetCancelHandler([cbRef, deferrals]()
 				{
-					auto newLockedClient = clientWeak.lock();
-					if (!*didSucceed && newLockedClient)
-					{
-						clientRegistry->RemoveClient(newLockedClient);
-					}
-
 					*cbRef = nullptr;
 					*deferrals = nullptr;
 				});
 
-				MonoEnsureThreadAttached();
+				gscomms_execute_callback_on_main_thread([=]
+				{
+					auto deferralsRef = *deferrals;
 
-				/*NETEV playerConnecting SERVER
-				/#*
-				 * A server-side event that is triggered when a player is trying to connect.
-				 *
-				 * This event can be canceled to reject the player *instantly*, assuming you haven't yielded.
-				 *
-				 * @param playerName - The display name of the player connecting.
-				 * @param setKickReason - A function used to set a reason message for when the event is canceled.
-				 * @param deferrals - An object to control deferrals.
-				 * @param source - The player's *temporary* NetID (a number in Lua/JS), **not a real argument, use [FromSource] or source**.
-				 #/
-				declare function playerConnecting(playerName: string, setKickReason: (reason: string) => void, deferrals: {
+					/*NETEV playerConnecting SERVER
 					/#*
-					 * `deferrals.defer` will initialize deferrals for the current resource. It is required to wait for at least a tick after calling defer before calling `update`, `presentCard` or `done`.
-					 #/
-					defer(): void,
-
-					/#*
-					 * `deferrals.update` will send a progress message to the connecting client.
+					 * A server-side event that is triggered when a player is trying to connect.
 					 *
-					 * @param message - The string to send to the client.
-					 #/
-					update(message: string): void,
-
-					/#*
-					 * `deferrals.presentCard` will send an [Adaptive Card](https://adaptivecards.io/) to the client.
+					 * This event can be canceled to reject the player *instantly*, assuming you haven't yielded.
 					 *
-					 * @param card - An object containing card data, or a serialized JSON string with the card information.
-					 * @param cb - If present, will be invoked on an `Action.Submit` event from the Adaptive Card.
+					 * @param playerName - The display name of the player connecting.
+					 * @param setKickReason - A function used to set a reason message for when the event is canceled.
+					 * @param deferrals - An object to control deferrals.
+					 * @param source - The player's *temporary* NetID (a number in Lua/JS), **not a real argument, use [FromSource] or source**.
 					 #/
-					presentCard(
-						card: object | string,
-						cb?:
+					declare function playerConnecting(playerName: string, setKickReason: (reason: string) => void, deferrals: {
 						/#*
-						 * A callback to be invoked for `Action.Submit`.
-						 *
-						 * @param data - A parsed version of the data sent from the card.
-						 * @param rawData - A JSON string containing the data sent from the card.
+						 * `deferrals.defer` will initialize deferrals for the current resource. It is required to wait for at least a tick after calling defer before calling `update`, `presentCard` or `done`.
 						 #/
-						  (data: any, rawData: string) => void
-					): void,
+						defer(): void,
 
-					/#*
-					 * `deferrals.done` finalizes a deferral. It is required to wait for at least a tick before calling `done` after calling a prior deferral method.
-					 *
-					 * @param failureReason - If specified, the connection will be refused, and the user will see the specified message as a result. If this is not specified, the user will be allowed to connect.
-					 #/
-					done(failureReason?: string): void,
+						/#*
+						 * `deferrals.update` will send a progress message to the connecting client.
+						 *
+						 * @param message - The string to send to the client.
+						 #/
+						update(message: string): void,
 
-					/#*
-					 * `deferrals.handover` adds handover data for the client to be able to use at a later point.
-					 *
-					 * @param data - Data to pass to the connecting client.
-					 #/
-					handover(data: { [key: string]: any }): void,
-				}, source: string): void;
-				*/
-				bool shouldAllow = eventManager->TriggerEvent2("playerConnecting", { fmt::sprintf("net:%d", lockedClient->GetNetId()) }, lockedClient->GetName(), cbComponent->CreateCallback([noReason](const msgpack::unpacked& unpacked)
-				{
-					auto obj = unpacked.get().as<std::vector<msgpack::object>>();
+						/#*
+						 * `deferrals.presentCard` will send an [Adaptive Card](https://adaptivecards.io/) to the client.
+						 *
+						 * @param card - An object containing card data, or a serialized JSON string with the card information.
+						 * @param cb - If present, will be invoked on an `Action.Submit` event from the Adaptive Card.
+						 #/
+						presentCard(
+							card: object | string,
+							cb?:
+							/#*
+							 * A callback to be invoked for `Action.Submit`.
+							 *
+							 * @param data - A parsed version of the data sent from the card.
+							 * @param rawData - A JSON string containing the data sent from the card.
+							 #/
+							  (data: any, rawData: string) => void
+						): void,
 
-					if (obj.size() == 1)
+						/#*
+						 * `deferrals.done` finalizes a deferral. It is required to wait for at least a tick before calling `done` after calling a prior deferral method.
+						 *
+						 * @param failureReason - If specified, the connection will be refused, and the user will see the specified message as a result. If this is not specified, the user will be allowed to connect.
+						 #/
+						done(failureReason?: string): void,
+
+						/#*
+						 * `deferrals.handover` adds handover data for the client to be able to use at a later point.
+						 *
+						 * @param data - Data to pass to the connecting client.
+						 #/
+						handover(data: { [key: string]: any }): void,
+					}, source: string): void;
+					*/
+					bool shouldAllow = (deferralsRef) ? (eventManager->TriggerEvent2("playerConnecting", { fmt::sprintf("internal-net:%d", lockedClient->GetNetId()) }, lockedClient->GetName(), cbComponent->CreateCallback([noReason](const msgpack::unpacked& unpacked)
 					{
-						**noReason = obj[0].as<std::string>();
+						auto obj = unpacked.get().as<std::vector<msgpack::object>>();
+
+						if (obj.size() == 1)
+						{
+							**noReason = obj[0].as<std::string>();
+						}
+					}),
+					deferralsRef->GetCallbacks())) : false;
+
+					if (deferralsRef)
+					{
+						deferralsRef->RanEvents();
 					}
-				}), (*deferrals)->GetCallbacks());
 
-				if (!shouldAllow)
-				{
-					clientRegistry->RemoveClient(lockedClient);
+					if (!shouldAllow)
+					{
+						*deferrals = {};
+						sendError(**noReason);
+						return;
+					}
 
-					sendError(**noReason);
-					return;
-				}
+					if (*earlyReject)
+					{
+						*deferrals = {};
+						sendError(**noReason);
+						return;
+					}
 
-				// was the deferral already completed/canceled this frame? if so, just don't respond at all
-				auto deferralsRef = *deferrals;
+					// was the deferral already completed/canceled this frame? if so, just don't respond at all
+					if (!deferralsRef)
+					{
+						return;
+					}
 
-				if (!deferralsRef)
-				{
-					return;
-				}
+					if (!deferralsRef->IsDeferred())
+					{
+						allowClient();
 
-				if (!deferralsRef->IsDeferred())
-				{
-					allowClient();
+						json dataNew = data;
+						addData(dataNew, *deferrals);
 
-					json dataNew = data;
-					addData(dataNew, *deferrals);
+						*cbRef = nullptr;
+						*deferrals = nullptr;
 
-					*cbRef = nullptr;
-					*deferrals = nullptr;
-
-					cb(dataNew);
-					cb(json(nullptr));
-				}
+						cb(dataNew);
+						cb(json(nullptr));
+					}
+				});
 			};
 
 			// seriously C++?
@@ -886,8 +1009,6 @@ static InitFunction initFunction([]()
 						// if an auth method fails, bail
 						if (err)
 						{
-							clientRegistry->RemoveClient(newClientLocked);
-
 							sendError(*err);
 
 							// unset the callback
@@ -928,9 +1049,9 @@ static InitFunction initFunction([]()
 
 			auto deferralRef = client->GetData("deferralPtr");
 
-			if (deferralRef.has_value())
+			if (deferralRef)
 			{
-				auto deferralPtr = std::any_cast<std::weak_ptr<fx::ClientDeferral>>(deferralRef);
+				auto deferralPtr = fx::AnyCast<std::weak_ptr<fx::ClientDeferral>>(deferralRef);
 				auto deferrals = deferralPtr.lock();
 
 				if (deferrals)

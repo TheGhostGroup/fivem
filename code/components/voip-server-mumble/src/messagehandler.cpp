@@ -135,12 +135,13 @@ void Mh_handle_message(client_t *client, message_t *msg)
 			break;
 		}
 
-		/*if (SSLi_getSHA1Hash(client->ssl, client->hash) && Ban_isBanned(client)) {
-			char hexhash[41];
-			SSLi_hash2hex(client->hash, hexhash);
-			Log_info("Client with hash '%s' is banned. Disconnecting", hexhash);
+		if (Ban_isBanned(client)) {
+			char buf[64];
+			sprintf(buf, "You were banned from the server");
+			Log_info("Client is banned. Disconnecting");
+			sendServerReject(client, buf, MumbleProto::Reject_RejectType_None);
 			goto disconnect;
-		}*/
+		}
 
 		client_itr = NULL;
 		while (Client_iterate(&client_itr) != NULL) {
@@ -386,7 +387,7 @@ void Mh_handle_message(client_t *client, message_t *msg)
 		Log_debug("Voice channel crypt resync requested");
 		if (!msg->payload.cryptSetup->has_client_nonce()) {
 			sendmsg = Msg_create(CryptSetup);
-			sendmsg->payload.cryptSetup->set_server_nonce(client->cryptState.decrypt_iv, AES_BLOCK_SIZE);
+			sendmsg->payload.cryptSetup->set_server_nonce(client->cryptState.encrypt_iv, AES_BLOCK_SIZE);
 			Client_send_message(client, sendmsg);
 		} else {
 			memcpy(client->cryptState.decrypt_iv, msg->payload.cryptSetup->client_nonce().data(), AES_BLOCK_SIZE);
@@ -718,6 +719,11 @@ void Mh_handle_message(client_t *client, message_t *msg)
 		/* Check channel name is OK */
 		if (strlen(msg->payload.channelState->name().c_str()) > MAX_TEXT) {
 			sendPermissionDenied(client, "Channel name too long");
+			break;
+		}
+		/* Check description length */
+		if (strlen(msg->payload.channelState->description().c_str()) > MAX_TEXT) {
+			sendPermissionDenied(client, "Description too long");
 			break;
 		}
 

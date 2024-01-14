@@ -9,6 +9,7 @@
 
 #include <nutsnbolts.h>
 #include <CefOverlay.h>
+#include <DrawCommands.h>
 
 #include <mmsystem.h>
 
@@ -48,7 +49,7 @@ struct LoadScreenFuncs
 
 			if (msec > 50)
 			{
-				trace(__FUNCTION__ ": Instrumented function %p (%i) took %dmsec\n", data.func, data.index, msec);
+				trace(__FUNCTION__ ": Instrumented function %p (%i) took %dmsec\n", (void*)hook::get_unadjusted(data.func), data.index, msec);
 			}
 		}
 	}
@@ -291,6 +292,7 @@ int CountRelevantDataFileEntries()
 static void(*dataFileMgr__loadDefDat)(void*, const char*, bool);
 
 int dlcIdx = -1;
+std::map<uint32_t, std::string> g_dlcNameMap;
 
 static void LoadDefDats(void* dataFileMgr, const char* name, bool enabled)
 {
@@ -301,6 +303,10 @@ static void LoadDefDats(void* dataFileMgr, const char* name, bool enabled)
 	ifd.initFunction = [](int)
 	{
 	};
+
+	std::string nameStripped = name;
+	nameStripped = nameStripped.substr(0, nameStripped.find("CRC"));
+	g_dlcNameMap.emplace(ifd.funcHash, nameStripped);
 
 	if (dlcIdx >= 0)
 	{
@@ -338,7 +344,7 @@ static HookFunction hookFunction([] ()
 	}
 
 	// loading screen state 10 draws postFX every frame, which will make for a lot of unneeded GPU load below NUI
-	loadingScreenState = hook::get_address<int*>(hook::get_pattern("33 D2 48 8D 45 10 39 15", 8));
+	loadingScreenState = hook::get_address<int*>(hook::get_pattern("83 3D ? ? ? ? 05 75 ? 8B"), 2, 7);
 
 	OnGameFrame.Connect([]()
 	{
@@ -410,22 +416,83 @@ static HookFunction hookFunction([] ()
 	hook::call(hookPoint, LoadDefDats); //Call the new function to load the handling files
 });
 
+static hook::cdecl_stub<void(float)> _drawLoadingSpinner([]()
+{
+	return hook::get_call(hook::get_pattern("E8 ? ? ? ? 83 3D ? ? ? ? 00 74 0C E8 ? ? ? ? EB 05"));
+});
+
+static bool* g_isPendingGFx;
+static void** g_scaleformMgr;
+static void (*g_render)(void*);
+
+static void (*setupBusySpinner)(bool);
+static void (*updateBusySpinner)();
+static bool* spinnerDep;
+
+// CScaleformMgr::UpdateAtEndOfFrame
+static hook::cdecl_stub<void(bool)> _sf_updateEndOfFrame([]()
+{
+	return hook::get_pattern("45 33 FF 44 8A F1 44 38 ? ? ? ? 01 0F 85", -0x18);
+});
+
+static HookFunction hookFunctionSpinner([]()
+{
+	// set up GFx bits
+	{
+		auto location = hook::get_pattern<char>("74 1A 80 3D ? ? ? ? 00 74 11 E8 ? ? ? ? 48 8B");
+		g_isPendingGFx = hook::get_address<bool*>(location, 4, 9);
+		g_scaleformMgr = hook::get_address<void**>(location + 19);
+		hook::set_call(&g_render, location + 0x17);
+	}
+
+	// spinner setup deps
+	{
+		auto location = hook::get_pattern("B1 01 E8 ? ? ? ? 48 8D 0D ? ? ? ? 48 8B ? E8", 2);
+		hook::set_call(&setupBusySpinner, location);
+	}
+
+	{
+		auto location = hook::get_pattern<char>("77 15 C6 05 ? ? ? ? 01 E8", 2);
+		spinnerDep = hook::get_address<bool*>(location, 2, 7);
+		hook::set_call(&updateBusySpinner, location + 7);
+	}
+
+	// don't ignore spinner
+	auto p = hook::get_call(hook::get_pattern<char>("E8 ? ? ? ? 83 3D ? ? ? ? 00 74 0C E8 ? ? ? ? EB 05"));
+	hook::nop(p + 0x1D, 6);
+});
+
 static InitFunction initFunction([] ()
 {
-	/*static uint32_t timeMsec;
-
-	rage::OnInitFunctionInvoking.Connect([] (rage::InitFunctionType type, int idx, rage::InitFunctionData& data)
+	OnLookAliveFrame.Connect([]()
 	{
-		timeMsec = timeGetTime();
+		if (nui::HasFrame("loadingScreen"))
+		{
+			if (*g_scaleformMgr)
+			{
+				setupBusySpinner(1);
+				*spinnerDep = true;
+				updateBusySpinner();
+
+				_sf_updateEndOfFrame(false);
+			}
+		}
 	});
-
-	rage::OnInitFunctionInvoked.Connect([] (rage::InitFunctionType, const rage::InitFunctionData& data)
+		
+	OnPostFrontendRender.Connect([]()
 	{
-		trace("%s took %dmsec.\n", data.GetName(), (timeGetTime() - timeMsec));
-	});
+		if (nui::HasFrame("loadingScreen"))
+		{
+			*g_isPendingGFx = true;
 
-	OnReturnDataFileEntry.Connect([] (int typeIdx, const char* entryName)
-	{
-		trace("got entry %i - %s\n", typeIdx, entryName);
-	});*/
+			if (*g_scaleformMgr)
+			{
+				static auto timeStart = std::chrono::high_resolution_clock::now().time_since_epoch();
+				auto timeSpan = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now().time_since_epoch() - timeStart);
+				_drawLoadingSpinner(timeSpan.count() / 1000.0 + 4);
+
+				g_render(*g_scaleformMgr);
+			}
+		}
+	}, 5000);
 });

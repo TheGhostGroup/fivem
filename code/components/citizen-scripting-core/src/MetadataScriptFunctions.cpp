@@ -13,13 +13,27 @@
 
 #include <VFSManager.h>
 
+#if __has_include(<CrossBuildRuntime.h>) && defined(_WIN32)
+#include <CrossBuildRuntime.h>
+
+static inline auto GetGameBuild()
+{
+	return xbr::GetGameBuild();
+}
+#else
+static inline auto GetGameBuild()
+{
+	return 0;
+}
+#endif
+
 static InitFunction initFunction([] ()
 {
 	fx::ScriptEngine::RegisterNativeHandler("GET_NUM_RESOURCE_METADATA", [] (fx::ScriptContext& context)
 	{
 		// find the resource
 		fx::ResourceManager* resourceManager = fx::ResourceManager::GetCurrent();
-		fwRefContainer<fx::Resource> resource = resourceManager->GetResource(context.GetArgument<const char*>(0));
+		fwRefContainer<fx::Resource> resource = resourceManager->GetResource(context.CheckArgument<const char*>(0));
 
 		if (!resource.GetRef())
 		{
@@ -31,7 +45,7 @@ static InitFunction initFunction([] ()
 		fwRefContainer<fx::ResourceMetaDataComponent> component = resource->GetComponent<fx::ResourceMetaDataComponent>();
 
 		// find all matching entries
-		auto entries = component->GetEntries(context.GetArgument<const char*>(1));
+		auto entries = component->GetEntries(context.CheckArgument<const char*>(1));
 
 		// and count them
 		auto numEntries = std::distance(entries.begin(), entries.end());
@@ -43,7 +57,7 @@ static InitFunction initFunction([] ()
 	{
 		// find the resource
 		fx::ResourceManager* resourceManager = fx::ResourceManager::GetCurrent();
-		fwRefContainer<fx::Resource> resource = resourceManager->GetResource(context.GetArgument<const char*>(0));
+		fwRefContainer<fx::Resource> resource = resourceManager->GetResource(context.CheckArgument<const char*>(0));
 
 		if (!resource.GetRef())
 		{
@@ -55,7 +69,7 @@ static InitFunction initFunction([] ()
 		fwRefContainer<fx::ResourceMetaDataComponent> component = resource->GetComponent<fx::ResourceMetaDataComponent>();
 
 		// find matching entries
-		auto entries = component->GetEntries(context.GetArgument<const char*>(1));
+		auto entries = component->GetEntries(context.CheckArgument<const char*>(1));
 		int entryIndex = context.GetArgument<int>(2);
 
 		// and loop over the entries to see if we find anything
@@ -80,7 +94,7 @@ static InitFunction initFunction([] ()
 	{
 		// find the resource
 		fx::ResourceManager* resourceManager = fx::ResourceManager::GetCurrent();
-		fwRefContainer<fx::Resource> resource = resourceManager->GetResource(context.GetArgument<const char*>(0));
+		fwRefContainer<fx::Resource> resource = resourceManager->GetResource(context.CheckArgument<const char*>(0));
 
 		if (!resource.GetRef())
 		{
@@ -88,8 +102,26 @@ static InitFunction initFunction([] ()
 			return;
 		}
 
+		const auto& rootPath = resource->GetPath();
+
+		// an empty root path would read from `/...`
+		if (rootPath.empty())
+		{
+			context.SetResult(nullptr);
+			return;
+		}
+
+#ifndef IS_FXSERVER
+		// only load from `resources:/` for client (see CachedResourceMounter)
+		if (rootPath.find("resources:/") != 0) // find != 0 is equivalent to a !starts_with
+		{
+			context.SetResult(nullptr);
+			return;
+		}
+#endif
+
 		// try opening the file from the resource's home directory
-		fwRefContainer<vfs::Stream> stream = vfs::OpenRead(resource->GetPath() + "/" + context.GetArgument<const char*>(1));
+		fwRefContainer<vfs::Stream> stream = vfs::OpenRead(rootPath + "/" + context.CheckArgument<const char*>(1));
 
 		if (!stream.GetRef())
 		{
@@ -122,7 +154,7 @@ static InitFunction initFunction([] ()
 	{
 		// find the resource
 		fx::ResourceManager* resourceManager = fx::ResourceManager::GetCurrent();
-		fwRefContainer<fx::Resource> resource = resourceManager->GetResource(context.GetArgument<const char*>(0));
+		fwRefContainer<fx::Resource> resource = resourceManager->GetResource(context.CheckArgument<const char*>(0));
 
 		if (!resource.GetRef())
 		{
@@ -137,7 +169,7 @@ static InitFunction initFunction([] ()
 	{
 		// find the resource
 		fx::ResourceManager* resourceManager = fx::ResourceManager::GetCurrent();
-		fwRefContainer<fx::Resource> resource = resourceManager->GetResource(context.GetArgument<const char*>(0));
+		fwRefContainer<fx::Resource> resource = resourceManager->GetResource(context.CheckArgument<const char*>(0));
 
 		if (!resource.GetRef())
 		{
@@ -146,7 +178,7 @@ static InitFunction initFunction([] ()
 		}
 
 		// try opening a writable file in the resource's home directory
-		std::string filePath = resource->GetPath() + "/" + context.GetArgument<const char*>(1);
+		std::string filePath = resource->GetPath() + "/" + context.CheckArgument<const char*>(1);
 
 		fwRefContainer<vfs::Device> device = vfs::GetDevice(filePath);
 		auto handle = device->Create(filePath);
@@ -174,4 +206,28 @@ static InitFunction initFunction([] ()
 		context.SetResult(true);
 	});
 #endif
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_GAME_NAME", [](fx::ScriptContext& context)
+	{
+		const char* gameName =
+#ifdef IS_FXSERVER
+		"fxserver"
+#elif defined(GTA_FIVE)
+		"fivem"
+#elif defined(GTA_NY)
+		"libertym"
+#elif defined(IS_RDR3)
+		"redm"
+#else
+		"unknown"
+#endif
+		;
+
+		context.SetResult<const char*>(gameName);
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_GAME_BUILD_NUMBER", [](fx::ScriptContext& context)
+	{
+		context.SetResult<int64_t>(GetGameBuild());
+	});
 });

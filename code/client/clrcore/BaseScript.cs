@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
@@ -15,6 +16,8 @@ namespace CitizenFX.Core
 {
 	public abstract class BaseScript
 	{
+		private string m_typeName;
+
 		// based on answer from
 		// https://stackoverflow.com/a/6624385
 		private class DelegateEqualityComparer : IEqualityComparer<Delegate>
@@ -35,14 +38,14 @@ namespace CitizenFX.Core
 			}
 		}
 
-		private struct TickHandler
+		private class TickHandler
 		{
 			public Func<Task> tick;
 			public int hashCode;
 			public string name;
 		}
 
-		private Dictionary<int, Task> CurrentTaskList { get; set; }
+		private ConcurrentDictionary<int, Task> CurrentTaskList { get; set; }
 
 		private DelegateEqualityComparer m_dec = new DelegateEqualityComparer();
 
@@ -56,6 +59,11 @@ namespace CitizenFX.Core
 		{
 			add
 			{
+				if (m_typeName == null)
+				{
+					m_typeName = GetType().Name;
+				}
+
 				m_tickList.Add(new TickHandler()
 				{
 					tick = value,
@@ -83,7 +91,7 @@ namespace CitizenFX.Core
 			set => ms_curName = value;
 		}
 
-#if !IS_FXSERVER && !IS_RDR3
+#if !IS_FXSERVER && !IS_RDR3 && !GTA_NY
 		private Player m_player;
 
 		protected Player LocalPlayer
@@ -102,7 +110,7 @@ namespace CitizenFX.Core
 		}
 #endif
 
-#if !IS_RDR3
+#if !IS_RDR3 && !GTA_NY
 		protected PlayerList Players { get; private set; }
 #endif
 
@@ -112,9 +120,9 @@ namespace CitizenFX.Core
 		{
 			EventHandlers = new EventHandlerDictionary();
 			Exports = new ExportDictionary();
-			CurrentTaskList = new Dictionary<int, Task>();
+			CurrentTaskList = new ConcurrentDictionary<int, Task>();
 			GlobalState = new StateBag("global");
-#if !IS_RDR3
+#if !IS_RDR3 && !GTA_NY
 			Players = new PlayerList();
 #endif
 		}
@@ -122,16 +130,12 @@ namespace CitizenFX.Core
 		[SecuritySafeCritical]
 		internal void ScheduleRun()
 		{
-			var flowBlock = CitizenTaskScheduler.SuppressFlow();
-
 			var calls = m_tickList;
 
 			foreach (var call in calls)
 			{
 				ScheduleTick(call);
 			}
-
-			flowBlock?.Undo();
 		}
 
 		internal void RegisterTick(Func<Task> tick)
@@ -144,29 +148,32 @@ namespace CitizenFX.Core
 			EventHandlers[eventName] += callback;
 		}
 
+		private string GetCurName(TickHandler callWrap)
+		{
+			return $"{m_typeName} -> tick {callWrap.name}";
+		}
+
 		private void ScheduleTick(TickHandler callWrap)
 		{
 			if (!CurrentTaskList.ContainsKey(callWrap.hashCode))
 			{
 				var call = callWrap.tick;
 
-				var curName = $"{GetType().Name} -> tick {callWrap.name}";
-
 				try
 				{
-					ms_curName = curName;
+					ms_curName = callWrap.name;
 
-					using (var scope = new ProfilerScope(() => curName))
+					using (var scope = new ProfilerScope(() => ms_curName = GetCurName(callWrap)))
 					{
-						CurrentTaskList.Add(callWrap.hashCode, CitizenTaskScheduler.Factory.StartNew(() =>
+						CurrentTaskList.TryAdd(callWrap.hashCode, CitizenTaskScheduler.Factory.StartNew(() =>
 						{
-							ms_curName = curName;
-
 							try
 							{
-								using (var innerScope = new ProfilerScope(() => curName))
+								ms_curName = callWrap.name;
+
+								using (var innerScope = new ProfilerScope(() => ms_curName = GetCurName(callWrap)))
 								{
-									var t = ((Func<Task>)call)();
+									var t = call();
 
 									return t;
 								}
@@ -182,7 +189,7 @@ namespace CitizenFX.Core
 								Debug.WriteLine($"Failed to run a tick for {GetType().Name}: {a.Exception?.InnerExceptions.Aggregate("", (b, s) => s + b.ToString() + "\n")}");
 							}
 
-							CurrentTaskList.Remove(callWrap.hashCode);
+							CurrentTaskList.TryRemove(callWrap.hashCode, out _);
 						}));
 					}
 				}
@@ -203,7 +210,7 @@ namespace CitizenFX.Core
 		/// <returns>An awaitable task.</returns>
 		public static Task Delay(int msecs)
 		{
-			return CitizenTaskScheduler.Factory.FromAsync(BeginDelay, EndDelay, msecs, CitizenTaskScheduler.Instance);
+			return CitizenTaskScheduler.Factory.FromAsync(BeginDelay, EndDelay, msecs, null);
 		}
 
 		[SecuritySafeCritical]
@@ -450,7 +457,7 @@ namespace CitizenFX.Core
 						}
 					}
 					// Player
-#if !IS_RDR3
+#if !IS_RDR3 && !GTA_NY
 					else if (parameters.Any(p => p.ParameterType == typeof(Player)) && parameters.Length == 1)
 					{
 #if IS_FXSERVER
@@ -492,7 +499,7 @@ namespace CitizenFX.Core
 						}
 					}
 					// Player, string[]
-#if !IS_RDR3
+#if !IS_RDR3 && !GTA_NY
 					else if (parameters.Any(p => p.ParameterType == typeof(Player)) && parameters.Length == 2)
 					{
 #if IS_FXSERVER

@@ -1,6 +1,8 @@
 #include "StdInc.h"
 #include <rocksdb/db.h>
 
+#include <CoreConsole.h>
+
 #include <ScriptEngine.h>
 
 #include <msgpack.hpp>
@@ -17,14 +19,17 @@ struct DatabaseHolder
 {
 	DatabaseHolder(fx::ServerInstanceBase* instance)
 	{
+		nameVar = instance->AddVariable<std::string>("sv_kvsName", ConVar_None, "default");
+
 		rocksdb::DB* dbPointer;
 
 		rocksdb::Options options;
 		options.create_if_missing = true;
 		options.compression = rocksdb::kLZ4Compression;
+		options.keep_log_file_num = 10;
 
 		auto instanceRoot = std::filesystem::u8path(instance->GetRootPath());
-		auto dbRoot = (instanceRoot / "db" / "default").lexically_normal();
+		auto dbRoot = (instanceRoot / "db" / nameVar->GetValue()).lexically_normal();
 
 		std::error_code err;
 		std::filesystem::create_directories(dbRoot, err);
@@ -68,6 +73,8 @@ struct DatabaseHolder
 	}
 
 private:
+	std::shared_ptr<ConVar<std::string>> nameVar;
+
 	std::unique_ptr<rocksdb::DB> db;
 };
 
@@ -103,30 +110,32 @@ static std::string FormatKey(const char* key, const std::string& resource = {})
 	return "res:" + resName + ":" + key;
 }
 
+template<bool sync = true>
 static void PutResourceKvp(fx::ScriptContext& context, const char* data, size_t size)
 {
 	auto db = EnsureDatabase();
 	auto key = FormatKey(context.CheckArgument<const char*>(0));
 
 	rocksdb::WriteOptions options;
-	options.sync = true;
+	options.sync = sync;
 
 	db->Put(options, key, rocksdb::Slice{ data, size });
 }
 
-template<typename T>
+template<typename T, bool sync = true>
 static void SetResourceKvp(fx::ScriptContext& context)
 {
 	msgpack::sbuffer buffer;
 	msgpack::packer<msgpack::sbuffer> packer(buffer);
 	packer.pack(std::is_pointer_v<T> ? context.CheckArgument<T>(1) : context.GetArgument<T>(1));
 
-	PutResourceKvp(context, buffer.data(), buffer.size());
+	PutResourceKvp<sync>(context, buffer.data(), buffer.size());
 }
 
+template<bool sync = true>
 static void SetResourceKvpRaw(fx::ScriptContext& context)
 {
-	PutResourceKvp(context, context.GetArgument<const char*>(1), context.GetArgument<size_t>(2));
+	PutResourceKvp<sync>(context, context.GetArgument<const char*>(1), context.GetArgument<size_t>(2));
 }
 
 struct AnyType
@@ -297,12 +306,34 @@ static void EndFindKvp(fx::ScriptContext& context)
 	handle->dbIter.reset();
 }
 
+template<bool sync = true>
 static void DeleteResourceKvp(fx::ScriptContext& context)
 {
 	auto db = EnsureDatabase();
 	auto key = FormatKey(context.GetArgument<const char*>(0));
 
-	db->Delete(rocksdb::WriteOptions{}, key);
+	rocksdb::WriteOptions options;
+	options.sync = sync;
+
+	db->Delete(options, key);
+}
+
+static void FlushResourceKvp(fx::ScriptContext& context)
+{
+	auto db = EnsureDatabase();
+	db->SyncWAL(); /* Ensure allow_mmap_writes remains false in rocksdb::Options */
+}
+
+static void GetResourceKvpProperty(fx::ScriptContext& context)
+{
+	static std::string property_value;
+
+	auto db = EnsureDatabase();
+	auto db_property = context.CheckArgument<const char*>(0);
+
+	db->GetProperty(db_property, &property_value);
+
+	context.SetResult<const char*>(property_value.c_str());
 }
 
 static InitFunction initFunction([]()
@@ -316,9 +347,17 @@ static InitFunction initFunction([]()
 	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP", SetResourceKvp<const char*>);
 	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP_INT", SetResourceKvp<int>);
 	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP_FLOAT", SetResourceKvp<float>);
-	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_RAW_KVP", SetResourceKvpRaw);
+	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_RAW_KVP", SetResourceKvpRaw<>);
 
-	fx::ScriptEngine::RegisterNativeHandler("DELETE_RESOURCE_KVP", DeleteResourceKvp);
+	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP_NO_SYNC", SetResourceKvp<const char*, false>);
+	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP_INT_NO_SYNC", SetResourceKvp<int, false>);
+	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP_FLOAT_NO_SYNC", SetResourceKvp<float, false>);
+	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_RAW_KVP_NO_SYNC", SetResourceKvpRaw<false>);
+	fx::ScriptEngine::RegisterNativeHandler("FLUSH_RESOURCE_KVP", FlushResourceKvp);
+
+	fx::ScriptEngine::RegisterNativeHandler("DELETE_RESOURCE_KVP", DeleteResourceKvp<>);
+	fx::ScriptEngine::RegisterNativeHandler("DELETE_RESOURCE_KVP_NO_SYNC", DeleteResourceKvp<false>);
+	fx::ScriptEngine::RegisterNativeHandler("GET_RESOURCE_KVP_PROPERTY", GetResourceKvpProperty);
 
 	fx::ScriptEngine::RegisterNativeHandler("START_FIND_KVP", StartFindKvp);
 	fx::ScriptEngine::RegisterNativeHandler("FIND_KVP", FindKvp);

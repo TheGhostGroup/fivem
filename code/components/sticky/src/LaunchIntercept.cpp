@@ -16,7 +16,7 @@ void Component_RunPreInit()
 
 	bool debugMode = false;
 
-#ifdef GTA_FIVE
+#if defined(GTA_FIVE) || defined(IS_RDR3) || defined(GTA_NY)
 #ifdef _DEBUG
 	debugMode = true;
 #endif
@@ -26,9 +26,15 @@ void Component_RunPreInit()
 		debugMode = false;
 	}
 
+	bool five = false;
+
+#ifdef GTA_FIVE
+	five = true;
+#endif
+
 	if (hostData->IsMasterProcess() && !debugMode)
 	{
-		auto processName = MakeCfxSubProcess(L"GameProcess.exe", Is372() ? L"game_372" : (!Is2060() ? L"game" : L"game_2060"));
+		auto processName = MakeCfxSubProcess(L"GameProcess.exe", fmt::sprintf(L"game_%d%s", xbr::GetGameBuild(), (IsWindows8Point1OrGreater()) ? L"_aslr" : L""));
 
 		STARTUPINFOW si = { 0 };
 		si.cb = sizeof(si);

@@ -7,8 +7,12 @@
 
 #include "StdInc.h"
 #include <Error.h>
+
 #include "ConsoleHost.h"
 #include "ConsoleHostImpl.h"
+#include "CoreConsole.h"
+
+#include <d3d11.h>
 
 #include <mutex>
 #include <queue>
@@ -17,6 +21,12 @@
 
 #include <rapidjson/document.h>
 #include <rapidjson/writer.h>
+
+#if __has_include("CefOverlay.h")
+#include "CefOverlay.h"
+
+#define WITH_NUI 1
+#endif
 
 #ifndef IS_LAUNCHER
 #include <DrawCommands.h>
@@ -29,19 +39,98 @@
 
 #include <imgui.h>
 
+#include "backends/imgui_impl_dx11.h"
+#include "backends/imgui_impl_win32.h"
+
 #include <ShlObj.h>
+
+#include <HostSharedData.h>
+#include <ReverseGameData.h>
+
+static void BuildFont(float scale);
+
+static ImGuiStyle InitStyle()
+{
+	ImGuiStyle style;
+
+	ImColor hiliteBlue = ImColor(81, 179, 236);
+	ImColor hiliteBlueTransparent = ImColor(81, 179, 236, 180);
+	ImColor backgroundBlue = ImColor(22, 24, 28, 200);
+	ImColor semiTransparentBg = ImColor(50, 50, 50, 0.6 * 255);
+	ImColor semiTransparentBgHover = ImColor(80, 80, 80, 0.6 * 255);
+
+	style.Colors[ImGuiCol_WindowBg] = backgroundBlue;
+	style.Colors[ImGuiCol_TitleBg] = hiliteBlue;
+	style.Colors[ImGuiCol_TitleBgActive] = hiliteBlue;
+	style.Colors[ImGuiCol_TitleBgCollapsed] = hiliteBlue;
+	style.Colors[ImGuiCol_Border] = hiliteBlue;
+	style.Colors[ImGuiCol_FrameBg] = semiTransparentBg;
+	style.Colors[ImGuiCol_FrameBgHovered] = semiTransparentBgHover;
+	style.Colors[ImGuiCol_TextSelectedBg] = hiliteBlueTransparent;
+
+	return style;
+}
 
 static bool g_conHostInitialized = false;
 extern bool g_consoleFlag;
+extern bool g_cursorFlag;
 int g_scrollTop;
 int g_bufferHeight;
+
+bool ConsoleHasAnything()
+{
+	return g_consoleFlag || g_cursorFlag;
+}
+
+bool ConsoleHasMouse()
+{
+	if (ConsoleHasAnything())
+	{
+#if WITH_NUI
+		if (nui::HasCursor())
+		{
+			return ImGui::GetIO().WantCaptureMouse;
+		}
+#endif
+
+		return true;
+	}
+
+	return false;
+}
+
+bool ConsoleHasKeyboard()
+{
+	// g_cursorFlag is cursor-only (for when we want to use the dear ImGui cursor for other purposes)
+	if (g_consoleFlag)
+	{
+#if WITH_NUI
+		if (nui::HasFocus())
+		{
+			return ImGui::GetIO().WantCaptureKeyboard;
+		}
+#endif
+
+		return true;
+	}
+
+	return false;
+}
 
 #ifndef IS_LAUNCHER
 static uint32_t g_pointSamplerState;
 static rage::grcTexture* g_fontTexture;
 
-static void RenderDrawListInternal(ImDrawList* drawList)
+static void RenderDrawListInternal(ImDrawList* drawList, ImDrawData* refData)
 {
+#ifndef _HAVE_GRCORE_NEWSTATES
+	SetRenderState(0, grcCullModeNone);
+	SetRenderState(2, 0); // alpha blending m8
+
+	GetD3D9Device()->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+	GetD3D9Device()->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+	GetD3D9Device()->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+#else
 	auto oldRasterizerState = GetRasterizerState();
 	SetRasterizerState(GetStockStateIdentifier(RasterizerStateNoCulling));
 
@@ -50,6 +139,7 @@ static void RenderDrawListInternal(ImDrawList* drawList)
 
 	auto oldDepthStencilState = GetDepthStencilState();
 	SetDepthStencilState(GetStockStateIdentifier(DepthStencilStateNoDepth));
+#endif
 
 	size_t idxOff = 0;
 
@@ -61,7 +151,14 @@ static void RenderDrawListInternal(ImDrawList* drawList)
 		}
 		else
 		{
-			SetTextureGtaIm((rage::grcTexture*)cmd.TextureId);
+			if (cmd.TextureId)
+			{
+				SetTextureGtaIm(*(rage::grcTexture**)cmd.TextureId);
+			}
+			else
+			{
+				SetTextureGtaIm(rage::grcTextureFactory::GetNoneTexture());
+			}
 
 			PushDrawBlitImShader();
 
@@ -76,8 +173,13 @@ static void RenderDrawListInternal(ImDrawList* drawList)
 				{
 					auto& vertex = drawList->VtxBuffer.Data[drawList->IdxBuffer.Data[i + idxOff]];
 					auto color = vertex.col;
+					
+					if (!rage::grcTexture::IsRenderSystemColorSwapped())
+					{
+						color = (color & 0xFF00FF00) | _rotl(color & 0x00FF00FF, 16);
+					}
 
-					rage::grcVertex(vertex.pos.x, vertex.pos.y, 0.0f, 0.0f, 0.0f, -1.0f, color, vertex.uv.x, vertex.uv.y);
+					rage::grcVertex(vertex.pos.x - refData->DisplayPos.x, vertex.pos.y - refData->DisplayPos.y, 0.0f, 0.0f, 0.0f, -1.0f, color, vertex.uv.x, vertex.uv.y);
 				}
 
 				idxOff += c;
@@ -85,14 +187,14 @@ static void RenderDrawListInternal(ImDrawList* drawList)
 #if defined(GTA_FIVE)
 				// set scissor rects here, as they might be overwritten by a matrix push
 				D3D11_RECT scissorRect;
-				scissorRect.left = cmd.ClipRect.x;
-				scissorRect.top = cmd.ClipRect.y;
-				scissorRect.right = cmd.ClipRect.z;
-				scissorRect.bottom = cmd.ClipRect.w;
+				scissorRect.left = cmd.ClipRect.x - refData->DisplayPos.x;
+				scissorRect.top = cmd.ClipRect.y - refData->DisplayPos.y;
+				scissorRect.right = cmd.ClipRect.z - refData->DisplayPos.x;
+				scissorRect.bottom = cmd.ClipRect.w - refData->DisplayPos.y;
 
 				GetD3D11DeviceContext()->RSSetScissorRects(1, &scissorRect);
 #else
-				SetScissorRect(cmd.ClipRect.x, cmd.ClipRect.y, cmd.ClipRect.z, cmd.ClipRect.w);
+				SetScissorRect(cmd.ClipRect.x - refData->DisplayPos.x, cmd.ClipRect.y - refData->DisplayPos.y, cmd.ClipRect.z - refData->DisplayPos.x, cmd.ClipRect.w - refData->DisplayPos.y);
 #endif
 
 				rage::grcEnd();
@@ -102,11 +204,17 @@ static void RenderDrawListInternal(ImDrawList* drawList)
 		}
 	}
 
+#ifdef _HAVE_GRCORE_NEWSTATES
 	SetRasterizerState(oldRasterizerState);
 
 	SetBlendState(oldBlendState);
 
 	SetDepthStencilState(oldDepthStencilState);
+#else
+	GetD3D9Device()->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_ANISOTROPIC);
+	GetD3D9Device()->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_ANISOTROPIC);
+	GetD3D9Device()->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+#endif
 
 	delete drawList;
 
@@ -139,17 +247,18 @@ static void RenderDrawLists(ImDrawData* drawData)
 
 		if (IsOnRenderThread())
 		{
-			RenderDrawListInternal(grDrawList);
+			RenderDrawListInternal(grDrawList, drawData);
 		}
 		else
 		{
 			uintptr_t argRef = (uintptr_t)grDrawList;
+			uintptr_t argRefB = (uintptr_t)drawData;
 
 			EnqueueGenericDrawCommand([](uintptr_t a, uintptr_t b)
 			{
-				RenderDrawListInternal((ImDrawList*)a);
+				RenderDrawListInternal((ImDrawList*)a, (ImDrawData*)b);
 			},
-			&argRef, &argRef);
+			&argRef, &argRefB);
 		}
 	}
 }
@@ -167,13 +276,23 @@ static void CreateFontTexture()
 	reference.height = height;
 	reference.depth = 1;
 	reference.stride = width * 4;
+#ifdef GTA_NY
+	reference.format = 1;
+#else
 	reference.format = 11;
+#endif
 	reference.pixelData = (uint8_t*)pixels;
 
 	rage::grcTexture* texture = rage::grcTextureFactory::getInstance()->createImage(&reference, nullptr);
 	g_fontTexture = texture;
 
-	io.Fonts->TexID = (void*)g_fontTexture;
+	if (!io.Fonts->TexID)
+	{
+		void** texId = new void*[2];
+		io.Fonts->TexID = (ImTextureID)texId;
+	}
+
+	((void**)io.Fonts->TexID)[0] = (void*)g_fontTexture;
 }
 #else
 DLL_EXPORT fwEvent<ImDrawData*> OnRenderImDrawData;
@@ -190,19 +309,87 @@ static void RenderDrawLists(ImDrawData* drawData)
 #endif
 
 void DrawConsole();
+void DrawDevGui();
 
-static std::mutex g_conHostMutex;
+static std::recursive_mutex g_conHostMutex;
+ImFont* consoleFontSmall;
 
 void DrawMiniConsole();
+void DrawWinConsole(bool* pOpen);
+
+static void HandleFxDKInput(ImGuiIO& io)
+{
+	static HostSharedData<ReverseGameData> rgd("CfxReverseGameData");
+	static uint16_t lastInputChar = 0;
+	static uint32_t inputCharChangedAt = timeGetTime();
+
+	auto currentInputChar = rgd->inputChar;
+	auto inputCharChanged = currentInputChar != lastInputChar;
+
+	lastInputChar = currentInputChar;
+
+	if (currentInputChar > 0 && currentInputChar < 0x10000)
+	{
+		if (inputCharChanged)
+		{
+			inputCharChangedAt = timeGetTime();
+			io.AddInputCharacterUTF16(currentInputChar);
+		}
+		else if (timeGetTime() - inputCharChangedAt > 300)
+		{
+			io.AddInputCharacterUTF16(currentInputChar);
+		}
+	}
+}
+
+void OnConsoleFrameDraw(int width, int height, bool usedSharedD3D11);
 
 DLL_EXPORT void OnConsoleFrameDraw(int width, int height)
 {
-	if (!g_conHostMutex.try_lock())
+	return OnConsoleFrameDraw(width, height, false);
+}
+
+extern ID3D11DeviceContext* g_pd3dDeviceContext;
+
+extern float ImGui_ImplWin32_GetWindowDpiScale(ImGuiViewport* viewport);
+extern void ImGui_ImplDX11_RecreateFontsTexture();
+
+static bool g_winConsole;
+
+void OnConsoleFrameDraw(int width, int height, bool usedSharedD3D11)
+{
+	std::unique_lock lock(g_conHostMutex, std::defer_lock);
+	if (!lock.try_lock())
 	{
 		return;
 	}
 
+#ifndef IS_FXSERVER
+	static ConVar<bool> winConsoleVar("con_winconsole", ConVar_Archive | ConVar_UserPref, false, &g_winConsole);
+#endif
+
 #ifndef IS_LAUNCHER
+	static float lastScale = 1.0f;
+	float scale = ImGui_ImplWin32_GetWindowDpiScale(ImGui::GetMainViewport());
+
+	if (scale > 2.0f)
+	{
+		scale = 2.0f;
+	}
+
+	if (scale != lastScale)
+	{
+		ImGui::GetStyle() = InitStyle();
+		ImGui::GetStyle().ScaleAllSizes(scale);
+
+		BuildFont(scale);
+		CreateFontTexture();
+
+		ImGui_ImplDX11_RecreateFontsTexture();
+
+		lastScale = scale;
+	}
+
 	if (!g_fontTexture)
 	{
 		CreateFontTexture();
@@ -215,21 +402,36 @@ DLL_EXPORT void OnConsoleFrameDraw(int width, int height)
 
 	ConHost::OnShouldDrawGui(&shouldDrawGui);
 
-	if (!g_consoleFlag && !shouldDrawGui)
+	if (!g_cursorFlag && !g_consoleFlag && !shouldDrawGui && !g_winConsole)
 	{
+		// if not drawing the gui, we're also not owning the cursor
+#ifdef WITH_NUI
+		nui::SetHideCursor(false);
+#endif
+
 		lastDrawTime = timeGetTime();
 
-		g_conHostMutex.unlock();
 		return;
 	}
 
 	ImGuiIO& io = ImGui::GetIO();
-	io.MouseDrawCursor = g_consoleFlag;
+
+	HandleFxDKInput(io);
+
+	io.MouseDrawCursor = ConsoleHasMouse();
+
+#ifdef WITH_NUI
+	nui::SetHideCursor(io.MouseDrawCursor);
+#endif
 
 	{
 		io.DisplaySize = ImVec2(width, height);
-
 		io.DeltaTime = (timeGetTime() - lastDrawTime) / 1000.0f;
+
+		if (io.DeltaTime <= 0.0f)
+		{
+			io.DeltaTime = 1.0f / 60.0f;
+		}
 	}
 
 	io.KeyCtrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -237,22 +439,93 @@ DLL_EXPORT void OnConsoleFrameDraw(int width, int height)
 	io.KeyAlt = (GetKeyState(VK_MENU) & 0x8000) != 0;
 	io.KeySuper = false;
 
+	if (ImGui::GetPlatformIO().Viewports.Size > 1)
+	{
+		MSG msg = { 0 };
+
+		// run a separate filtered message loop *per window* as we don't want to include the game window here
+		for (size_t viewport = 1; viewport < ImGui::GetPlatformIO().Viewports.Size; viewport++)
+		{
+			auto hWnd = (HWND)ImGui::GetPlatformIO().Viewports[viewport]->PlatformHandleRaw;
+
+			while (PeekMessageW(&msg, hWnd, 0, 0, PM_REMOVE))
+			{
+				TranslateMessage(&msg);
+				DispatchMessageW(&msg);
+			}
+		}
+	}
+
+	ImGui_ImplDX11_NewFrame();
+	ImGui_ImplWin32_NewFrame();
+
 	ImGui::NewFrame();
+
+	bool wasSmallFont = false;
+
+	{
+		int x, y;
+		GetGameResolution(x, y);
+
+		if (x <= 1920 && y <= 1080)
+		{
+			ImGui::PushFont(consoleFontSmall);
+			wasSmallFont = true;
+		}
+	}
 
 	if (g_consoleFlag)
 	{
+		DrawDevGui();
 		DrawConsole();
 	}
 
 	DrawMiniConsole();
 
+	if (g_winConsole)
+	{
+		DrawWinConsole(&g_winConsole);
+	}
+
 	ConHost::OnDrawGui();
 
+	if (wasSmallFont)
+	{
+		ImGui::PopFont();
+	}
+
 	ImGui::Render();
+	RenderDrawLists(ImGui::GetDrawData());
+
+	ID3D11RenderTargetView* oldRTV = nullptr;
+	ID3D11DepthStencilView* oldDSV = nullptr;
+
+	if (usedSharedD3D11)
+	{
+		g_pd3dDeviceContext->OMGetRenderTargets(1, &oldRTV, &oldDSV);
+	}
+
+    ImGui::UpdatePlatformWindows();
+	ImGui::RenderPlatformWindowsDefault();
+
+	if (usedSharedD3D11)
+	{
+		g_pd3dDeviceContext->OMSetRenderTargets(1, &oldRTV, oldDSV);
+
+		if (oldRTV)
+		{
+			oldRTV->Release();
+			oldRTV = nullptr;
+		}
+
+		if (oldDSV)
+		{
+			oldDSV->Release();
+			oldDSV = nullptr;
+		}
+	}
 
 	lastDrawTime = timeGetTime();
-
-	g_conHostMutex.unlock();
 }
 
 static void OnConsoleWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, bool& pass, LRESULT& result)
@@ -261,68 +534,40 @@ static void OnConsoleWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, 
 
 	ConHost::OnShouldDrawGui(&shouldDrawGui);
 
-	if (!g_consoleFlag || !pass)
+	if (!pass)
 	{
 		return;
 	}
 
-	std::unique_lock<std::mutex> g_conHostMutex;
-
-	ImGuiIO& io = ImGui::GetIO();
-	switch (msg)
+	if (!ConsoleHasAnything())
 	{
-		case WM_LBUTTONDOWN:
-			io.MouseDown[0] = true;
+		return;
+	}
+
+	std::unique_lock _(g_conHostMutex);
+	ImGuiIO& io = ImGui::GetIO();
+
+	if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam) == TRUE)
+	{
+		pass = false;
+		result = true;
+		return;
+	}
+	
+	if (msg == WM_INPUT || (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST))
+	{
+		if (ConsoleHasMouse())
+		{
 			pass = false;
-			break;
-		case WM_LBUTTONUP:
-			io.MouseDown[0] = false;
+		}
+	}
+
+	if ((msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || msg == WM_CHAR)
+	{
+		if (ConsoleHasKeyboard())
+		{
 			pass = false;
-			break;
-		case WM_RBUTTONDOWN:
-			io.MouseDown[1] = true;
-			pass = false;
-			break;
-		case WM_RBUTTONUP:
-			io.MouseDown[1] = false;
-			pass = false;
-			break;
-		case WM_MBUTTONDOWN:
-			io.MouseDown[2] = true;
-			pass = false;
-			break;
-		case WM_MBUTTONUP:
-			io.MouseDown[2] = false;
-			pass = false;
-			break;
-		case WM_MOUSEWHEEL:
-			io.MouseWheel += GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? +1.0f : -1.0f;
-			pass = false;
-			break;
-		case WM_MOUSEMOVE:
-			io.MousePos.x = (signed short)(lParam);
-			io.MousePos.y = (signed short)(lParam >> 16);
-			pass = false;
-			break;
-		case WM_KEYDOWN:
-			if (wParam < 256)
-				io.KeysDown[wParam] = 1;
-			pass = false;
-			break;
-		case WM_KEYUP:
-			if (wParam < 256)
-				io.KeysDown[wParam] = 0;
-			pass = false;
-			break;
-		case WM_CHAR:
-			// You can also use ToAscii()+GetKeyboardState() to retrieve characters.
-			if (wParam > 0 && wParam < 0x10000)
-				io.AddInputCharacter((unsigned short)wParam);
-			pass = false;
-			break;
-		case WM_INPUT:
-			pass = false;
-			break;
+		}
 	}
 
 	if (!pass)
@@ -339,38 +584,161 @@ DLL_EXPORT void RunConsoleWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 	OnConsoleWndProc(hWnd, msg, wParam, lParam, pass, result);
 }
 
-ImFont* consoleFontSmall;
 ImFont* consoleFontTiny;
 
-static InitFunction initFunction([]()
+static void BuildFont(float scale)
+{
+	auto& io = ImGui::GetIO();
+	io.Fonts->Clear();
+	io.Fonts->SetTexID(nullptr);
+
+	FILE* font = _wfopen(MakeRelativeCitPath(L"citizen/consolefont.ttf").c_str(), L"rb");
+
+	ImVector<ImWchar> ranges;
+	ImFontGlyphRangesBuilder builder;
+
+	static const ImWchar extra_ranges[] = {
+		0x0100,
+		0x017F, // Latin Extended-A
+		0x0180,
+		0x024F, // Latin Extended-B
+		0x0370,
+		0x03FF, // Greek and Coptic
+		0x10A0,
+		0x10FF, // Georgian
+		0x1E00,
+		0x1EFF, // Latin Extended Additional
+		0,
+	};
+
+	builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
+	builder.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
+	builder.AddRanges(&extra_ranges[0]);
+	builder.BuildRanges(&ranges);
+
+	if (font)
+	{
+		fseek(font, 0, SEEK_END);
+
+		auto fontSize = ftell(font);
+
+		std::unique_ptr<uint8_t[]> fontData(new uint8_t[fontSize]);
+
+		fseek(font, 0, SEEK_SET);
+
+		fread(&fontData[0], 1, fontSize, font);
+		fclose(font);
+
+		ImFontConfig fontCfg;
+		fontCfg.FontDataOwnedByAtlas = false;
+
+		io.Fonts->AddFontFromMemoryTTF(fontData.get(), fontSize, 22.0f * scale, &fontCfg, ranges.Data);
+		consoleFontSmall = io.Fonts->AddFontFromMemoryTTF(fontData.get(), fontSize, 18.0f * scale, &fontCfg, ranges.Data);
+		consoleFontTiny = io.Fonts->AddFontFromMemoryTTF(fontData.get(), fontSize, 14.0f * scale, &fontCfg, ranges.Data);
+
+		io.Fonts->Build();
+	}
+}
+
+#pragma comment(lib, "d3d11.lib")
+
+void ImGui_ImplWin32_InitPlatformInterface();
+
+extern ImGuiKey ImGui_ImplWin32_VirtualKeyToImGuiKey(WPARAM wParam);
+
+static HookFunction initFunction([]()
 {
 	auto cxt = ImGui::CreateContext();
 	ImGui::SetCurrentContext(cxt);
 
 	ImGuiIO& io = ImGui::GetIO();
-	io.KeyMap[ImGuiKey_Tab] = VK_TAB; // Keyboard mapping. ImGui will use those indices to peek into the io.KeyDown[] array that we will update during the application lifetime.
-	io.KeyMap[ImGuiKey_LeftArrow] = VK_LEFT;
-	io.KeyMap[ImGuiKey_RightArrow] = VK_RIGHT;
-	io.KeyMap[ImGuiKey_UpArrow] = VK_UP;
-	io.KeyMap[ImGuiKey_DownArrow] = VK_DOWN;
-	io.KeyMap[ImGuiKey_PageUp] = VK_PRIOR;
-	io.KeyMap[ImGuiKey_PageDown] = VK_NEXT;
-	io.KeyMap[ImGuiKey_Home] = VK_HOME;
-	io.KeyMap[ImGuiKey_End] = VK_END;
-	io.KeyMap[ImGuiKey_Delete] = VK_DELETE;
-	io.KeyMap[ImGuiKey_Backspace] = VK_BACK;
-	io.KeyMap[ImGuiKey_Enter] = VK_RETURN;
-	io.KeyMap[ImGuiKey_Escape] = VK_ESCAPE;
-	io.KeyMap[ImGuiKey_A] = 'A';
-	io.KeyMap[ImGuiKey_C] = 'C';
-	io.KeyMap[ImGuiKey_V] = 'V';
-	io.KeyMap[ImGuiKey_X] = 'X';
-	io.KeyMap[ImGuiKey_Y] = 'Y';
-	io.KeyMap[ImGuiKey_Z] = 'Z';
-
 	io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 	io.ConfigDockingWithShift = true;
 	io.ConfigWindowsResizeFromEdges = true;
+
+	io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+	io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+
+	io.BackendFlags |= ImGuiBackendFlags_HasSetMousePos; // We can honor io.WantSetMousePos requests (optional, rarely used)
+	io.BackendFlags |= ImGuiBackendFlags_PlatformHasViewports; // We can create multi-viewports on the Platform side (optional)
+	io.BackendFlags |= ImGuiBackendFlags_HasMouseHoveredViewport; // We can set io.MouseHoveredViewport correctly (optional, not easy)
+
+	io.BackendFlags |= ImGuiBackendFlags_RendererHasViewports;
+
+	ImGuiViewport* main_viewport = ImGui::GetMainViewport();
+	main_viewport->PlatformHandle = main_viewport->PlatformHandleRaw = nullptr;
+
+	ID3D11Device* device;
+	ID3D11DeviceContext* immcon;
+
+	auto setupDevice = [](ID3D11Device* device, ID3D11DeviceContext* immcon)
+	{
+		if (device && immcon)
+		{
+			auto& io = ImGui::GetIO();
+
+			if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+			{
+				ImGui_ImplWin32_InitPlatformInterface();
+			}
+
+			ImGui_ImplDX11_Init(device, immcon);
+		}
+	};
+
+	bool usedSharedD3D11 = false;
+
+	// 'GTA_FIVE' is a D3D11 game so we can use the native D3D11 device
+#ifdef GTA_FIVE
+	// #TODO: if this turns out breaking, check for 'bad' graphics mods and only run this code if none is present
+	usedSharedD3D11 = true;
+
+	OnGrcCreateDevice.Connect([setupDevice]()
+	{
+		struct
+		{
+			void* vtbl;
+			ID3D11Device* rawDevice;
+		}* deviceStuff = (decltype(deviceStuff))GetD3D11Device();
+
+		setupDevice(deviceStuff->rawDevice, GetD3D11DeviceContext());
+	});
+#endif
+
+	if (!usedSharedD3D11)
+	{
+		// use the system function as many proxy DLLs don't like multiple devices being made in the game process
+		// and they're 'closed source' and 'undocumented' so we can't reimplement the same functionality natively
+
+		// also, create device here and not after the game's or nui:core hacks will mismatch with proxy DLLs
+		wchar_t systemD3D11Name[512];
+		GetSystemDirectoryW(systemD3D11Name, std::size(systemD3D11Name));
+		wcscat(systemD3D11Name, L"\\d3d11.dll");
+
+		auto systemD3D11 = LoadLibraryW(systemD3D11Name);
+		assert(systemD3D11);
+
+		auto systemD3D11CreateDevice = (decltype(&D3D11CreateDevice))GetProcAddress(systemD3D11, "D3D11CreateDevice");
+
+		systemD3D11CreateDevice(NULL,
+		D3D_DRIVER_TYPE_HARDWARE,
+		nullptr,
+		0,
+		nullptr,
+		0,
+		D3D11_SDK_VERSION,
+		&device,
+		nullptr,
+		&immcon);
+
+		OnGrcCreateDevice.Connect([device, immcon, setupDevice]()
+		{
+			if (device)
+			{
+				setupDevice(device, immcon);
+			}
+		});
+	}
 
 	io.BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
 
@@ -401,55 +769,19 @@ static InitFunction initFunction([]()
 	})();
 
 	io.IniFilename = const_cast<char*>(imguiIni.c_str());
-	io.RenderDrawListsFn = RenderDrawLists; // Alternatively you can set this to NULL and call ImGui::GetDrawData() after ImGui::Render() to get the same ImDrawData pointer.
 	//io.ImeWindowHandle = g_hWnd;
 
-	ImGuiStyle& style = ImGui::GetStyle();
-
-	ImColor hiliteBlue = ImColor(81, 179, 236);
-	ImColor hiliteBlueTransparent = ImColor(81, 179, 236, 180);
-	ImColor backgroundBlue = ImColor(22, 24, 28, 200);
-	ImColor semiTransparentBg = ImColor(255, 255, 255, 0.6);
-	ImColor semiTransparentBgHover = ImColor(255, 255, 255, 0.8);
-
-	style.Colors[ImGuiCol_WindowBg] = backgroundBlue;
-	style.Colors[ImGuiCol_TitleBg] = hiliteBlue;
-	style.Colors[ImGuiCol_TitleBgActive] = hiliteBlue;
-	style.Colors[ImGuiCol_TitleBgCollapsed] = hiliteBlue;
-	style.Colors[ImGuiCol_Border] = hiliteBlue;
-	style.Colors[ImGuiCol_FrameBg] = semiTransparentBg;
-	style.Colors[ImGuiCol_FrameBgHovered] = semiTransparentBgHover;
-	style.Colors[ImGuiCol_TextSelectedBg] = hiliteBlueTransparent;
+	ImGui::GetStyle() = InitStyle();
 
 	// fuck rounding
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
 
-	{
-		FILE* font = _wfopen(MakeRelativeCitPath(L"citizen/mensch.ttf").c_str(), L"rb");
-
-		if (font)
-		{
-			fseek(font, 0, SEEK_END);
-
-			auto fontSize = ftell(font);
-
-			uint8_t* fontData = new uint8_t[fontSize];
-
-			fseek(font, 0, SEEK_SET);
-
-			fread(&fontData[0], 1, fontSize, font);
-			fclose(font);
-
-			io.Fonts->AddFontFromMemoryTTF(fontData, fontSize, 22.0f);
-
-			consoleFontSmall = io.Fonts->AddFontFromMemoryTTF(fontData, fontSize, 18.0f);
-			consoleFontTiny = io.Fonts->AddFontFromMemoryTTF(fontData, fontSize, 14.0f);
-		}
-	}
+	BuildFont(1.0f);
 
 #ifndef IS_LAUNCHER
 	OnGrcCreateDevice.Connect([=]()
 	{
+#ifdef _HAVE_GRCORE_NEWSTATES
 #ifndef IS_RDR3
 		D3D11_SAMPLER_DESC samplerDesc = CD3D11_SAMPLER_DESC(CD3D11_DEFAULT());
 		samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -459,11 +791,12 @@ static InitFunction initFunction([]()
 #else
 		g_pointSamplerState = GetStockStateIdentifier(SamplerStatePoint);
 #endif
+#endif
 	});
 
 	InputHook::QueryInputTarget.Connect([](std::vector<InputTarget*>& targets)
 	{
-		if (!g_consoleFlag)
+		if (!ConsoleHasAnything())
 		{
 			return true;
 		}
@@ -472,67 +805,71 @@ static InitFunction initFunction([]()
 		{
 			virtual inline void KeyDown(UINT vKey, UINT scanCode) override
 			{
-				std::unique_lock<std::mutex> g_conHostMutex;
-
+				std::unique_lock _(g_conHostMutex);
+				
 				ImGuiIO& io = ImGui::GetIO();
 
 				if (vKey < 256)
 				{
-					io.KeysDown[vKey] = 1;
+					io.AddKeyEvent(ImGui_ImplWin32_VirtualKeyToImGuiKey(vKey), true);
 				}
 			}
 
 			virtual inline void KeyUp(UINT vKey, UINT scanCode) override
 			{
-				std::unique_lock<std::mutex> g_conHostMutex;
+				std::unique_lock _(g_conHostMutex);
 
 				ImGuiIO& io = ImGui::GetIO();
 
 				if (vKey < 256)
 				{
-					io.KeysDown[vKey] = 0;
+					io.AddKeyEvent(ImGui_ImplWin32_VirtualKeyToImGuiKey(vKey), false);
 				}
 			}
 
 			virtual inline void MouseDown(int buttonIdx, int x, int y) override
 			{
-				std::unique_lock<std::mutex> g_conHostMutex;
+				std::unique_lock _(g_conHostMutex);
 
 				ImGuiIO& io = ImGui::GetIO();
 
 				if (buttonIdx < std::size(io.MouseDown))
 				{
-					io.MouseDown[buttonIdx] = true;
+					io.AddMouseButtonEvent(buttonIdx, true);
 				}
 			}
 
 			virtual inline void MouseUp(int buttonIdx, int x, int y) override
 			{
-				std::unique_lock<std::mutex> g_conHostMutex;
+				std::unique_lock _(g_conHostMutex);
 
 				ImGuiIO& io = ImGui::GetIO();
 
 				if (buttonIdx < std::size(io.MouseDown))
 				{
-					io.MouseDown[buttonIdx] = false;
+					io.AddMouseButtonEvent(buttonIdx, false);
 				}
 			}
 
 			virtual inline void MouseWheel(int delta) override
 			{
-				std::unique_lock<std::mutex> g_conHostMutex;
+				if (delta == 0)
+				{
+					return;
+				}
+
+				std::unique_lock _(g_conHostMutex);
 
 				ImGuiIO& io = ImGui::GetIO();
-				io.MouseWheel += delta > 0 ? +1.0f : -1.0f;
+				io.AddMouseWheelEvent(0.0f, delta > 0 ? +1.0f : -1.0f);
 			}
 
 			virtual inline void MouseMove(int x, int y) override
 			{
-				std::unique_lock<std::mutex> g_conHostMutex;
+				std::unique_lock _(g_conHostMutex);
 
 				ImGuiIO& io = ImGui::GetIO();
-				io.MousePos.x = (signed short)(x);
-				io.MousePos.y = (signed short)(y);
+				io.AddMousePosEvent((signed short)(x), (signed short)(y));
 			}
 		} tgt;
 
@@ -548,18 +885,18 @@ static InitFunction initFunction([]()
 
 	InputHook::QueryMayLockCursor.Connect([](int& may)
 	{
-		if (g_consoleFlag)
+		if (ConsoleHasAnything())
 		{
 			may = 0;
 		}
 	});
 
-	OnPostFrontendRender.Connect([]()
+	OnPostFrontendRender.Connect([usedSharedD3D11]()
 	{
 		int width, height;
 		GetGameResolution(width, height);
 
-		OnConsoleFrameDraw(width, height);
+		OnConsoleFrameDraw(width, height, usedSharedD3D11);
 	});
 #endif
 });
@@ -586,3 +923,33 @@ void ConHost::Print(const std::string& channel, const std::string& message)
 fwEvent<const char*, const char*> ConHost::OnInvokeNative;
 fwEvent<> ConHost::OnDrawGui;
 fwEvent<bool*> ConHost::OnShouldDrawGui;
+
+DLL_EXPORT ImFont* GetConsoleFontSmall()
+{
+	return consoleFontSmall;
+}
+
+DLL_EXPORT ImFont* GetConsoleFontTiny()
+{
+	return consoleFontTiny;
+}
+
+// GTA-specific
+#include <Hooking.h>
+
+static decltype(&ReleaseCapture) g_origReleaseCapture;
+
+static void WINAPI ReleaseCaptureStub()
+{
+	if (ConsoleHasAnything())
+	{
+		return;
+	}
+
+	g_origReleaseCapture();
+}
+
+static HookFunction hookFunction([]()
+{
+	g_origReleaseCapture = (decltype(g_origReleaseCapture))hook::iat("user32.dll", ReleaseCaptureStub, "ReleaseCapture");
+});

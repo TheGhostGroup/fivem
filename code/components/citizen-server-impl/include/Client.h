@@ -19,9 +19,11 @@
 #include <citizen_util/object_pool.h>
 #include <citizen_util/shared_reference.h>
 
+#include <boost/type_index.hpp>
+
 #include <shared_mutex>
 
-#define MAX_CLIENTS (1024 + 1) // don't change this past 256 ever, also needs to be synced with client code
+constexpr auto MAX_CLIENTS = (2048 + 1);
 
 namespace {
 	using namespace std::literals::chrono_literals;
@@ -43,6 +45,62 @@ namespace {
 
 namespace fx
 {
+	// here temporarily as mostly used for GetData
+	class SERVER_IMPL_EXPORT AnyBase
+	{
+	public:
+		virtual ~AnyBase() = default;
+
+		virtual uint32_t GetType() = 0;
+	};
+
+	template<typename T>
+	class AnyHolder : public AnyBase
+	{
+	public:
+		explicit AnyHolder(const T& data)
+			: m_data(data)
+		{
+
+		}
+
+		virtual uint32_t GetType() override
+		{
+			return HashString(boost::typeindex::type_id<T>().raw_name());
+		}
+
+		inline T& GetData()
+		{
+			return m_data;
+		}
+
+		inline const T& GetData() const
+		{
+			return m_data;
+		}
+
+	private:
+		T m_data;
+	};
+
+	template<typename T>
+	auto MakeAny(const T& data)
+	{
+		return std::make_shared<AnyHolder<std::remove_reference_t<std::remove_const_t<T>>>>(data);
+	}
+
+	template<typename T>
+	T& AnyCast(const std::shared_ptr<AnyBase>& base)
+	{
+		if (!base || base->GetType() != HashString(boost::typeindex::type_id<T>().raw_name()))
+		{
+			throw std::bad_any_cast();
+		}
+
+		auto entry = std::static_pointer_cast<AnyHolder<T>>(base);
+		return entry->GetData();
+	}
+
 	namespace sync
 	{
 		class ClientSyncDataBase
@@ -145,14 +203,9 @@ namespace fx
 			OnAssignConnectionToken();
 		}
 
-		inline const std::string& GetUpdateChannel()	
+		inline std::chrono::milliseconds GetFirstSeen()
 		{
-			return m_updateChannel;
-		}
-
-		inline void SetUpdateChannel(const std::string& updateChannel)
-		{
-			m_updateChannel = updateChannel;
+			return m_firstSeen;
 		}
 
 		inline std::chrono::milliseconds GetLastSeen()
@@ -163,6 +216,11 @@ namespace fx
 		inline const std::vector<std::string>& GetIdentifiers()
 		{
 			return m_identifiers;
+		}
+
+		inline const std::vector<std::string>& GetTokens()
+		{
+			return m_tokens;
 		}
 
 		inline bool HasRouted()
@@ -180,6 +238,11 @@ namespace fx
 			m_identifiers.emplace_back(identifier);
 
 			UpdateCachedPrincipalValues();
+		}
+
+		inline void AddToken(const std::string& token)
+		{
+			m_tokens.emplace_back(token);
 		}
 
 		inline auto EnterPrincipalScope()
@@ -202,29 +265,20 @@ namespace fx
 
 		inline std::shared_ptr<sync::ClientSyncDataBase> GetSyncData()
 		{
+			std::shared_lock _(m_syncDataMutex);
 			return m_syncData;
 		}
 
 		inline void SetSyncData(const std::shared_ptr<sync::ClientSyncDataBase>& ptr)
 		{
+			std::unique_lock _(m_syncDataMutex);
 			m_syncData = ptr;
 		}
 
-		inline void PushReplayPacket(int channel, const net::Buffer& buffer)
+		// to be called from CreateSyncData
+		inline auto AcquireSyncDataCreationLock()
 		{
-			m_replayQueue.push({ buffer, channel });
-		}
-
-		inline void ReplayPackets()
-		{
-			std::tuple<net::Buffer, int> value;
-
-			while (m_replayQueue.try_pop(value))
-			{
-				const auto&[buffer, channel] = value;
-
-				SendPacket(channel, buffer, NetPacketType_Reliable);
-			}
+			return std::unique_lock(m_syncDataCreationMutex);
 		}
 
 		inline bool IsDropping() const
@@ -237,9 +291,43 @@ namespace fx
 			m_dropping = true;
 		}
 
-		const std::any& GetData(const std::string& key);
+		inline auto GetNetworkMetricsSendCallback()
+		{
+			return m_clientNetworkMetricsSendCallback;
+		}
 
-		void SetData(const std::string& key, const std::any& data);
+		inline void SetNetworkMetricsSendCallback(void (*callback)(Client *thisptr, int channel, const net::Buffer& buffer, NetPacketType flags))
+		{
+			m_clientNetworkMetricsSendCallback = callback;
+		}
+
+		inline auto GetNetworkMetricsRecvCallback()
+		{
+			return m_clientNetworkMetricsRecvCallback;
+		}
+
+		inline void SetNetworkMetricsRecvCallback(void(*callback)(Client *thisptr, uint32_t packetId, net::Buffer& packet))
+		{
+			m_clientNetworkMetricsRecvCallback = callback;
+		}
+
+		int GetPing();
+
+		std::shared_ptr<AnyBase> GetData(const std::string& key);
+
+		void SetDataRaw(const std::string& key, const std::shared_ptr<AnyBase>& data);
+
+		template<typename TAny>
+		inline void SetData(const std::string& key, const TAny& data)
+		{
+			if constexpr (std::is_same_v<TAny, std::nullptr_t>)
+			{
+				SetDataRaw(key, {});
+				return;
+			}
+
+			SetDataRaw(key, MakeAny(data));
+		}
 
 		void SendPacket(int channel, const net::Buffer& buffer, NetPacketType flags = NetPacketType_Unreliable);
 
@@ -272,7 +360,10 @@ namespace fx
 		// the client's UDP peer address
 		net::PeerAddress m_peerAddress;
 
-		// when the client was last seen
+		// when client was first seen (time since Epoch)
+		std::chrono::milliseconds m_firstSeen;
+
+		// when the client was last seen (time since Epoch)
 		std::chrono::milliseconds m_lastSeen;
 
 		// the client's primary GUID
@@ -280,6 +371,9 @@ namespace fx
 
 		// the client's identifiers
 		std::vector<std::string> m_identifiers;
+
+		// the client's tokens
+		std::vector<std::string> m_tokens;
 
 		// the client's netid
 		uint32_t m_netId;
@@ -296,32 +390,33 @@ namespace fx
 		// the client's remote endpoint used for HTTP
 		std::string m_tcpEndPoint;
 
-		// the client's update channel (production, canary, ...)
-		std::string m_updateChannel;
-
 		// the client's ENet peer
 		std::unique_ptr<int, gs_peer_deleter> m_peer;
 
 		// sync data
 		std::shared_ptr<sync::ClientSyncDataBase> m_syncData;
+		std::shared_mutex m_syncDataMutex;
+		std::mutex m_syncDataCreationMutex;
 
 		// whether the client has sent a routing msg once
 		bool m_hasRouted;
 
-		// packets to resend when a new peer connects using this client
-		tbb::concurrent_queue<std::tuple<net::Buffer, int>> m_replayQueue;
-
 		// an arbitrary set of data
-		tbb::concurrent_unordered_map<std::string, std::any> m_userData;
+		std::shared_mutex m_userDataMutex;
+		std::unordered_map<std::string, std::shared_ptr<AnyBase>> m_userData;
 
 		// principal values
 		std::list<se::Principal> m_principals;
 
 		// whether the client is currently being dropped
 		volatile bool m_dropping;
+
+		void (*m_clientNetworkMetricsSendCallback)(Client *thisptr, int channel, const net::Buffer& buffer, NetPacketType flags);
+
+		void (*m_clientNetworkMetricsRecvCallback)(Client *thisptr, uint32_t packetId, net::Buffer& packet);
 	};
 
-	inline object_pool<Client, 512 * 1024> clientPool;
+	extern SERVER_IMPL_EXPORT object_pool<Client, 512 * MAX_CLIENTS> clientPool;
 
 	using ClientSharedPtr = shared_reference<Client, &clientPool>;
 	using ClientWeakPtr = weak_reference<ClientSharedPtr>;

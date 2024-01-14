@@ -15,10 +15,10 @@ namespace fx
 	HttpServerManager::HttpServerManager()
 	{
 		m_httpHandler = new Handler();
-		m_httpHandler->handler = [=] (fwRefContainer<net::HttpRequest> request, fwRefContainer<net::HttpResponse> response)
+		m_httpHandler->handler = [this] (fwRefContainer<net::HttpRequest> request, fwRefContainer<net::HttpResponse> response)
 		{
 			{
-				std::unique_lock<std::mutex> lock(m_handlersMutex);
+				std::shared_lock lock(m_handlersMutex);
 
 				for (auto& [ prefix, handler ] : m_handlers)
 				{
@@ -32,7 +32,7 @@ namespace fx
 						{
 							if (boost::algorithm::ends_with(prefix, "/"))
 							{
-								eastl::string_view prefixView{ prefix.c_str(), prefix.size() };
+								net::HeaderStringView prefixView{ prefix.c_str(), prefix.size() };
 								matches = request->GetPath() == prefixView.substr(0, prefixView.length() - 1);
 							}
 						}
@@ -72,14 +72,14 @@ namespace fx
 
 	void HttpServerManager::AddEndpoint(const std::string& prefix, const TEndpointHandler& handler)
 	{
-		std::unique_lock<std::mutex> lock(m_handlersMutex);
+		std::unique_lock lock(m_handlersMutex);
 
 		m_handlers.insert({ prefix, handler });
 	}
 
 	void HttpServerManager::RemoveEndpoint(const std::string& prefix)
 	{
-		std::unique_lock<std::mutex> lock(m_handlersMutex);
+		std::unique_lock lock(m_handlersMutex);
 
 		m_handlers.erase(prefix);
 	}
@@ -112,6 +112,37 @@ namespace fx
 								}
 							}
 
+							return net::MultiplexPatternMatchResult::NoMatch;
+						}
+					}
+
+					// length safety check
+					if (bytes.size() > 4096)
+					{
+						// 4096-byte+ but no HTTP/? that's awkward
+						return net::MultiplexPatternMatchResult::NoMatch;
+					}
+
+					// try to avoid classifying non-HTTP traffic as maybe-HTTP
+					auto spacePos = std::find(bytes.begin(), bytes.end(), ' ');
+
+					// method shouldn't be more than 64 bytes
+					if (std::distance(bytes.begin(), spacePos) > 64)
+					{
+						return net::MultiplexPatternMatchResult::NoMatch;
+					}
+
+					// should start with a letter
+					if (bytes[0] < 'A' || bytes[0] > 'Z')
+					{
+						return net::MultiplexPatternMatchResult::NoMatch;
+					}
+
+					for (auto it = bytes.begin(); it != spacePos; it++)
+					{
+						// HTTP methods *usually* should contain A-Z or - only
+						if ((*it < 'A' || *it > 'Z') && *it != '-')
+						{
 							return net::MultiplexPatternMatchResult::NoMatch;
 						}
 					}

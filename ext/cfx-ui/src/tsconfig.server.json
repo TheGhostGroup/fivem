@@ -1,15 +1,0 @@
-{
-  "extends": "../tsconfig.base.json",
-  "compilerOptions": {
-    "outDir": "../out-tsc/app",
-    "baseUrl": "",
-    "types": ["node"]
-  ,    "target": "es2016"
-},
-  "angularCompilerOptions": {
-    "entryModule": "app/app.server.module#AppServerModule"
-  },
-  "files": [
-    "main.server.ts"
-  ]
-}

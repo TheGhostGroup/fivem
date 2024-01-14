@@ -290,41 +290,48 @@ namespace fx
 		{
 			auto rscStream = (rawStream.GetRef()) ? rawStream : stream;
 
-			struct
+			if (m_customValidateFunc)
 			{
-				uint32_t magic;
-				uint32_t version;
-				uint32_t virtPages;
-				uint32_t physPages;
-			} rsc7Header;
-
-			rscStream->Read(&rsc7Header, sizeof(rsc7Header));
-
-			if (rsc7Header.magic == 0x37435352) // RSC7
-			{
-				entry.rscVersion = rsc7Header.version;
-				entry.rscPagesPhysical = rsc7Header.physPages;
-				entry.rscPagesVirtual = rsc7Header.virtPages;
-				entry.isResource = true;
-
-				ValidateSize(entry.entryName, ConvertRSC7Size(rsc7Header.physPages), ConvertRSC7Size(rsc7Header.virtPages));
-			}
-			else if (rsc7Header.magic == 0x05435352) // RSC\x05
-			{
-				entry.rscVersion = rsc7Header.version;
-				entry.rscPagesVirtual = rsc7Header.virtPages;
-				entry.rscPagesPhysical = rsc7Header.version;
-				entry.isResource = true;
-			}
-			else if (rsc7Header.magic == 0x38435352) // RSC8
-			{
-				entry.rscVersion = rsc7Header.version;
-				entry.rscPagesVirtual = rsc7Header.virtPages;
-				entry.rscPagesPhysical = rsc7Header.physPages;
-				entry.isResource = true;
+				m_customValidateFunc(entry, rscStream);
+				rscStream->Seek(0, SEEK_SET);
 			}
 
-			rscStream->Seek(0, SEEK_SET);
+			if (!entry.rscVersion)
+			{
+				struct
+				{
+					uint32_t magic;
+					uint32_t version;
+					uint32_t virtPages;
+					uint32_t physPages;
+				} rsc7Header;
+
+				rscStream->Read(&rsc7Header, sizeof(rsc7Header));
+
+				if (rsc7Header.magic == 0x37435352) // RSC7
+				{
+					entry.rscVersion = rsc7Header.version;
+					entry.rscPagesPhysical = rsc7Header.physPages;
+					entry.rscPagesVirtual = rsc7Header.virtPages;
+					entry.isResource = true;
+				}
+				else if (rsc7Header.magic == 0x05435352) // RSC\x05
+				{
+					entry.rscVersion = rsc7Header.version;
+					entry.rscPagesVirtual = rsc7Header.virtPages;
+					entry.rscPagesPhysical = rsc7Header.version;
+					entry.isResource = true;
+				}
+				else if (rsc7Header.magic == 0x38435352) // RSC8
+				{
+					entry.rscVersion = rsc7Header.version;
+					entry.rscPagesVirtual = rsc7Header.virtPages;
+					entry.rscPagesPhysical = rsc7Header.physPages;
+					entry.isResource = true;
+				}
+
+				rscStream->Seek(0, SEEK_SET);
+			}
 		}
 
 		{
@@ -410,9 +417,9 @@ namespace fx
 		return (uint32_t)size;
 	}
 
-	void ResourceStreamComponent::ValidateSize(std::string_view name, uint32_t physSize, uint32_t virtSize)
+	void ResourceStreamComponent::ValidateSize(std::string_view name, uint32_t physSize, uint32_t virtSize, int* numWarnings)
 	{
-		auto checkSize = [&name, this](uint32_t size, std::string_view why)
+		auto checkSize = [this, &name, numWarnings](uint32_t size, std::string_view why)
 		{
 			auto divSize = fmt::sprintf("%.1f", size / 1024.0 / 1024.0);
 			int warnColor = 0;
@@ -432,10 +439,14 @@ namespace fx
 
 			if (warnColor != 0)
 			{
-				trace("^%dAsset %s/%s uses %s MiB of %s memory.%s^7\n", warnColor, m_resource->GetName(), name, divSize, why,
+				console::Printf(fmt::sprintf("resources:%s:stream", m_resource->GetName()),
+					"^%dAsset %s/%s uses %s MiB of %s memory.%s^7\n",
+					warnColor, m_resource->GetName(), name, divSize, why,
 					(size > (48 * 1024 * 1024))
-						? " Oversized assets can and WILL lead to streaming issues (models not loading/rendering, commonly known as 'texture loss', 'city bug' or 'streaming isn't great')."
+						? " Oversized assets can and WILL lead to streaming issues (such as models not loading/rendering)."
 						: "");
+
+				++*numWarnings;
 			}
 		};
 
@@ -443,17 +454,25 @@ namespace fx
 		checkSize(virtSize, "virtual");
 	}
 
+	void ResourceStreamComponent::CheckSizes(int* numWarnings)
+	{
+		auto instance = m_resource->GetManager()->GetComponent<fx::ServerInstanceBaseRef>()->Get();
+		if (instance->GetComponent<fx::GameServer>()->GetGameName() == fx::GameName::GTA5)
+		{
+			for (const auto& [_, entry] : m_resourcePairs)
+			{
+				if (entry.isResource)
+				{
+					ValidateSize(entry.entryName, ConvertRSC7Size(entry.rscPagesPhysical), ConvertRSC7Size(entry.rscPagesVirtual), numWarnings);
+				}
+			}
+		}
+	}
+
 	auto ResourceStreamComponent::AddStreamingFile(const Entry& entry) -> RuntimeEntry*
 	{
 		RuntimeEntry se(entry);
 		se.isAutoScan = false;
-
-		static auto instance = m_resource->GetManager()->GetComponent<fx::ServerInstanceBaseRef>()->Get();
-
-		if (entry.isResource && instance->GetComponent<fx::GameServer>()->GetGameName() == fx::GameName::GTA5)
-		{
-			ValidateSize(entry.entryName, ConvertRSC7Size(entry.rscPagesPhysical), ConvertRSC7Size(entry.rscPagesVirtual));
-		}
 
 		auto it = m_resourcePairs.insert({ entry.entryName, se }).first;
 		m_hashPairs[se.hashString] = &it->second;
@@ -504,7 +523,13 @@ namespace fx
 		object->OnStop.Connect([=]()
 		{
 			m_resourcePairs.clear();
+			m_hashPairs.clear();
 		}, -500);
+	}
+
+	void ResourceStreamComponent::SetCustomValidateFunction(std::function<void(Entry&, fwRefContainer<vfs::Stream>)> func)
+	{
+		m_customValidateFunc = func;
 	}
 }
 

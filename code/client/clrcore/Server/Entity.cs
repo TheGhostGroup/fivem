@@ -1,11 +1,26 @@
 using System;
-using System.Linq;
-using CitizenFX.Core.Native;
-using System.Security;
 
+#if MONO_V2
+using CitizenFX.Core;
+using API = CitizenFX.Server.Native.Natives;
+using Prop = CitizenFX.Server.Object;
+using compat_int_uint = System.UInt32;
+using compat_int_entity_type = CitizenFX.Shared.EntityType;
+#else
+using CitizenFX.Core.Native;
+using compat_int_uint = System.Int32;
+using compat_int_entity_type = System.Int32;
+#endif
+
+#if MONO_V2
+namespace CitizenFX.Server
+{
+	public abstract class Entity : PoolObject, IEquatable<Entity>, ISpatial, Shared.IEntity
+#else
 namespace CitizenFX.Core
 {
 	public abstract class Entity : PoolObject, IEquatable<Entity>, ISpatial
+#endif
 	{
 		public Entity(int handle) : base(handle)
 		{
@@ -105,27 +120,32 @@ namespace CitizenFX.Core
 		/// <summary>
 		/// Gets the model of the this <see cref="Entity"/>.
 		/// </summary>
-		public int Model
+		public compat_int_uint Model
 		{
 			get
 			{
-				return API.GetEntityModel(this.Handle);
+				return unchecked((compat_int_uint)API.GetEntityModel(this.Handle));
 			}
 		}
 
 		/// <summary>
 		/// Gets the network owner of the this <see cref="Entity"/>.
 		/// </summary>
-		/// <returns>Returns the <see cref="Player"/> of the network owner.</returns>
+		/// <returns>Returns the <see cref="Player"/> of the network owner.
+		/// Returns <c>null</c> if this <see cref="Entity"/> is in an unowned state.</returns>
 		public Player Owner
 		{
 			get
 			{
-				string playerHandle = Convert.ToString(API.NetworkGetEntityOwner(this.Handle));
+				int playerHandle = API.NetworkGetEntityOwner(this.Handle);
 
-				return new Player(playerHandle);
+				return playerHandle == -1 ? null : new Player(Convert.ToString(playerHandle));
 			}
 		}
+
+#if MONO_V2
+		Shared.Player Shared.IEntity.Owner => Owner;
+#endif
 
 		/// <summary>
 		/// Gets the network ID of the this <see cref="Entity"/>.
@@ -144,13 +164,7 @@ namespace CitizenFX.Core
 		/// <returns>Returns 1 if this <see cref="Entity"/> is a Ped.
 		/// Returns 2 if this <see cref="Entity"/> is a Vehicle.
 		/// Returns 3 if this <see cref="Entity"/> is a Prop.</returns>
-		public int Type
-		{
-			get
-			{
-				return API.GetEntityType(this.Handle);
-			}
-		}
+		public compat_int_entity_type Type => (compat_int_entity_type)API.GetEntityType(this.Handle);
 
 		/// <summary>
 		/// Gets the <see cref="StateBag"/> of this <see cref="Entity"/>

@@ -83,13 +83,13 @@ SteamComponent::SteamComponent()
 
 }
 
-static void RunChildLauncher()
+static void RunChildLauncher(bool syncWait = false)
 {
 	// get the base executable path
 	auto ourPath = MakeCfxSubProcess(L"SteamChild.exe");
 
 	wchar_t ourDirectory[MAX_PATH];
-	GetCurrentDirectory(sizeof(ourDirectory), ourDirectory);
+	GetCurrentDirectory(std::size(ourDirectory), ourDirectory);
 
 	std::wstring commandLine = va(L"\"%s\" -steamparent:%d", ourPath, GetCurrentProcessId());
 
@@ -99,12 +99,24 @@ static void RunChildLauncher()
 
 	CreateProcess(ourPath, (wchar_t*)commandLine.c_str(), nullptr, nullptr, FALSE, 0, nullptr, ourDirectory, &si, &pi);
 
-	// wait for it to finish
-	WaitForSingleObject(pi.hProcess, 15000);
+	auto wait = [pi = std::move(pi)]()
+	{
+		// wait for it to finish
+		WaitForSingleObject(pi.hProcess, 15000);
 
-	// and close up afterwards
-	CloseHandle(pi.hProcess);
-	CloseHandle(pi.hThread);
+		// and close up afterwards
+		CloseHandle(pi.hProcess);
+		CloseHandle(pi.hThread);
+	};
+
+	if (syncWait)
+	{
+		wait();
+	}
+	else
+	{
+		std::thread(wait).detach();
+	}
 }
 
 #include <base64.h>
@@ -132,7 +144,7 @@ void SteamComponent::Initialize()
 		InitializePublicAPI();
 
 		// run the child launcher
-		RunChildLauncher();
+		RunChildLauncher(true);
 
 		// initialize the private Steam API
 		InitializeClientAPI();
@@ -283,8 +295,8 @@ void SteamComponent::RemoveSteamCallback(int registeredID)
 }
 
 #if defined(GTA_NY)
-#define PARENT_APP_ID 12210
-#define PRODUCT_DISPLAY_NAME "CitizenFX:IV \xF0\x9F\x92\x8A"
+#define PARENT_APP_ID 218
+#define PRODUCT_DISPLAY_NAME "LibertyM \xF0\x9F\x92\x8A"
 #elif defined(PAYNE)
 #define PARENT_APP_ID 204100
 #define PRODUCT_DISPLAY_NAME "CitizenPayne \xF0\x9F\x92\x8A"
@@ -350,7 +362,7 @@ void SteamComponent::InitializePresence()
 	m_parentAppID = parentAppID;
 
 	// create a fake app to hold our gameid
-	uint64_t gameID = 0xA18F2DAB01000000 | parentAppID; // crc32 for 'kekking' + mod
+	uint64_t gameID = 0xD8A9994402000000 | parentAppID; // crc32 for 'cfx' + shortcut
 
 	InterfaceMapper steamAppsInterface(m_clientEngine->GetIClientApps(m_steamUser, m_steamPipe, "CLIENTAPPS_INTERFACE_VERSION001"));
 
@@ -359,7 +371,7 @@ void SteamComponent::InitializePresence()
 	builder.PackString("name", PRODUCT_DISPLAY_NAME);
 	builder.PackUint64("gameid", gameID);
 	builder.PackString("installed", "1");
-	builder.PackString("gamedir", "kekking");
+	builder.PackString("gamedir", "cfx");
 	builder.PackString("serverbrowsername", "lovely!");
 	builder.PackEnd();
 
@@ -628,11 +640,15 @@ void SteamComponent::SetRichPresenceValue(int idx, const std::string& value)
 {
 	assert(idx >= 0 && idx < _countof(m_richPresenceValues));
 
+	// special case for 0 as we use that for the server name suffix.
+	// we should only launch a new Steam child if the game name changes.
+	bool updateGameName = (idx == 0 && m_richPresenceValues[0] != value);
+
 	m_richPresenceValues[idx] = value;
 
 	m_richPresenceChanged = true;
 
-	if (idx == 0)
+	if (updateGameName)
 	{
 		static HostSharedData<CfxPresenceState> gameData("PresenceState");
 		gameData->needRefresh = true;

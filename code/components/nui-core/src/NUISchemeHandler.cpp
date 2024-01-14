@@ -9,18 +9,16 @@
 #include "CefOverlay.h"
 #include "NUISchemeHandlerFactory.h"
 #include <NUIClient.h>
+#include <CL2LaunchMode.h>
 
 #include <VFSManager.h>
 #include <include/cef_parser.h>
 
 #include "memdbgon.h"
 
-static std::atomic<int> g_fileHandleCount;
-static std::queue<std::function<void()>> g_deleteQueue;
-
 static nui::TResourceLookupFn g_resourceLookupFunc;
 
-extern const std::map<std::string, std::string, std::less<>> g_mimeTypeMap;
+extern const std::map<std::string_view, std::string_view, std::less<>> g_mimeTypeMap;
 
 namespace nui
 {
@@ -33,138 +31,135 @@ namespace nui
 class NUIResourceHandler : public CefResourceHandler
 {
 private:
-	std::string mimeType_;
+	std::string mimeType_ = "text/html";
 
-	bool dataManaged_;
-
-	int read_;
+	int read_ = 0;
 
 	fwRefContainer<vfs::Device> device_;
 
-	std::string filename_;
+	uintptr_t file_ = vfs::Device::InvalidHandle;
 
-	uintptr_t file_;
+	bool canCache_ = false;
 
-	bool closed_;
 public:
-	NUIResourceHandler()
-	{
-		closed_ = false;
-		file_ = -1;
-	}
-
 	virtual ~NUIResourceHandler()
 	{
-		if (file_ && file_ != -1 && !closed_)
-		{
-			device_->Close(file_);
-		}
-
-		g_fileHandleCount.fetch_sub(1);
-
-		if (!g_deleteQueue.empty())
-		{
-			g_deleteQueue.front()();
-			g_deleteQueue.pop();
-		}
+		Close();
 	}
 
 	virtual bool ProcessRequest(CefRefPtr<CefRequest> request, CefRefPtr<CefCallback> callback)
 	{
-		std::string url = request->GetURL();
-		std::wstring hostname;
 		std::wstring path;
+		std::vector<std::string> tryFiles;
 
-		CefURLParts parts;
-		CefParseURL(url, parts);
-
-		hostname = CefString(&parts.host);
-		path = CefString(&parts.path);
-
-		std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
-
-		if (hostname == L"game" || hostname == L"nui-game-internal")
 		{
-			filename_ = "citizen:/";
-			
-			filename_ += converter.to_bytes(path).substr(1);
-		}
-		else
-		{
-			if (hostname.find(L"cfx-nui-") == 0)
-			{
-				hostname = hostname.substr(8);
-			}
+			std::string url = request->GetURL();
+			std::wstring hostname;
 
-			if (g_resourceLookupFunc)
+			CefURLParts parts;
+			CefParseURL(url, parts);
+
+			hostname = CefString(&parts.host);
+			path = CefString(&parts.path);
+
+			std::string reqFilename;
+
+			if (hostname == L"game" || hostname == L"nui-game-internal")
 			{
-				filename_ = g_resourceLookupFunc(ToNarrow(hostname));
+				if (launch::IsSDKGuest() && path.find(L"sdk-root/shell/mpMenu.html") != std::string::npos)
+				{
+					reqFilename = "sdk-root:/shell/mpMenu.html";
+				}
+				else
+				{
+					reqFilename = "citizen:/";
+
+					if (path == L"/ui/app/")
+					{
+						path += L"index.html";
+					}
+
+					if (path.find(L"/ui/app/") != std::string::npos && path.find(L"index.html") == std::string::npos)
+					{
+						canCache_ = true;
+					}
+
+					reqFilename += ToNarrow(path).substr(1);
+				}
 			}
 			else
 			{
-				filename_ = "resources:/";
-				filename_ += converter.to_bytes(hostname) + "/";
+				if (hostname.find(L"cfx-nui-") == 0)
+				{
+					hostname = hostname.substr(8);
+				}
+
+				if (g_resourceLookupFunc)
+				{
+					reqFilename = g_resourceLookupFunc(ToNarrow(hostname), ToNarrow(path));
+				}
+				else
+				{
+					reqFilename = "resources:/";
+					reqFilename += ToNarrow(hostname) + "/";
+					reqFilename += ToNarrow(path);
+				}
 			}
 
-			filename_ += converter.to_bytes(path);
-		}
+			// remove # parts
+			auto hash = reqFilename.find_first_of(L'#');
 
-		// remove # parts
-		auto hash = filename_.find_first_of(L'#');
-
-		if (hash != std::string::npos)
-		{
-			//filename_.resize(hash);
-			filename_.erase(hash);
-		}
-
-		hash = filename_.find_first_of(L'?');
-
-		if (hash != std::string::npos)
-		{
-			//filename_.resize(hash);
-			filename_.erase(hash);
-		}
-
-		if (filename_.length() >= 256)
-		{
-			filename_ = filename_.substr(0, 255);
-		}
-
-		device_ = vfs::GetDevice(filename_);
-
-		int count = g_fileHandleCount.fetch_add(1);
-
-		auto handleOpen = [=] ()
-		{
-			if (device_.GetRef() && filename_.find("..") == std::string::npos)
+			if (hash != std::string::npos)
 			{
-				file_ = device_->Open(filename_.c_str(), true);
+				reqFilename.erase(hash);
 			}
 
-			// set mime type
-			std::string ext = url.substr(url.rfind('.') + 1);
+			hash = reqFilename.find_first_of(L'?');
 
-			mimeType_ = "text/html";
-
-			auto it = g_mimeTypeMap.find(ext);
-
-			if (it != g_mimeTypeMap.end())
+			if (hash != std::string::npos)
 			{
-				mimeType_ = it->second;
+				reqFilename.erase(hash);
 			}
 
-			callback->Continue();
-		};
+			if (reqFilename.length() >= 256)
+			{
+				reqFilename = reqFilename.substr(0, 255);
+			}
 
-		if (count < 2)
-		{
-			handleOpen();
+			tryFiles.push_back(reqFilename);
 		}
-		else
+
+		if (path.find(L"/ui/app/") != std::string::npos)
 		{
-			g_deleteQueue.push(handleOpen);
+			tryFiles.push_back("citizen:/ui/app/index.html");
 		}
+
+		for (auto& filename : tryFiles)
+		{
+			device_ = vfs::GetDevice(filename);
+
+			if (device_.GetRef() && filename.find("..") == std::string::npos)
+			{
+				file_ = device_->Open(filename.c_str(), true);
+			}
+
+			if (file_ != vfs::Device::InvalidHandle)
+			{
+				// set mime type
+				std::string ext = filename.substr(filename.rfind('.') + 1);
+
+				auto it = g_mimeTypeMap.find(ext);
+
+				if (it != g_mimeTypeMap.end())
+				{
+					mimeType_ = it->second;
+				}
+
+				break;
+			}
+		}
+
+		callback->Continue();
 
 		return true;
 	}
@@ -173,7 +168,7 @@ public:
 	{
 		response->SetMimeType(mimeType_);
 
-		if (file_ == -1)
+		if (file_ == vfs::Device::InvalidHandle)
 		{
 			response->SetStatus(404);
 		}
@@ -190,10 +185,22 @@ public:
 			map.insert({ "content-type", mimeType_ + "; charset=utf-8" });
 		}
 
-		map.insert({ "cache-control", "no-cache, must-revalidate" });
+		map.emplace("access-control-allow-origin", "*");
+		map.emplace("access-control-allow-methods", "GET, OPTIONS");
+
+		// #TODO: maybe handle caching based on actual resource-related metadata (last-modified, etag, ..?)
+		if (!canCache_)
+		{
+			map.insert({ "cache-control", "no-cache, must-revalidate" });
+		}
+		else
+		{
+			map.insert({ "cache-control", "max-age=2592000" });
+		}
+
 		response->SetHeaderMap(map);
 
-		if (file_ != -1)
+		if (file_ != vfs::Device::InvalidHandle)
 		{
 			response_length = device_->GetLength(file_);
 		}
@@ -203,23 +210,36 @@ public:
 		}
 	}
 
-	virtual void Cancel()
+	void Close()
 	{
-		closed_ = true;
-
-		if (file_ != -1)
+		if (device_.GetRef() && file_ != vfs::Device::InvalidHandle)
 		{
 			device_->Close(file_);
 		}
+
+		device_ = {};
+		file_ = vfs::Device::InvalidHandle;
+	}
+
+	virtual void Cancel()
+	{
+		Close();
 	}
 
 	virtual bool ReadResponse(void* data_out, int bytes_to_read, int& bytes_read, CefRefPtr<CefCallback> callback)
 	{
-		if (file_ != -1)
+		if (file_ != vfs::Device::InvalidHandle)
 		{
 			bytes_read = device_->Read(file_, data_out, bytes_to_read);
 
-			return (bytes_read > 0);
+			bool readMore = (bytes_read > 0);
+
+			if (!readMore)
+			{
+				Close();
+			}
+
+			return readMore;
 		}
 
 		return false;
@@ -257,9 +277,10 @@ public:
 	}
 };
 
-void NUISchemeHandlerFactory::SetRequestBlacklist(const std::vector<std::regex>& requestBlacklist)
+void NUISchemeHandlerFactory::SetRequestBlocklist(const std::vector<std::regex>& requestBlocklist)
 {
-	m_requestBlacklist = requestBlacklist;
+	std::unique_lock _(m_requestBlocklistLock);
+	m_requestBlocklist = requestBlocklist;
 }
 
 CefRefPtr<CefResourceHandler> NUISchemeHandlerFactory::Create(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, const CefString& scheme_name, CefRefPtr<CefRequest> request)
@@ -290,13 +311,15 @@ CefRefPtr<CefResourceHandler> NUISchemeHandlerFactory::Create(CefRefPtr<CefBrows
 	}
 	else if (scheme_name == "ws" || scheme_name == "wss")
 	{
-		for (auto& reg : m_requestBlacklist)
+		std::shared_lock _(m_requestBlocklistLock);
+
+		for (auto& reg : m_requestBlocklist)
 		{
 			std::string url = request->GetURL().ToString();
 
 			if (std::regex_search(url, reg))
 			{
-				trace("Blocked a request for blacklisted URI %s\n", url);
+				trace("Blocked a request for blocklisted URI %s\n", url);
 				return new ForbiddenResourceHandler();
 			}
 		}
@@ -313,7 +336,7 @@ CefRefPtr<CefResourceHandler> NUISchemeHandlerFactory::Create(CefRefPtr<CefBrows
 
 OVERLAY_DECL fwEvent<const char*, CefRefPtr<CefRequest>, CefRefPtr<CefResourceHandler>&> OnSchemeCreateRequest;
 
-const std::map<std::string, std::string, std::less<>> g_mimeTypeMap = {
+const std::map<std::string_view, std::string_view, std::less<>> g_mimeTypeMap{
 	{ "*3gpp", "audio/3gpp" },
 	{ "*jpm", "video/jpm" },
 	{ "*mp3", "audio/mp3" },

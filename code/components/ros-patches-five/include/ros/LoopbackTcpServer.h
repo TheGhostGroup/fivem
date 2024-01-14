@@ -66,8 +66,10 @@ private:
 
 	LoopbackTcpServerManager* m_manager;
 
+	std::string m_hostName;
+
 public:
-	LoopbackTcpServer(LoopbackTcpServerManager* manager);
+	LoopbackTcpServer(LoopbackTcpServerManager* manager, const std::string& hostName);
 
 	inline uint16_t GetPort()
 	{
@@ -84,7 +86,7 @@ public:
 	fwRefContainer<LoopbackTcpServerStream> CreateConnection(SOCKET socket);
 };
 
-#include <concurrent_unordered_map.h>
+#include <tbb/concurrent_unordered_map.h>
 
 class LoopbackTcpServerManager : public fwRefCountable
 {
@@ -98,7 +100,7 @@ private:
 private:
 	std::multimap<uint32_t, fwRefContainer<LoopbackTcpServer>> m_tcpServers;
 
-	concurrency::concurrent_unordered_map<SOCKET, fwRefContainer<LoopbackTcpServerStream>> m_socketStreams;
+	tbb::concurrent_unordered_map<SOCKET, fwRefContainer<LoopbackTcpServerStream>> m_socketStreams;
 
 	std::multimap<SOCKET, WSAEVENT> m_socketEvents;
 
@@ -108,7 +110,7 @@ private:
 
 	std::map<std::pair<SOCKET, DWORD>, LPOVERLAPPED> m_threadpoolIoCallbacks;
 
-	std::map<SOCKET, std::tuple<void*, size_t, size_t*>> m_threadpoolReadRequests;
+	std::map<SOCKET, std::tuple<void*, size_t, ULONG_PTR*>> m_threadpoolReadRequests;
 
 	std::map<HANDLE, std::tuple<PTP_WIN32_IO_CALLBACK, PVOID, PTP_IO>> m_threadpoolIoHandles;
 

@@ -42,8 +42,11 @@
 fwRefContainer<fx::ResourceManager> g_resourceManager;
 
 #if __has_include(<streaming.h>)
+#include <Streaming.h>
+
 void DLL_IMPORT CfxCollection_AddStreamingFileByTag(const std::string& tag, const std::string& fileName, rage::ResourceFlags flags);
 void DLL_IMPORT CfxCollection_RemoveStreamingTag(const std::string& tag);
+void DLL_IMPORT CfxCollection_BackoutStreamingTag(const std::string& tag);
 void DLL_IMPORT CfxCollection_SetStreamingLoadLocked(bool locked);
 
 namespace streaming
@@ -95,9 +98,30 @@ DECLARE_INSTANCE_TYPE(ResourceEntryListComponent);
 static InitFunction initFunction([] ()
 {
 #if __has_include(<streaming.h>)
+	static std::unordered_set<std::string> removeTags;
+
 	fx::OnAddStreamingResource.Connect([] (const fx::StreamingEntryData& entry)
 	{
+#ifndef GTA_NY
 		CfxCollection_AddStreamingFileByTag(entry.resourceName, entry.filePath, { entry.rscPagesVirtual, entry.rscPagesPhysical });
+#else
+		CfxCollection_AddStreamingFileByTag(entry.resourceName, entry.filePath, entry.rscPagesVirtual);
+#endif
+		removeTags.insert(entry.resourceName);
+	});
+
+	fx::ResourceManager::OnInitializeInstance.Connect([](fx::ResourceManager* mgr)
+	{
+		mgr->OnAfterReset.Connect([]()
+		{
+			for (auto& tag : removeTags)
+			{
+				CfxCollection_BackoutStreamingTag(tag);
+			}
+
+			removeTags.clear();
+		},
+		INT32_MIN);
 	});
 
 	fx::OnLockStreaming.Connect([]()
@@ -116,7 +140,9 @@ static InitFunction initFunction([] ()
 	{
 		Instance<fx::ResourceManager>::Get()->ForAllResources([](fwRefContainer<fx::Resource> resource)
 		{
+#ifndef GTA_NY
 			resource->GetComponent<fx::ResourceGameLifetimeEvents>()->OnBeforeGameShutdown();
+#endif
 		});
 	}, -500);
 #endif
@@ -128,11 +154,6 @@ static InitFunction initFunction([] ()
 #if __has_include(<streaming.h>)
 		resource->OnStart.Connect([=] ()
 		{
-			if (resource->GetName() == "_cfx_internal")
-			{
-				return;
-			}
-
 			fwRefContainer<fx::ResourceMetaDataComponent> metaData = resource->GetComponent<fx::ResourceMetaDataComponent>();
 			std::string resourceRoot = resource->GetPath();
 
@@ -270,6 +291,7 @@ static InitFunction initFunction([] ()
 	{
 		fwRefContainer<fx::ResourceManager> manager = fx::CreateResourceManager();
 		manager->SetComponent(console::GetDefaultContext());
+		manager->MakeCurrent();
 
 		Instance<fx::ResourceManager>::Set(manager.GetRef());
 
@@ -287,5 +309,7 @@ static InitFunction initFunction([] ()
 
 			Instance<fx::ResourceManager>::Get()->ResetResources();
 		}
+
+		removeTags.clear();
 	});
 });

@@ -232,7 +232,7 @@ class Win32GameWindow : public GameWindow
 
 	void CreateTextures(int width, int height)
 	{
-		std::vector<uint32_t> mem(width * height);
+		std::vector<uint32_t> mem(static_cast<std::vector<uint32_t>::size_type>(width) * height);
 
 		for (size_t i = 0; i < mem.size(); i++)
 		{
@@ -809,8 +809,8 @@ class Win32GameWindow : public GameWindow
 					}
 					else if (input->header.dwType == RIM_TYPEMOUSE)
 					{
-						rgd->mouseX += input->data.mouse.lLastX;
-						rgd->mouseY += input->data.mouse.lLastY;
+						rgd->mouseDeltaX += input->data.mouse.lLastX;
+						rgd->mouseDeltaY += input->data.mouse.lLastY;
 
 						if (input->data.mouse.usButtonFlags & RI_MOUSE_WHEEL)
 						{

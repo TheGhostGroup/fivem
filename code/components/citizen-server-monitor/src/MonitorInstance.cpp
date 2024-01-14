@@ -13,7 +13,7 @@
 #include <KeyedRateLimiter.h>
 
 #include <console/OptionTokenizer.h>
-#include <boost/filesystem.hpp>
+#include <filesystem>
 
 #include <ComponentLoader.h>
 
@@ -176,6 +176,24 @@ namespace fx
 
 )");
 
+		// disable QuickEdit in *monitor mode only*
+		// #TODO: detect if we're running under Windows Terminal, in which case
+		//        selection isn't suspending
+#ifdef _WIN32
+		{
+			HANDLE hConsole = GetStdHandle(STD_INPUT_HANDLE);
+
+			DWORD consoleMode;
+			if (GetConsoleMode(hConsole, &consoleMode))
+			{
+				consoleMode |= ENABLE_EXTENDED_FLAGS;
+				consoleMode &= ~ENABLE_QUICK_EDIT_MODE;
+
+				SetConsoleMode(hConsole, consoleMode);
+			}
+		}
+#endif
+
 		// initialize the server configuration
 		std::shared_ptr<ConVar<std::string>> rootVar;
 
@@ -192,19 +210,14 @@ namespace fx
 				consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "set", set.first, set.second });
 			}
 
-			boost::filesystem::path rootPath;
-
+			std::filesystem::path rootPath;
 			try
 			{
-				rootPath = boost::filesystem::canonical(".");
+				rootPath = std::filesystem::canonical(".");
 
-#ifdef _WIN32
-				m_rootPath = ToNarrow(rootPath.wstring());
-#else
-				m_rootPath = rootPath.string();
-#endif
+				m_rootPath = rootPath.u8string();
 			}
-			catch (std::exception& error)
+			catch (std::exception&)
 			{
 			}
 
@@ -224,7 +237,7 @@ namespace fx
 		// tasks should be running in background threads; we'll just wait until someone wants to get rid of us
 		while (!m_shouldTerminate)
 		{
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			std::this_thread::sleep_for(std::chrono::seconds(1));
 		}
 	}
 
@@ -270,8 +283,6 @@ namespace fx
 			return resourceManager->AddResource(url.href()).get();
 		};
 
-		// monitor does not use webadmin currently
-		//addResource("webadmin")->Start();
 		addResource("monitor")->Start();
 
 		// setup ticks

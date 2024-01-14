@@ -122,8 +122,22 @@ table.sort(_natives, function(a, b)
 	return printFunctionName(a) < printFunctionName(b)
 end)
 
-local function printReturnType(type)
-	if type.nativeType == 'string' then
+local function printReturnType(native)
+	local type = native.returns
+	
+	-- If the native has a cs_type annotation, determine if it references a
+	-- codegen type, native type, or nothing.
+	local cs_type = (native.annotations and native.annotations['cs_type']) or nil
+	if cs_type then
+		type = types[cs_type]
+		if not type then
+			return cs_type -- cs native type
+		end
+	end
+
+	if not type then
+		return 'void'
+	elseif type.nativeType == 'string' then
 		return 'string'
 	elseif type.nativeType == 'bool' then
 		return 'bool'
@@ -164,7 +178,7 @@ local function wrapLines(str, openTag, closeTag, allowEmptyTag)
 		return t .. '/// ' .. openTag:sub(1, openTag:len() - 1) .. ' />\n'
 	else
 		return ''
-	end	
+	end
 end
 
 local function formatDocString(native)
@@ -173,7 +187,7 @@ local function formatDocString(native)
 	if not d then
 		return ''
 	end
-	
+
 	local l = ''
 	l = l .. wrapLines(d.summary, '<summary>', '</summary>')
 
@@ -193,7 +207,21 @@ end
 local function parseArgument(argument, native)
 	local argType
 
-	if argument.type.name == 'func' then
+	-- Check if the cs_type annotation references a codegen type.
+	local cs_type = (argument.annotations and argument.annotations['cs_type']) or nil
+
+	if cs_type then
+		-- doc authors may assume `cs_type(T*)` works, so we try to correct them here
+		cs_type = cs_type:gsub("%*$", "Ptr")
+	end
+
+	if cs_type and codeEnvironment[cs_type] then
+		argument = codeEnvironment[cs_type](argument.name)
+	end
+
+	if argument.annotations and argument.annotations['cs_type'] then
+		argType = argument.annotations['cs_type']
+	elseif argument.type.name == 'func' then
 		argType = 'InputArgument'
 	elseif argument.type.name == 'Hash' then
 		argType = 'uint'
@@ -213,6 +241,8 @@ local function parseArgument(argument, native)
 		argType = 'float'
 	elseif argument.type.nativeType == 'bool' then
 		argType = 'bool'
+	elseif argument.type.nativeType == 'object' then
+		argType = 'object'
 	elseif argument.type.nativeType == 'vector3' then
 		argType = 'Vector3'
 	end
@@ -224,7 +254,7 @@ local function parseArgument(argument, native)
 		name = langWords[name]
 	end
 
-	return name, argType
+	return argument, name, argType
 end
 
 local function formatArgs(native)
@@ -233,8 +263,14 @@ local function formatArgs(native)
 	local nativeArgs = {}
 
 	if native.arguments then
-		for _, argument in pairs(native.arguments) do
-			local argumentName, argType = parseArgument(argument, native)
+		for _, argument in ipairs(native.arguments) do
+			-- cs_type may replace the argument
+			local argument, argumentName, argType = parseArgument(argument, native)
+
+			if (argType == nil) then
+				io.stderr:write("argType is nil for: " .. native.name .. "\n")
+				io.stderr:write("argument: type.name -> " .. argument.type.name .. ", type.nativeType -> " .. argument.type.nativeType .. ", type.subType -> " .. tostring(argument.type.subType) .. ", name -> " .. argument.name .. "\n")
+			end
 
 			table.insert(args, { argumentName, argType, argument.pointer })
 			table.insert(nativeArgs, argumentName)
@@ -246,70 +282,64 @@ local function formatArgs(native)
 			end
 		end
 	end
-	
+
 	return args, argsDefs, nativeArgs
 end
 
 local function formatWrapper(native, fnName)
 	local t = '\t\t\t'
 	local body = ''
-	
+
 	local args, argsDefs, nativeArgs = formatArgs(native)
-		
+
 	local argNames = {}
-	
-	for argn, arg in pairs(args) do
+
+	for argn, arg in ipairs(args) do
 		local name, type, ptr = table.unpack(arg)
-		
+
 		if ptr then
 			name = 'ref ' .. name
 		end
-		
+
 		table.insert(argNames, name)
 	end
 
 	body = body .. '(' .. table.concat(argsDefs, ', ') .. ')\n'
 	body = body .. '\t\t{\n'
-	
-	local retType = 'void'
-	if native.returns then
-		retType = printReturnType(native.returns)
-	end
-	
+
+	local retType = printReturnType(native)
+
 	body = body .. t
-	
+
 	if retType ~= 'void' then
 		body = body .. 'return '
 	end
-	
+
 	body = body .. fnName .. '(' .. table.concat(argNames, ', ') .. ');\n'
-	
+
 	body = body .. '\t\t}\n\n'
-	
+
 	return body
 end
 
 local function formatImpl(native, baseAppendix)
 	local t = '\t\t\t'
 	local body = ''
-	
+
 	local nativeName = printFunctionName(native) .. baseAppendix
 	local args, argsDefs, nativeArgs = formatArgs(native)
 
 	body = body .. '(' .. table.concat(argsDefs, ', ') .. ')\n'
 	body = body .. '\t\t{\n'
 
-	local retType = 'void'
-	if native.returns then
-		retType = printReturnType(native.returns)
-	end
+	local retType = printReturnType(native)
 
 	-- First lets make output args containers if needed
 	local hyperDriveSafe = true
-	
+
 	local refValNum = 0
 	local refToArg = {}
-	for argn, arg in pairs(args) do
+	for argn, arg in ipairs(args) do
 		local name, type, ptr = table.unpack(arg)
 
 		if ptr == true then
@@ -317,7 +347,7 @@ local function formatImpl(native, baseAppendix)
 				hyperDriveSafe = false
 				type = 'NativeVector3'
 			end
-		
+
 			refValNum = refValNum + 1
 			local refName = 'ref_' .. name
 
@@ -330,40 +360,40 @@ local function formatImpl(native, baseAppendix)
 	if refValNum > 1 then
 		body = body .. '\n'
 	end
-	
+
 	local appendix = ''
-	
+
 	body = body .. t .. '{\n'
 	--body = body .. t .. '\tScriptContext.Reset();\n'
-	
+
 	body = body .. t .. '\tbyte* cxtBytes = stackalloc byte[sizeof(ContextType)];\n'
 	body = body .. t .. '\tContextType* cxt = (ContextType*)cxtBytes;\n'
-	
+
 	local fastEligible = true
 	local pushFree = true
-	
-	for argn, arg in pairs(args) do
+
+	for argn, arg in ipairs(args) do
 		local _, type = table.unpack(arg)
-		
+
 		if type == 'InputArgument' or type == 'object' then
 			fastEligible = false
 			pushFree = false
 		end
-		
+
 		if type == 'string' then
 			pushFree = false
 		end
 	end
-	
+
 	if not pushFree and not fastEligible then
 		body = body .. t .. '\tcxt->numArguments = 0;\n'
 		body = body .. t .. '\tcxt->numResults = 0;\n'
 	end
-	
+
 	body = body .. t .. '\tlong* _fnPtr = (long*)&cxt->functionData[0];\n'
-	
+
 	if not fastEligible then
-		for argn, arg in pairs(args) do
+		for argn, arg in ipairs(args) do
 			local name, type, ptr = table.unpack(arg)
 
 			if ptr then
@@ -371,7 +401,9 @@ local function formatImpl(native, baseAppendix)
 				appendix = appendix .. t .. '\t' .. name .. ' = ref_' .. name .. ';\n'
 			elseif type == 'string' then
 				body = body .. t .. '\tScriptContext.PushString(cxt, ' .. name .. ');\n'
-			elseif type == 'InputArgument' or type == 'object' then
+			elseif type == 'object' then
+				body = body .. t .. '\tScriptContext.PushObject(cxt, ' .. name .. ');\n'
+			elseif type == 'InputArgument' then
 				body = body .. t .. '\tScriptContext.Push(cxt, ' .. name .. ');\n'
 			else
 				body = body .. t .. '\tScriptContext.PushFast(cxt, ' .. name .. ');\n'
@@ -379,19 +411,19 @@ local function formatImpl(native, baseAppendix)
 		end
 	else
 		local numArgs = 0
-		
-		for argn, arg in pairs(args) do
+
+		for argn, arg in ipairs(args) do
 			local name, type, ptr = table.unpack(arg)
-			
+
 			local val = name
-			
+
 			if ptr then
 				type = 'System.IntPtr'
 				val = 'new System.IntPtr(&ref_' .. name .. ')'
-				
+
 				appendix = appendix .. t .. '\t' .. name .. ' = ref_' .. name .. ';\n'
 			end
-			
+
 			if type == 'int' then
 				body = body .. t .. '\t_fnPtr[' .. numArgs .. '] = (long)' .. val .. ';\n'
 			--elseif type == 'bool' then
@@ -406,28 +438,28 @@ local function formatImpl(native, baseAppendix)
 				if type ~= 'float' and type ~= 'System.IntPtr' then
 					body = body .. t .. '\t_fnPtr[' .. numArgs .. '] = 0;\n'
 				end
-			
+
 				body = body .. t .. '\t*(' .. type .. '*)(&_fnPtr[' .. numArgs .. ']) = ' .. val .. ';\n'
 			end
-			
+
 			if type == 'Vector3' then
 				numArgs = numArgs + 3
 			else
 				numArgs = numArgs + 1
 			end
 		end
-		
+
 		if native.ns == 'CFX' then
 			body = body .. t .. '\tcxt->numArguments = ' .. numArgs .. ';\n'
 		end
 	end
-	
+
 	if hyperDriveSafe then
 		body = body .. "\n#if !USE_HYPERDRIVE\n"
 	end
-	
+
 	body = body .. t .. '\tScriptContext.Invoke(cxt, (ulong)' .. native.hash .. ');\n'
-	
+
 	if hyperDriveSafe then
 		body = body .. "#else\n"
 		body = body .. t .. '\tcxt->functionDataPtr = _fnPtr;\n'
@@ -438,15 +470,15 @@ local function formatImpl(native, baseAppendix)
 		body = body .. t .. ("\tif (!invv(cxt, (void**)&error)) { throw new System.InvalidOperationException(ScriptContext.ErrorHandler(error)); }\n")
 		body = body .. "#endif\n"
 	end
-	
+
 	if retType ~= 'void' then
 		local tempRetType = retType
-	
+
 		if retType == 'string' or retType == 'object' or retType == 'dynamic' then
 			if retType == 'dynamic' then
 				tempRetType = 'object'
 			end
-		
+
 			appendix = appendix .. t .. '\treturn (' .. retType .. ')ScriptContext.GetResult(cxt, typeof(' .. tempRetType .. '));\n'
 		else
 			if retType == 'Vector3' then
@@ -457,7 +489,7 @@ local function formatImpl(native, baseAppendix)
 			appendix = appendix .. t .. '\treturn *(' .. tempRetType .. '*)(&cxt->functionData[0]);\n'
 		end
 	end
-	
+
 	appendix = appendix .. t .. '}\n'
 
 	return retType, (body .. appendix .. '\t\t}\n'), hyperDriveSafe
@@ -473,7 +505,7 @@ local function printNative(native)
 	else
 		usedNatives[nativeName] = 1
 	end
-	
+
 	local baseAppendix = appendix
 
 	local doc = formatDocString(native)
@@ -484,7 +516,7 @@ local function printNative(native)
 
 	for _, alias in ipairs(native.aliases) do
 		local aliasName = printFunctionName({ name = alias })
-		
+
 		if usedNatives[aliasName] then
 			appendix = (usedNatives[aliasName] + 1) .. ''
 			usedNatives[aliasName] = usedNatives[aliasName] + 1
@@ -496,11 +528,11 @@ local function printNative(native)
 			str = str .. string.format("%s\t\t[System.Security.SecuritySafeCritical]\n\t\tpublic static %s %s%s", doc, retType, aliasName .. appendix, wrapper)
 		end
 	end
-	
-	str = str .. string.format("\t\t[System.Security.SecurityCritical]\n\t\tprivate static unsafe %s Internal%s%s", retType, nativeName .. baseAppendix, def)	
+
+	str = str .. string.format("\t\t[System.Security.SecurityCritical]\n\t\tprivate static unsafe %s Internal%s%s", retType, nativeName .. baseAppendix, def)
 	if hyperDriveSafe then
 		str = str .. string.format("\n#if USE_HYPERDRIVE\n\t\tprivate static ScriptContext.CallFunc m_invoker%s;\n#endif\n", nativeName .. baseAppendix);
-	end	
+	end
 	return str
 end
 
@@ -519,3 +551,39 @@ end
 
 print('\t}')
 -- print('}')
+
+-- PAS bits
+print('\tinternal static partial class PointerArgumentSafety\n\t{')
+print('\t\tstatic PointerArgumentSafety()\n\t\t{')
+
+for _, v in pairs(_natives) do
+    if matchApiSet(v) and v.returns then
+        local returnType = ''
+
+        if v.returns.nativeType == 'string' then
+            returnType = 'string'
+        elseif v.returns.nativeType == 'float' then
+            returnType = 'float'
+        elseif v.returns.nativeType == 'bool' then
+            returnType = 'bool'
+        elseif v.returns.nativeType == 'int' then
+            returnType = 'int'
+        elseif v.returns.nativeType == 'Any' and not v.returns.pointer then
+            returnType = 'int'
+        elseif v.returns.nativeType == 'Vector3' then
+            returnType = 'int'
+        end
+
+        if returnType ~= '' then
+            print(("\t\t\t// %s"):format((v.ns or '') .. '/' .. v.name))
+
+			if v.name == 'INVOKE_FUNCTION_REFERENCE' then
+				returnType = 'FuncRef'
+			end
+			
+			print(("\t\t\tAddResultCleaner(%s, ResultCleaner_%s);\n"):format(v.hash, returnType))
+        end
+    end
+end
+
+print('\t\t}\n\t}')

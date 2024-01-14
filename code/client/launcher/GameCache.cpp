@@ -7,18 +7,51 @@
 
 #include "StdInc.h"
 
-#if defined(LAUNCHER_PERSONALITY_MAIN) || defined(LAUNCHER_PERSONALITY_GAME)
+#if defined(LAUNCHER_PERSONALITY_MAIN) || defined(LAUNCHER_PERSONALITY_GAME) || defined(COMPILING_GLUE)
 #include <CfxState.h>
 #include <HostSharedData.h>
+
+#if defined(LAUNCHER_PERSONALITY_MAIN) || defined(COMPILING_GLUE)
 #include <CfxLocale.h>
+#include <openssl/sha.h>
+#endif
+
+#include <KnownFolders.h>
+#include <shlobj.h>
 
 #undef interface
 #include "InstallerExtraction.h"
 #include <array>
 
+#if defined(LAUNCHER_PERSONALITY_MAIN) || defined(COMPILING_GLUE)
+#define CURL_STATICLIB
+#include <curl/curl.h>
+#include <curl/easy.h>
+#endif
+
 #include <Error.h>
 
-#if defined(GTA_FIVE) || defined(IS_RDR3)
+#if defined(GTA_FIVE) || defined(IS_RDR3) || defined(GTA_NY)
+struct GameCacheEntry;
+
+struct DeltaEntry
+{
+	std::array<uint8_t, 20> fromChecksum;
+	std::array<uint8_t, 20> toChecksum;
+	std::string remoteFile;
+	uint64_t dlSize;
+
+	std::string GetFileName() const;
+	GameCacheEntry MakeEntry() const;
+
+	inline std::wstring GetLocalFileName() const
+	{
+		return MakeRelativeCitPath(ToWide("data\\game-storage\\" + GetFileName()));
+	}
+
+	DeltaEntry(std::string_view fromChecksum, std::string_view toChecksum, const std::string& remoteFile, uint64_t dlSize);
+};
+
 // entry for a cached-intent file
 struct GameCacheEntry
 {
@@ -40,27 +73,38 @@ struct GameCacheEntry
 	// remote size of the archive file
 	size_t remoteSize;
 
+	// delta sets
+	std::vector<DeltaEntry> deltas;
+
+	// overridden local filename
+	std::wstring localFileOverride;
+
 	// constructor
-	GameCacheEntry(const char* filename, const char* checksum, const char* remotePath, size_t localSize)
-		: filename(filename), checksums({ checksum }), remotePath(remotePath), localSize(localSize), remoteSize(localSize), archivedFile(nullptr)
+	GameCacheEntry(const char* filename, const char* checksum, const char* remotePath, size_t localSize, std::initializer_list<DeltaEntry> deltas = {})
+		: filename(filename), checksums({ checksum }), remotePath(remotePath), localSize(localSize), remoteSize(localSize), archivedFile(nullptr), deltas(deltas)
 	{
 
 	}
 
-	GameCacheEntry(const char* filename, const char* checksum, const char* remotePath, const char* archivedFile, size_t localSize, size_t remoteSize)
-		: filename(filename), checksums({ checksum }), remotePath(remotePath), localSize(localSize), remoteSize(remoteSize), archivedFile(archivedFile)
+	GameCacheEntry(const char* filename, const char* checksum, const char* remotePath, size_t localSize, size_t remoteSize, std::initializer_list<DeltaEntry> deltas = {})
+		: filename(filename), checksums({ checksum }), remotePath(remotePath), localSize(localSize), remoteSize(remoteSize), archivedFile(nullptr), deltas(deltas)
+	{
+	}
+
+	GameCacheEntry(const char* filename, const char* checksum, const char* remotePath, const char* archivedFile, size_t localSize, size_t remoteSize, std::initializer_list<DeltaEntry> deltas = {})
+		: filename(filename), checksums({ checksum }), remotePath(remotePath), localSize(localSize), remoteSize(remoteSize), archivedFile(archivedFile), deltas(deltas)
 	{
 
 	}
 
-	GameCacheEntry(const char* filename, std::initializer_list<const char*> checksums, const char* remotePath, size_t localSize)
-		: filename(filename), checksums(checksums), remotePath(remotePath), localSize(localSize), remoteSize(localSize), archivedFile(nullptr)
+	GameCacheEntry(const char* filename, std::initializer_list<const char*> checksums, const char* remotePath, size_t localSize, std::initializer_list<DeltaEntry> deltas = {})
+		: filename(filename), checksums(checksums), remotePath(remotePath), localSize(localSize), remoteSize(localSize), archivedFile(nullptr), deltas(deltas)
 	{
 
 	}
 
-	GameCacheEntry(const char* filename, std::initializer_list<const char*> checksums, const char* remotePath, const char* archivedFile, size_t localSize, size_t remoteSize)
-		: filename(filename), checksums(checksums), remotePath(remotePath), localSize(localSize), remoteSize(remoteSize), archivedFile(archivedFile)
+	GameCacheEntry(const char* filename, std::initializer_list<const char*> checksums, const char* remotePath, const char* archivedFile, size_t localSize, size_t remoteSize, std::initializer_list<DeltaEntry> deltas = {})
+		: filename(filename), checksums(checksums), remotePath(remotePath), localSize(localSize), remoteSize(remoteSize), archivedFile(archivedFile), deltas(deltas)
 	{
 
 	}
@@ -68,63 +112,106 @@ struct GameCacheEntry
 	// methods
 	bool IsPrimitiveFile() const
 	{
-		return std::string(filename).find("ros_2034/") == 0 || std::string(filename).find("ros_1241/") == 0 || std::string(filename).find("launcher/") == 0;
+		return std::string_view{ filename }.find("ros_") == 0 || std::string_view{ filename }.find("launcher/") == 0;
 	}
 
-	std::wstring GetCacheFileName() const
+	std::wstring GetCacheFileName(std::string_view checksum = {}) const
 	{
 		std::string filenameBase = filename;
 
 		if (IsPrimitiveFile())
 		{
-			return MakeRelativeCitPath(ToWide(va("cache\\game\\%s", filenameBase.c_str())));
+			return MakeRelativeCitPath(ToWide(va("data\\game-storage\\%s", filenameBase.c_str())));
 		}
 
 		std::replace(filenameBase.begin(), filenameBase.end(), '/', '+');
 
-		return MakeRelativeCitPath(ToWide(va("cache\\game\\%s_%s", filenameBase.c_str(), checksums[0])));
+		return MakeRelativeCitPath(ToWide(va("data\\game-storage\\%s_%s", filenameBase.c_str(), checksum.empty() ? checksums[0] : checksum)));
+	}
+
+	void SetLocalName(const std::wstring& str)
+	{
+		localFileOverride = str;
 	}
 
 	std::wstring GetRemoteBaseName() const
 	{
 		std::string remoteNameBase = remotePath;
 
-		int slashIndex = remoteNameBase.find_last_of('/') + 1;
+		size_t slashIndex = remoteNameBase.find_last_of('/') + 1;
 
-		return MakeRelativeCitPath(ToWide("cache\\game\\" + remoteNameBase.substr(slashIndex)));
+		return MakeRelativeCitPath(ToWide("data\\game-storage\\" + remoteNameBase.substr(slashIndex)));
 	}
 
 	std::wstring GetLocalFileName() const
 	{
-		using namespace std::string_literals;
+		if (!localFileOverride.empty())
+		{
+			return localFileOverride;
+		}
 
 		if (_strnicmp(filename, "launcher/", 9) == 0)
 		{
-			wchar_t rootBuf[1024] = { 0 };
-			DWORD rootLength = sizeof(rootBuf);
+			static auto mtlPath = ([]()
+			{
+				wchar_t rootBuf[1024] = { 0 };
+				DWORD rootLength = sizeof(rootBuf);
 
-			RegGetValue(HKEY_LOCAL_MACHINE,
+				RegGetValue(HKEY_LOCAL_MACHINE,
 				L"SOFTWARE\\WOW6432Node\\Rockstar Games\\Launcher", L"InstallFolder",
 				RRF_RT_REG_SZ, nullptr, rootBuf, &rootLength);
+				
+				return std::wstring{ rootBuf };
+			})();
 
-			return rootBuf + L"\\"s + ToWide(&filename[9]);
+			return mtlPath + L"\\" + ToWide(&filename[9]);
 		}
 
 		if (_strnicmp(filename, "ros_", 4) == 0)
 		{
-			wchar_t rootBuf[1024] = { 0 };
-			DWORD rootLength = sizeof(rootBuf);
+			static auto scPath = ([]() -> std::wstring
+			{
+				LPWSTR rootPath;
+				if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFiles, 0, nullptr, &rootPath)))
+				{
+					std::wstring pathRef = rootPath;
+					CoTaskMemFree(rootPath);
 
-			RegGetValue(HKEY_LOCAL_MACHINE,
+					return pathRef;
+				}
+
+				wchar_t rootBuf[1024] = { 0 };
+				DWORD rootLength = sizeof(rootBuf);
+
+				RegGetValue(HKEY_LOCAL_MACHINE,
 				L"SOFTWARE\\WOW6432Node\\Rockstar Games\\Rockstar Games Social Club", L"InstallFolder",
 				RRF_RT_REG_SZ, nullptr, rootBuf, &rootLength);
+			})();
 
-			return rootBuf + L"\\"s + ToWide(&filename[9]);
+			return scPath + L"\\" + ToWide(strchr(filename, L'/') + 1);
 		}
 
 		return MakeRelativeGamePath(ToWide(filename));
 	}
 };
+
+GameCacheEntry DeltaEntry::MakeEntry() const
+{
+	return GameCacheEntry{ remoteFile.c_str(), "0000000000000000000000000000000000000000", remoteFile.c_str(), size_t(dlSize) };
+}
+
+std::string DeltaEntry::GetFileName() const
+{
+	std::string_view from{
+		reinterpret_cast<const char*>(fromChecksum.data()), 20
+	};
+
+	std::string_view to{
+		reinterpret_cast<const char*>(toChecksum.data()), 20
+	};
+
+	return fmt::sprintf("%x_%x", std::hash<decltype(from)>()(from), std::hash<decltype(to)>()(to));
+}
 
 struct GameCacheStorageEntry
 {
@@ -139,11 +226,6 @@ struct GameCacheStorageEntry
 static std::vector<GameCacheEntry> g_requiredEntries =
 {
 #if defined(GTA_FIVE)
-	//{ "GTA5.exe", "79a272830be65afae4acd520bfbfe176e0b142f3", "https://runtime.fivem.net/patches/GTA_V_Patch_1_0_1737_0.exe", "$/GTA5.exe", 77631632, 1189307336 },
-	//{ "update/update.rpf", "8a98e0879b91661dd2aa23f86abdf91ee741b237", "https://runtime.fivem.net/patches/GTA_V_Patch_1_0_1737_0.exe", "$/update/update.rpf", 1171902464, 1189307336 },
-
-	//{ L"update/update.rpf", "c819ecc1df08f3a90bc144fce0bba08bb7b6f893", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfupdate.rpf", 560553984 },
-	//{ "update/update.rpf", "319d867a44746885427d9c40262e9d735cd2a169", "Game_EFIGS/GTA_V_Patch_1_0_1011_1.exe", "$/update/update.rpf", 701820928, SIZE_MAX },
 	{ "update/x64/dlcpacks/patchday4ng/dlc.rpf", "124c908d82724258a5721535c87f1b8e5c6d8e57", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfpatchday4ng/dlc.rpf", 312438784 },
 	{ "update/x64/dlcpacks/mpluxe/dlc.rpf", "78f7777b49f4b4d77e3da6db728cb3f7ec51e2fc", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpluxe/dlc.rpf", 226260992 },
 
@@ -215,154 +297,101 @@ static std::vector<GameCacheEntry> g_requiredEntries =
 	{ "update/x64/dlcpacks/mpchristmas2018/dlc.rpf", "c4cda116420f14a28e5a999740cc53cf53a950ec", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 3247781888 },
 	{ "update/x64/dlcpacks/patchday20ng/dlc.rpf", "fbba396a0ede622e08f76c5ced8ac1d6839c0227", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfpatchday12ng/dlc.rpf", 457129984 },
 #elif defined(IS_RDR3)
-	{ "RDR2.exe", "ac3c2abd80bfa949279d8e1d32105a3d9345c6c8", "ipfs://bafybeihtqz54b4or4xxqyvrih5wi4il7ni72e7qxg6mtt2c47s6bbkgy4q", 91439232 },
-	{ "appdata0_update.rpf", "1715741785ce3c28adf9a78633e57f478229bb84", "ipfs://bafybeiapjt7ifvkqrtscmbgghgq2jz7ptpdxvvyqwcrxzqqoqolh45ybwq", 3003087 },
-	{ "update.rpf", "835a767055cfbf2c2ad86cf4462c7dfb931970fd", "ipfs://bafybeidgpk6as7ebr4sakax2cy5mulmjr6gbb32mj74i3apbfbjbeoi2ki", 3515071792 },
-	{ "shaders_x64.rpf", "77bad0ab74cd1ef7c646206ea12152449ec56cdf", "ipfs://bafybeia5ol2sjowvyfzyncn4wiyp5wtr6tdb6hlq3imbh4ed5v5hgll6jm", 233487310 },
-
 	{ "x64/dlcpacks/mp007/dlc.rpf", "f9d085bc889fc89d205c43a63d784d131be3ae8f", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 1425958473 },
+	{ "x64/dlcpacks/patchpack007/dlc.rpf", "1847fa67af881ae8f6b88149948db6a181b698ac", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 58027818 },
 #endif
 
-	{ "launcher/Launcher.exe", "54456C7E24724BF76CBA02210CF2737339663744", "https://mirrors.fivem.net/emergency_mirror/launcher/Launcher.exe", 37970576 },
-	{ "launcher/Launcher.rpf", "619AFA8203CF1DACEAE115898DE3EE30F40B678D", "https://mirrors.fivem.net/emergency_mirror/launcher/Launcher.rpf", 784384 },
-	{ "launcher/Redistributables/SocialClub/Social-Club-Setup.exe", "8260133F1A5BF9131BF01172D2A181881BB98BD0", "https://mirrors.fivem.net/emergency_mirror/launcher/Redistributables/SocialClub/Social-Club-Setup.exe", 99013544 },
-	{ "launcher/Redistributables/VCRed/vc_redist.x64.exe", "BE4F7AD520349D9D0683AB9DD171B3A1E4DB426B", "https://mirrors.fivem.net/emergency_mirror/launcher/Redistributables/VCRed/vc_redist.x64.exe", 15080792 },
-	{ "launcher/Redistributables/VCRed/vc_redist.x86.exe", "13439C916FAAF5E08CAFCE790381578685B0A552", "https://mirrors.fivem.net/emergency_mirror/launcher/Redistributables/VCRed/vc_redist.x86.exe", 14381032 },
-	{ "launcher/RockstarService.exe", "724C0E73F5E59DF9302AE734D918D364E3ACEF54", "https://mirrors.fivem.net/emergency_mirror/launcher/RockstarService.exe", 474256 },
-	{ "launcher/RockstarSteamHelper.exe", "FD742FB740A99B4705CA9AD977B036323C2094C7", "https://mirrors.fivem.net/emergency_mirror/launcher/RockstarSteamHelper.exe", 444560 },
-	{ "launcher/ThirdParty/Epic/EOSSDK-Win64-Shipping.dll", "AF01787DDB7DE00239EDC62D33E0B20C0BE80037", "https://mirrors.fivem.net/emergency_mirror/launcher/ThirdParty/Epic/EOSSDK-Win64-Shipping.dll", 9971968 },
-	{ "launcher/api-ms-win-core-console-l1-1-0.dll", "724F4F91041AD595E365B724A0348C83ACF12BBB", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-console-l1-1-0.dll", 19208 },
-	{ "launcher/api-ms-win-core-datetime-l1-1-0.dll", "4940D5B92B6B80A40371F8DF073BF3EB406F5658", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-datetime-l1-1-0.dll", 18696 },
-	{ "launcher/api-ms-win-core-debug-l1-1-0.dll", "E7C8A6C29C3158F8B332EEA5C33C3B1E044B5F73", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-debug-l1-1-0.dll", 18696 },
-	{ "launcher/api-ms-win-core-errorhandling-l1-1-0.dll", "51CBB7BA47802DC630C2507750432C55F5979C27", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-errorhandling-l1-1-0.dll", 18696 },
-	{ "launcher/api-ms-win-core-file-l1-1-0.dll", "9ACBEEF0AC510C179B319CA69CD5378D0E70504D", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-file-l1-1-0.dll", 22280 },
-	{ "launcher/api-ms-win-core-file-l1-2-0.dll", "04669214375B25E2DC8A3635484E6EEB206BC4EB", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-file-l1-2-0.dll", 18696 },
-	{ "launcher/api-ms-win-core-file-l2-1-0.dll", "402B7B8F8DCFD321B1D12FC85A1EE5137A5569B2", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-file-l2-1-0.dll", 18696 },
-	{ "launcher/api-ms-win-core-handle-l1-1-0.dll", "A2E2A40CEA25EA4FD64B8DEAF4FBE4A2DB94107A", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-handle-l1-1-0.dll", 18696 },
-	{ "launcher/api-ms-win-core-heap-l1-1-0.dll", "B4310929CCB82DD3C3A779CAB68F1F9F368076F2", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-heap-l1-1-0.dll", 19208 },
-	{ "launcher/api-ms-win-core-interlocked-l1-1-0.dll", "F779CDEF9DED19402AA72958085213D6671CA572", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-interlocked-l1-1-0.dll", 18696 },
-	{ "launcher/api-ms-win-core-libraryloader-l1-1-0.dll", "47143A66B4A2E2BA019BF1FD07BCCA9CFB8BB117", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-libraryloader-l1-1-0.dll", 19720 },
-	{ "launcher/api-ms-win-core-localization-l1-2-0.dll", "9874398548891F6A08FC06437996F84EB7495783", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-localization-l1-2-0.dll", 21256 },
-	{ "launcher/api-ms-win-core-memory-l1-1-0.dll", "9C03356CF48112563BB845479F40BF27B293E95E", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-memory-l1-1-0.dll", 19208 },
-	{ "launcher/api-ms-win-core-namedpipe-l1-1-0.dll", "CB59F1FE73C17446EB196FC0DD7D944A0CD9D81F", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-namedpipe-l1-1-0.dll", 18696 },
-	{ "launcher/api-ms-win-core-processenvironment-l1-1-0.dll", "2745259F4DBBEFBF6B570EE36D224ABDB18719BC", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-processenvironment-l1-1-0.dll", 19720 },
-	{ "launcher/api-ms-win-core-processthreads-l1-1-0.dll", "50699041060D14576ED7BACBD44BE9AF80EB902A", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-processthreads-l1-1-0.dll", 20744 },
-	{ "launcher/api-ms-win-core-processthreads-l1-1-1.dll", "0BFFB9ED366853E7019452644D26E8E8F236241B", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-processthreads-l1-1-1.dll", 19208 },
-	{ "launcher/api-ms-win-core-profile-l1-1-0.dll", "E7E0B18A40A35BD8B0766AC72253DE827432E148", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-profile-l1-1-0.dll", 18184 },
-	{ "launcher/api-ms-win-core-rtlsupport-l1-1-0.dll", "24F37D46DFC0EF303EF04ABF9956241AF55D25C9", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-rtlsupport-l1-1-0.dll", 19208 },
-	{ "launcher/api-ms-win-core-string-l1-1-0.dll", "637E4A9946691F76E6DEB69BDC21C210921D6F07", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-string-l1-1-0.dll", 18696 },
-	{ "launcher/api-ms-win-core-synch-l1-1-0.dll", "5584C189216A17228CCA6CD07037AAA9A8603241", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-synch-l1-1-0.dll", 20744 },
-	{ "launcher/api-ms-win-core-synch-l1-2-0.dll", "A9AEBBBB73B7B846B051325D7572F2398F5986EE", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-synch-l1-2-0.dll", 19208 },
-	{ "launcher/api-ms-win-core-sysinfo-l1-1-0.dll", "F20AE25484A1C1B43748A1F0C422F48F092AD2C1", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-sysinfo-l1-1-0.dll", 19720 },
-	{ "launcher/api-ms-win-core-timezone-l1-1-0.dll", "4BF13DB65943E708690D6256D7DDD421CC1CC72B", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-timezone-l1-1-0.dll", 19208 },
-	{ "launcher/api-ms-win-core-util-l1-1-0.dll", "1E1A5AB47E4C2B3C32C81690B94954B7612BB493", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-core-util-l1-1-0.dll", 18696 },
-	{ "launcher/api-ms-win-crt-conio-l1-1-0.dll", "49002B58CB0DF2EE8D868DEC335133CF225657DF", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-conio-l1-1-0.dll", 19720 },
-	{ "launcher/api-ms-win-crt-convert-l1-1-0.dll", "C84E41FDCC4CA89A76AE683CB390A9B86500D3CA", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-convert-l1-1-0.dll", 22792 },
-	{ "launcher/api-ms-win-crt-environment-l1-1-0.dll", "9A4818897251CACB7FE1C6FE1BE3E854985186AD", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-environment-l1-1-0.dll", 19208 },
-	{ "launcher/api-ms-win-crt-filesystem-l1-1-0.dll", "78FA03C89EA12FF93FA499C38673039CC2D55D40", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-filesystem-l1-1-0.dll", 20744 },
-	{ "launcher/api-ms-win-crt-heap-l1-1-0.dll", "60B4CF246C5F414FC1CD12F506C41A1043D473EE", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-heap-l1-1-0.dll", 19720 },
-	{ "launcher/api-ms-win-crt-locale-l1-1-0.dll", "9C1DF49A8DBDC8496AC6057F886F5C17B2C39E3E", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-locale-l1-1-0.dll", 19208 },
-	{ "launcher/api-ms-win-crt-math-l1-1-0.dll", "8B35EC4676BD96C2C4508DC5F98CA471B22DEED7", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-math-l1-1-0.dll", 27912 },
-	{ "launcher/api-ms-win-crt-multibyte-l1-1-0.dll", "91EEF52C557AEFD0FDE27E8DF4E3C3B7F99862F2", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-multibyte-l1-1-0.dll", 26888 },
-	{ "launcher/api-ms-win-crt-private-l1-1-0.dll", "0C33CFE40EDD278A692C2E73E941184FD24286D9", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-private-l1-1-0.dll", 71432 },
-	{ "launcher/api-ms-win-crt-process-l1-1-0.dll", "EC96F7BEEAEC14D3B6C437B97B4A18A365534B9B", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-process-l1-1-0.dll", 19720 },
-	{ "launcher/api-ms-win-crt-runtime-l1-1-0.dll", "A19ACEFA3F95D1B565650FDBC40EF98C793358E9", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-runtime-l1-1-0.dll", 23304 },
-	{ "launcher/api-ms-win-crt-stdio-l1-1-0.dll", "982B5DA1C1F5B9D74AF6243885BCBA605D54DF8C", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-stdio-l1-1-0.dll", 24840 },
-	{ "launcher/api-ms-win-crt-string-l1-1-0.dll", "7F389E6F2D6E5BEB2A3BAF622A0C0EA24BC4DE60", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-string-l1-1-0.dll", 24840 },
-	{ "launcher/api-ms-win-crt-time-l1-1-0.dll", "EE815A158BAACB357D9E074C0755B6F6C286B625", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-time-l1-1-0.dll", 21256 },
-	{ "launcher/api-ms-win-crt-utility-l1-1-0.dll", "EAA07829D012206AC55FB1AF5CC6A35F341D22BE", "https://mirrors.fivem.net/emergency_mirror/launcher/api-ms-win-crt-utility-l1-1-0.dll", 19208 },
-	{ "launcher/mtl_libovr.dll", "3AADE10DBF3C51233AA701AD1E12CD17A9DCB722", "https://mirrors.fivem.net/emergency_mirror/launcher/mtl_libovr.dll", 190952 },
-	{ "launcher/offline.pak", "C1EA3EF8587EC1BA896398912EA3BCA9D5C934B3", "https://mirrors.fivem.net/emergency_mirror/launcher/offline.pak", 1726729 },
-	{ "launcher/steam_api64.dll", "BD014660F7978A07BA2F99B6CF0621D678602663", "https://mirrors.fivem.net/emergency_mirror/launcher/steam_api64.dll", 121256 },
-	{ "launcher/ucrtbase.dll", "4189F4459C54E69C6D3155A82524BDA7549A75A6", "https://mirrors.fivem.net/emergency_mirror/launcher/ucrtbase.dll", 1016584 },
-	{ "ros_2034/SocialClubD3D12Renderer.dll", "F72BA64FDA3AED8FBED7EF47A2E52112D811A3A2", "https://mirrors.fivem.net/emergency_mirror/ros_2034/SocialClubD3D12Renderer.dll", 413672 },
-	{ "ros_2034/SocialClubHelper.exe", "18C57DF6CD51B0F583A026DA4A23035C6858353E", "https://mirrors.fivem.net/emergency_mirror/ros_2034/SocialClubHelper.exe", 2614760 },
-	{ "ros_2034/SocialClubVulkanLayer.dll", "59796C13F22CF1A436DB3A878EFE1807B4ECC850", "https://mirrors.fivem.net/emergency_mirror/ros_2034/SocialClubVulkanLayer.dll", 461800 },
-	{ "ros_2034/SocialClubVulkanLayer.json", "5DA071BDE81BF96C8939978343C6B5B93730CB39", "https://mirrors.fivem.net/emergency_mirror/ros_2034/SocialClubVulkanLayer.json", 339 },
-	{ "ros_2034/cef.pak", "09F37AFFF84B2445F0AFA8CBB803D53BADA62080", "https://mirrors.fivem.net/emergency_mirror/ros_2034/cef.pak", 3659767 },
-	{ "ros_2034/cef_100_percent.pak", "22A96140286FDB004540A2051B93432AA133843D", "https://mirrors.fivem.net/emergency_mirror/ros_2034/cef_100_percent.pak", 737157 },
-	{ "ros_2034/cef_200_percent.pak", "4BB734F61C04BFC68F7E15F128A2853A5F7649EA", "https://mirrors.fivem.net/emergency_mirror/ros_2034/cef_200_percent.pak", 864626 },
-	{ "ros_2034/chrome_elf.dll", "1279FE4A98EBDAE23DF608119272A40C51BB3A9D", "https://mirrors.fivem.net/emergency_mirror/ros_2034/chrome_elf.dll", 805864 },
-	{ "ros_2034/d3dcompiler_43.dll", "745AADA73AA1AB448C55FF681E875D592C593870", "https://mirrors.fivem.net/emergency_mirror/ros_2034/d3dcompiler_43.dll", 2106344 },
-	{ "ros_2034/d3dcompiler_47.dll", "5226E8C8A559B7D25CB2C2516498B413B01FAAD8", "https://mirrors.fivem.net/emergency_mirror/ros_2034/d3dcompiler_47.dll", 4336616 },
-	{ "ros_2034/icudtl.dat", "5CC62646E6C73B4BE276D08719BC5E257AF972BB", "https://mirrors.fivem.net/emergency_mirror/ros_2034/icudtl.dat", 10326688 },
-	{ "ros_2034/libEGL.dll", "DAF2E612B503771FB07366749F65C46BA50E2561", "https://mirrors.fivem.net/emergency_mirror/ros_2034/libEGL.dll", 146408 },
-	{ "ros_2034/libGLESv2.dll", "23ED37EC635B37A236EB70C4833114DD4AA18AD8", "https://mirrors.fivem.net/emergency_mirror/ros_2034/libGLESv2.dll", 5431272 },
-	{ "ros_2034/libcef.dll", "C7788FE47331F6E63C806734EB52A73F462CA33B", "https://mirrors.fivem.net/emergency_mirror/ros_2034/libcef.dll", 109920232 },
-	{ "ros_2034/locales/am.pak", "C38470C74EC5FA6C39C557A9AE1C62EA8C5949E7", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/am.pak", 308569 },
-	{ "ros_2034/locales/ar.pak", "488117B83394AC599F68D89EE6CB4AFDC101617D", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/ar.pak", 309144 },
-	{ "ros_2034/locales/bg.pak", "82BB3358F6404168A22618C666736D45B9652C15", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/bg.pak", 354995 },
-	{ "ros_2034/locales/bn.pak", "CAEE7C690B81EE2A39D806598891BBE419FED0F0", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/bn.pak", 457090 },
-	{ "ros_2034/locales/ca.pak", "4E5A93371D8E69306FF7104EC9E4BA9F1E658DE0", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/ca.pak", 220145 },
-	{ "ros_2034/locales/cs.pak", "8E28D1B3E2DCEE254DB0906470FE9EF061F6F301", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/cs.pak", 223622 },
-	{ "ros_2034/locales/da.pak", "C69E36ABB056EE8F3F79348ABAC3ACB4394A915D", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/da.pak", 200457 },
-	{ "ros_2034/locales/de.pak", "BE21B950998704AC0F6A4F8FE2DFE7831E4DB188", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/de.pak", 218494 },
-	{ "ros_2034/locales/el.pak", "1C27383402BF6E116DFE35275C10A258BFB2C1DC", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/el.pak", 388334 },
-	{ "ros_2034/locales/en-GB.pak", "1FDFEE5FDC8E4DC1BF797773A4C7B381640E94DB", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/en-GB.pak", 179898 },
-	{ "ros_2034/locales/en-US.pak", "C250B53402E3CA81A5B15B4AE9EFBE374D0B40DC", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/en-US.pak", 181262 },
-	{ "ros_2034/locales/es-419.pak", "AC9C6DDCAFDED36C1B7341D715D4D5AEC80EF6C4", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/es-419.pak", 216250 },
-	{ "ros_2034/locales/es.pak", "7D68745DF63153295BA95362298A6C807E22FB8F", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/es.pak", 219649 },
-	{ "ros_2034/locales/et.pak", "0D699B20763B1617466C767422AB165B59FFA44D", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/et.pak", 196109 },
-	{ "ros_2034/locales/fa.pak", "C3252469CB0704118DC87EFF963730786EDE9CF8", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/fa.pak", 311518 },
-	{ "ros_2034/locales/fi.pak", "A8E758C20BE09FB539F70A0808F16088D75F9412", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/fi.pak", 202474 },
-	{ "ros_2034/locales/fil.pak", "849467DF01B5B214DFD5BDE4E6571DD68D368164", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/fil.pak", 222492 },
-	{ "ros_2034/locales/fr.pak", "117E0FA329FD8C6CF2C50683112AA0AA9FB78E92", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/fr.pak", 234784 },
-	{ "ros_2034/locales/gu.pak", "C0CC8D54E5E10011AEE01445C84FB9F0D5886976", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/gu.pak", 433963 },
-	{ "ros_2034/locales/he.pak", "A3DE5BDE7F03F3CE7A49D8C9C3D222D4F1B92E33", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/he.pak", 263008 },
-	{ "ros_2034/locales/hi.pak", "C8E80B209AFF6C0672846E45A5CAD70E294372C4", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/hi.pak", 444860 },
-	{ "ros_2034/locales/hr.pak", "340B0FE0BFAD72027B5C4851AD0CDD1E88DB8F2E", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/hr.pak", 212148 },
-	{ "ros_2034/locales/hu.pak", "AF775FBF31FE24FF03D7F20E54A13EBB704B1243", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/hu.pak", 230497 },
-	{ "ros_2034/locales/id.pak", "48EB5000362567230AECE13533A20201BC7E9DA5", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/id.pak", 193889 },
-	{ "ros_2034/locales/it.pak", "1AA31C84E57DAFC025C7101FF67686F5CA4C1427", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/it.pak", 212034 },
-	{ "ros_2034/locales/ja.pak", "F5E8088157758222A5F12D92468E3278379ACC9D", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/ja.pak", 263635 },
-	{ "ros_2034/locales/kn.pak", "A404D241DC5C878EE984B9A020868C3B3A657D48", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/kn.pak", 506652 },
-	{ "ros_2034/locales/ko.pak", "CCF76DE8F9B8123534FDBC295EB611084827AE44", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/ko.pak", 221281 },
-	{ "ros_2034/locales/lt.pak", "5BF289E0B7FBF3BA76C458CDEE3DA37AE8916FC6", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/lt.pak", 227745 },
-	{ "ros_2034/locales/lv.pak", "C99AE49A35A91CB65DEC70C7D047317E7A4990B1", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/lv.pak", 226576 },
-	{ "ros_2034/locales/ml.pak", "AF5EE2F04A369FF547A302FC25D8A83625B4834A", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/ml.pak", 545408 },
-	{ "ros_2034/locales/mr.pak", "F5B0DAA6B06102EB7CB8E0D3A2B8A7CC8E4EB3B5", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/mr.pak", 440783 },
-	{ "ros_2034/locales/ms.pak", "F321C7D05192A568BFA9A3F1F2E1E4F990CCB0FD", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/ms.pak", 200631 },
-	{ "ros_2034/locales/nb.pak", "11447469B1E2EA31E5E41175EACBF2688CFDCBFC", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/nb.pak", 197834 },
-	{ "ros_2034/locales/nl.pak", "3CF49D1A6C4EAD4DDDE1BDB7B47F27D396DEA174", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/nl.pak", 207112 },
-	{ "ros_2034/locales/pl.pak", "3B458BE93A629DD21412C90261C6E0FC75884A01", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/pl.pak", 219794 },
-	{ "ros_2034/locales/pt-BR.pak", "6D800996B7AED2CCFD61F862F5972ECD863F301D", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/pt-BR.pak", 213275 },
-	{ "ros_2034/locales/pt-PT.pak", "F9510A1E9EB748A1DA710568CFA7E8E7572C8F9D", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/pt-PT.pak", 215681 },
-	{ "ros_2034/locales/ro.pak", "3715F4B689B36371BE57F8B3B428463B04E3D589", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/ro.pak", 220783 },
-	{ "ros_2034/locales/ru.pak", "B5E70099AB9221C7B48172615E90EEC4651BA962", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/ru.pak", 342198 },
-	{ "ros_2034/locales/sk.pak", "5B1145F2AFF82A48ADFC8649468C738729BE11F5", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/sk.pak", 227524 },
-	{ "ros_2034/locales/sl.pak", "2BF6609859614FFFF59835CC646F312616CA3221", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/sl.pak", 213458 },
-	{ "ros_2034/locales/sr.pak", "DE8301191E06A92FDA4B6AA0173D13144BC9D201", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/sr.pak", 331863 },
-	{ "ros_2034/locales/sv.pak", "59BCD61F90A572EE04B653E380F7FB037558EDF7", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/sv.pak", 198993 },
-	{ "ros_2034/locales/sw.pak", "E227032C65FD15F95134D5737D6A82153D64F88E", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/sw.pak", 203901 },
-	{ "ros_2034/locales/ta.pak", "C55A45300374620C318931CB57AD40A765C310E3", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/ta.pak", 513725 },
-	{ "ros_2034/locales/te.pak", "C5F840C16BBB8D881CBBE6DC5ECE0224A2B233FA", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/te.pak", 488193 },
-	{ "ros_2034/locales/th.pak", "77115AFC2AACCEAF7E06BFFA204636F5D43896DE", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/th.pak", 414114 },
-	{ "ros_2034/locales/tr.pak", "263531664B606FE910BA60E34D2FA588EEA940C6", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/tr.pak", 212733 },
-	{ "ros_2034/locales/uk.pak", "D4E839D8839A4E974D0AD0481516CDADB20CC22F", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/uk.pak", 346713 },
-	{ "ros_2034/locales/vi.pak", "816C6A6AAB8F0FD3262E55EACB26EA7F02886103", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/vi.pak", 245342 },
-	{ "ros_2034/locales/zh-CN.pak", "68887DDD4DCB4AB75A1A4FA7148CE7EECB3B1524", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/zh-CN.pak", 184050 },
-	{ "ros_2034/locales/zh-TW.pak", "7B77CAA9C113E815950835EA543F1C46638CB62A", "https://mirrors.fivem.net/emergency_mirror/ros_2034/locales/zh-TW.pak", 184212 },
-	{ "ros_2034/natives_blob.bin", "9D60E499A907811A3155E9A07F8645D6C83CB909", "https://mirrors.fivem.net/emergency_mirror/ros_2034/natives_blob.bin", 83328 },
-	{ "ros_2034/scui.pak", "BB2E5201A8CD16EDDE31D4E39257640A956F35E4", "https://mirrors.fivem.net/emergency_mirror/ros_2034/scui.pak", 6028093 },
-	{ "ros_2034/snapshot_blob.bin", "49038CDCB26B4DCC37F017787265180478E894B5", "https://mirrors.fivem.net/emergency_mirror/ros_2034/snapshot_blob.bin", 287384 },
-	{ "ros_2034/socialclub.dll", "8CB5C91391FECBF87EA4B0D1E8000CCFC046831D", "https://mirrors.fivem.net/emergency_mirror/ros_2034/socialclub.dll", 5179880 },
-	{ "ros_2034/swiftshader/libEGL.dll", "B20AD83B8D44E5A0AE98A4A430C9179D6D04CB27", "https://mirrors.fivem.net/emergency_mirror/ros_2034/swiftshader/libEGL.dll", 155112 },
-	{ "ros_2034/swiftshader/libGLESv2.dll", "DDB924538652AAED98AA9F4CE8268658C2D5BC15", "https://mirrors.fivem.net/emergency_mirror/ros_2034/swiftshader/libGLESv2.dll", 2686440 },
-	{ "ros_2034/uninstallRGSCRedistributable.exe", "5C7B092135788F36930C4FFE445830D55573E3E2", "https://mirrors.fivem.net/emergency_mirror/ros_2034/uninstallRGSCRedistributable.exe", 396664 },
-	{ "ros_2034/v8_context_snapshot.bin", "1834A6FF2B69121D01DA29EB1CB82ED29F493AE2", "https://mirrors.fivem.net/emergency_mirror/ros_2034/v8_context_snapshot.bin", 688952 },
+#if defined(_M_AMD64)
+	{ "ros_2090/socialclub.dll", "AE14687363C0FB5A8B086B4EB24D5A6E2D5161B9", "https://content.cfx.re/mirrors/ros/2.0.9.0/socialclub.dll", 5287320 },
+	{ "ros_2090/socialclub.pak", "D70F269F7EBBA3A13AA2871BAFA58212B01E6280", "https://content.cfx.re/mirrors/ros/2.0.9.0/socialclub.pak", 4996 },
+
+	// RDR3 expects these to exist for SC SDK init to succeed
+#ifdef IS_RDR3
+	{ "ros_2090/SocialClubD3D12Renderer.dll", "73A1421E35B5ED105FA9AF8445F62F0A42EE3C41", "https://content.cfx.re/mirrors/ros/2.0.9.0/SocialClubD3D12Renderer.dll", 415128 },
+	{ "ros_2090/SocialClubVulkanLayer.dll", "572E95099825B507079349A2B24BBAE4C1567B84", "https://content.cfx.re/mirrors/ros/2.0.9.0/SocialClubVulkanLayer.dll", 476056 },
+	{ "ros_2090/SocialClubVulkanLayer.json", "5DA071BDE81BF96C8939978343C6B5B93730CB39", "https://content.cfx.re/mirrors/ros/2.0.9.0/SocialClubVulkanLayer.json", 339 },
+#endif
 
 	{ "launcher/LauncherPatcher.exe", "1C6BCE6CDB4B2E1766A67F931A72519CEFF6AEB1", "", "", 0, 0 },
 	{ "launcher/index.bin", "85e2cc75d6d07518883ce5d377d3425b74636667", "", "", 0, 0 },
-
-#if defined(GTA_FIVE)
-	//{ "GTAVLauncher.exe", "0962fb5a39d9ec40d4fce2ac636ef11dcd0457cf", "http://patches.rockstargames.com/prod/gtav/Launcher_EFIGS/GTA_V_Launcher_1_0_1604_0.exe", "$/GTAVLauncher.exe", 21606840, 20081224 },
+#elif defined(_M_IX86)
+	{ "ros_2079_x86/cef_100_percent.pak", "5DF428B8B1D8584F2670A19224B0A3A11368B8F5", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/cef_100_percent.pak", 658266 },
+	{ "ros_2079_x86/cef_200_percent.pak", "5FA7D4173D0A43610378AC26E05701B0F9F9222D", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/cef_200_percent.pak", 812521 },
+	{ "ros_2079_x86/cef.pak", "743AAAFD06E48CE8006751016E3F9A1D20C528D7", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/cef.pak", 2206428 },
+	{ "ros_2079_x86/chrome_elf.dll", "A35C92343290AA283A57BF8FAA233BAACA2AF378", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/chrome_elf.dll", 816520 },
+	{ "ros_2079_x86/d3dcompiler_47.dll", "24B863C59A8725A2040070D6CD63B4F0B2501122", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/d3dcompiler_47.dll", 3648904 },
+	{ "ros_2079_x86/icudtl.dat", "C8930E95B78DEEF5B7730102ACD39F03965D479A", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/icudtl.dat", 10505952 },
+	{ "ros_2079_x86/libcef.dll", "EF40BDD5C7D1BA378F4BD6661E9D617F77F033BF", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/libcef.dll", 104726920 },
+	{ "ros_2079_x86/libEGL.dll", "271F1FB5B00882F6E5D30743CD7B43A91C4F4E31", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/libEGL.dll", 319368 },
+	{ "ros_2079_x86/libGLESv2.dll", "C601D45C0A4C7571A8252B7263455B84C7A6E80C", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/libGLESv2.dll", 6821768 },
+	{ "ros_2079_x86/scui.pak", "3A03DFA2CECF1E356EB8D080443069ED35A897F1", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/scui.pak", 3401985 },
+	{ "ros_2079_x86/snapshot_blob.bin", "FD1DF208437FB8A0E36F57F700C8FD412C300786", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/snapshot_blob.bin", 50522 },
+	{ "ros_2079_x86/socialclub.dll", "1E5702D3E75E1802D16132CC27942589F9301AA2", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/socialclub.dll", 1693064 },
+	{ "ros_2079_x86/socialclub.pak", "D70F269F7EBBA3A13AA2871BAFA58212B01E6280", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/socialclub.pak", 4996 },
+	{ "ros_2079_x86/SocialClubHelper.exe", "A6EE9FFFE5436180B341647E06C60FD26A2F32DC", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/SocialClubHelper.exe", 1052040 },
+	{ "ros_2079_x86/v8_context_snapshot.bin", "9C351FD39D4F64097B778BF920DB9CACB6884A71", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/v8_context_snapshot.bin", 170474 },
+	{ "ros_2079_x86/locales/am.pak", "1BA4F8D3A96D53E236F31315ED94CE7857BE676C", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/am.pak", 385976 },
+	{ "ros_2079_x86/locales/ar.pak", "D402FF17B3DEB25C729862367C6A66D4C71064C5", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ar.pak", 395800 },
+	{ "ros_2079_x86/locales/bg.pak", "789DEB5B067B64C336ED501A47EACF7AC28C165C", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/bg.pak", 438902 },
+	{ "ros_2079_x86/locales/bn.pak", "D6E4E916D3A5D6B06D7252F5A3EE3546C0D5FA81", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/bn.pak", 570862 },
+	{ "ros_2079_x86/locales/ca.pak", "B3A84377C6DFDCD2EC8B76DAE51EF174A3F32161", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ca.pak", 272754 },
+	{ "ros_2079_x86/locales/cs.pak", "42F2E55A50F980D8A7BC6ACA247FEA38187050C4", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/cs.pak", 278073 },
+	{ "ros_2079_x86/locales/da.pak", "4EFB233CF6F6D6FE7A30887CCDF2758481F7CEF9", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/da.pak", 249964 },
+	{ "ros_2079_x86/locales/de.pak", "E293C63938808FFE58CEF2E911C3E645099122C3", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/de.pak", 271680 },
+	{ "ros_2079_x86/locales/el.pak", "6FB999483B51B732797F46433571CD1F99C6C382", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/el.pak", 483371 },
+	{ "ros_2079_x86/locales/en-GB.pak", "337681F89B3CC5E069066BE31FE548A7FE1BDC3D", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/en-GB.pak", 222850 },
+	{ "ros_2079_x86/locales/en-US.pak", "55D6297A4E9BAC33E1975015592324CE32A426E5", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/en-US.pak", 224948 },
+	{ "ros_2079_x86/locales/es-419.pak", "D7CFB264CA28E4310060D4330D0F869F750296EA", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/es-419.pak", 267636 },
+	{ "ros_2079_x86/locales/es.pak", "AD9BCEBBC3DFB6B346E6DDA1B24410DAE844FAD0", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/es.pak", 272041 },
+	{ "ros_2079_x86/locales/et.pak", "2CC11D3FE483042FABDB0B568F70EC6D3AA89499", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/et.pak", 241972 },
+	{ "ros_2079_x86/locales/fa.pak", "5A83F5797DB4C5FD4EFE8E83CD32FCF30F7A579B", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/fa.pak", 387663 },
+	{ "ros_2079_x86/locales/fi.pak", "752D5AB53154F4F6CE671C11CDFFAD87E4B2098F", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/fi.pak", 250146 },
+	{ "ros_2079_x86/locales/fil.pak", "CB1FE897C559395F042E113162526A1A985F3C54", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/fil.pak", 276980 },
+	{ "ros_2079_x86/locales/fr.pak", "9BD0A49B7F93CECC843C4858FE02FC3233B95FB0", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/fr.pak", 293801 },
+	{ "ros_2079_x86/locales/gu.pak", "503499E4B8D7EDE7C2546546C708B62315B93534", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/gu.pak", 546805 },
+	{ "ros_2079_x86/locales/he.pak", "20DE3DE5EFE18A02E3722503812D1BE7F125BAC7", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/he.pak", 332944 },
+	{ "ros_2079_x86/locales/hi.pak", "261DF4775E2E7FF64BBA52D6CC2E3E7E6A744BA6", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/hi.pak", 563160 },
+	{ "ros_2079_x86/locales/hr.pak", "CC0EC12EE1A0182FD5095735BDAC50A7968E5941", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/hr.pak", 265276 },
+	{ "ros_2079_x86/locales/hu.pak", "3A06F37F8E0DCB4A2C4B9223F4EA630DEC598F30", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/hu.pak", 287478 },
+	{ "ros_2079_x86/locales/id.pak", "7648DD9102EC8D1A989F4CFEE5E77A50EEB2543A", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/id.pak", 240937 },
+	{ "ros_2079_x86/locales/it.pak", "AF12931047F550A700930292678ED68A2F3AE693", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/it.pak", 263141 },
+	{ "ros_2079_x86/locales/ja.pak", "3D69B821559E8B1B7BE61C5E0403013C6E34B472", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ja.pak", 326307 },
+	{ "ros_2079_x86/locales/kn.pak", "BB0B09183BFD4642EDFA4DCDFC6C589D51C91339", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/kn.pak", 637150 },
+	{ "ros_2079_x86/locales/ko.pak", "11E8387A32FA7E25669EA58288AAD02240D59115", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ko.pak", 274716 },
+	{ "ros_2079_x86/locales/lt.pak", "B08521D70C17BC493EDE917CF64483C73CC8CD2B", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/lt.pak", 284278 },
+	{ "ros_2079_x86/locales/lv.pak", "68E7175DF0FD0781434761C7AF533D44DFE94DD0", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/lv.pak", 283337 },
+	{ "ros_2079_x86/locales/ml.pak", "0D881D6C532AFD275DB69B4468742F64BDBCEB57", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ml.pak", 672973 },
+	{ "ros_2079_x86/locales/mr.pak", "578BDC9D3EC2A35CA5338DEC949AD6269A95CF81", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/mr.pak", 539342 },
+	{ "ros_2079_x86/locales/ms.pak", "6452CC250C4219EA0130D461942284ABB203105D", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ms.pak", 249855 },
+	{ "ros_2079_x86/locales/nb.pak", "B36849BBB46F448DA1A86C93A777E7600898143E", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/nb.pak", 245307 },
+	{ "ros_2079_x86/locales/nl.pak", "63C363F3A6D953D2F516926A60036CD45A2BBC73", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/nl.pak", 255846 },
+	{ "ros_2079_x86/locales/pl.pak", "6A9B10202C2A4EABE2DB370478A120303CCEA9E2", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/pl.pak", 276450 },
+	{ "ros_2079_x86/locales/pt-BR.pak", "CDDDA77FE5857E7095B0BEF9C95ADDC0E1BFE81E", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/pt-BR.pak", 263825 },
+	{ "ros_2079_x86/locales/pt-PT.pak", "B01F54FEAC5D8612FADBD1AA1E1A9AE48686765B", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/pt-PT.pak", 267667 },
+	{ "ros_2079_x86/locales/ro.pak", "C5F88F5AA8070D93D1A5AC2F6D5B716A405D6402", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ro.pak", 273510 },
+	{ "ros_2079_x86/locales/ru.pak", "3E87FCC49496F1A375022B18F29C5CA184AC94A1", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ru.pak", 435040 },
+	{ "ros_2079_x86/locales/sk.pak", "696DB99FE09F2B6F04F6755B562DA0698E67EE73", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/sk.pak", 281889 },
+	{ "ros_2079_x86/locales/sl.pak", "FC42DE011EB9EB97F76B90191A0AA6763524F257", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/sl.pak", 268266 },
+	{ "ros_2079_x86/locales/sr.pak", "A5F59A87CCAECE1EA27B679DC4CD43B226D44652", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/sr.pak", 414419 },
+	{ "ros_2079_x86/locales/sv.pak", "52B28217FA8CFB1BA78DA18FF8FABE96AA65C0CC", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/sv.pak", 247090 },
+	{ "ros_2079_x86/locales/sw.pak", "F06249989197891C214B827CB6ACA078A8AC52A9", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/sw.pak", 252916 },
+	{ "ros_2079_x86/locales/ta.pak", "7B2078915D759278F044DA16C331BC35A8EAE366", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ta.pak", 644686 },
+	{ "ros_2079_x86/locales/te.pak", "81B147F70EFC789597013B862AC7C4C2E932D668", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/te.pak", 606991 },
+	{ "ros_2079_x86/locales/th.pak", "17BB58538907D534C950C830451FD09BE8B699ED", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/th.pak", 514784 },
+	{ "ros_2079_x86/locales/tr.pak", "5872240D9E0700DDBE160CE5FED55B64A8C58D4E", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/tr.pak", 262379 },
+	{ "ros_2079_x86/locales/uk.pak", "403A5AF73EAA7E31FA913B3E92989A3966E84F27", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/uk.pak", 433942 },
+	{ "ros_2079_x86/locales/vi.pak", "4CDA92C95B944456682F49F7542A7DF29AFA390D", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/vi.pak", 305558 },
+	{ "ros_2079_x86/locales/zh-CN.pak", "297C09A18520F9716D81D612540AC8ED7EBDC42B", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/zh-CN.pak", 227335 },
+	{ "ros_2079_x86/locales/zh-TW.pak", "7F67C3A955A99FD31C0A5D5D7B0CD6B404F09BB1", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/zh-TW.pak", 227384 },
+	{ "ros_2079_x86/swiftshader/libEGL.dll", "315BE829397C2C65B4401DE0A9F634D2DF864CD4", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/swiftshader/libEGL.dll", 338312 },
+	{ "ros_2079_x86/swiftshader/libGLESv2.dll", "E62DA6B61D963AB9CD242C2811AC9D7ADA2613AB", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/swiftshader/libGLESv2.dll", 3017608 },
 #endif
 };
 
 static bool ParseCacheFileName(const char* inString, std::string& fileNameOut, std::string& hashOut)
 {
 	// check if the file name meets the minimum length for there to be a hash
-	int length = strlen(inString);
+	size_t length = strlen(inString);
 
 	if (length < 44)
 	{
@@ -401,29 +430,49 @@ static bool ParseCacheFileName(const char* inString, std::string& fileNameOut, s
 	return true;
 }
 
+#include <charconv>
+
 template<int Size>
-static std::array<uint8_t, Size> ParseHexString(const char* string)
+static constexpr std::array<uint8_t, Size> ParseHexString(const std::string_view string)
 {
 	std::array<uint8_t, Size> retval;
 
-	assert(strlen(string) == Size * 2);
-
-	for (int i = 0; i < Size; i++)
+	for (size_t i = 0; i < Size; i++)
 	{
-		const char* startIndex = &string[i * 2];
-		char byte[3] = { startIndex[0], startIndex[1], 0 };
+		size_t idx = i * 2;
+		char byte[3] = { string[idx], string[idx + 1], 0 };
 
-		retval[i] = strtoul(byte, nullptr, 16);
+		std::from_chars(&byte[0], &byte[2], retval[i], 16);
 	}
 
 	return retval;
 }
 
+template<int Size>
+static std::string FormatHexString(const std::array<uint8_t, Size>& arr)
+{
+	static const char charTable[] = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F' };
+	char stringBuffer[(Size * 2) + 1] = { 0 };
+
+	for (size_t i = 0; i < Size; i++)
+	{
+		stringBuffer[i * 2] = charTable[(arr[i] >> 4) & 0xF];
+		stringBuffer[i * 2 + 1] = charTable[arr[i] & 0xF];
+	}
+
+	return stringBuffer;
+}
+
+DeltaEntry::DeltaEntry(std::string_view fromChecksum, std::string_view toChecksum, const std::string& remoteFile, uint64_t dlSize)
+	: fromChecksum(ParseHexString<20>(fromChecksum)), toChecksum(ParseHexString<20>(toChecksum)), remoteFile(remoteFile), dlSize(dlSize)
+{
+}
+
 static std::vector<GameCacheStorageEntry> LoadCacheStorage()
 {
 	// create the cache directory if needed
-	CreateDirectory(MakeRelativeCitPath(L"cache").c_str(), nullptr);
-	CreateDirectory(MakeRelativeCitPath(L"cache\\game").c_str(), nullptr);
+	CreateDirectory(MakeRelativeCitPath(L"data").c_str(), nullptr);
+	CreateDirectory(MakeRelativeCitPath(L"data\\game-storage").c_str(), nullptr);
 
 	// output buffer
 	std::vector<GameCacheStorageEntry> cacheStorage;
@@ -431,9 +480,7 @@ static std::vector<GameCacheStorageEntry> LoadCacheStorage()
 	// iterate over files in cache
 	WIN32_FIND_DATA findData;
 
-	HANDLE hFind = FindFirstFile(MakeRelativeCitPath(L"cache\\game\\*.*").c_str(), &findData);
-
-	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
+	HANDLE hFind = FindFirstFile(MakeRelativeCitPath(L"data\\game-storage\\*.*").c_str(), &findData);
 
 	if (hFind != INVALID_HANDLE_VALUE)
 	{
@@ -443,7 +490,7 @@ static std::vector<GameCacheStorageEntry> LoadCacheStorage()
 			std::string fileName;
 			std::string fileHash;
 
-			if (ParseCacheFileName(converter.to_bytes(findData.cFileName).c_str(), fileName, fileHash))
+			if (ParseCacheFileName(ToNarrow(findData.cFileName).c_str(), fileName, fileHash))
 			{
 				// add the entry, if so
 				LARGE_INTEGER quadTime;
@@ -465,7 +512,7 @@ static std::vector<GameCacheStorageEntry> LoadCacheStorage()
 
 	// load on-disk storage as well
 	{
-		if (FILE* f = _wfopen(MakeRelativeCitPath(L"cache\\game\\cache.dat").c_str(), L"rb"))
+		if (FILE* f = _wfopen(MakeRelativeCitPath(L"data\\game-storage\\game_files.dat").c_str(), L"rb"))
 		{
 			// get file length
 			int length;
@@ -489,7 +536,7 @@ static std::vector<GameCacheStorageEntry> LoadCacheStorage()
 	return cacheStorage;
 }
 
-#ifdef LAUNCHER_PERSONALITY_MAIN
+#if defined(LAUNCHER_PERSONALITY_MAIN) || defined(COMPILING_GLUE)
 static std::vector<GameCacheEntry> CompareCacheDifferences()
 {
 	// load the cache storage from disk
@@ -578,6 +625,43 @@ bool ExtractInstallerFile(const std::wstring& installerFile, const std::string& 
 
 #include <commctrl.h>
 
+#if defined(COMPILING_GLUE)
+extern void TaskDialogEmulated(TASKDIALOGCONFIG* config, int* button, void*, void*);
+#endif
+
+static const char* const kByteStringsUnlocalized[] = {
+	" B",
+	" kB",
+	" MB",
+	" GB",
+	" TB",
+	" PB"
+};
+
+static std::wstring FormatBytes(int64_t bytes)
+{
+	double unit_amount = static_cast<double>(bytes);
+	size_t dimension = 0;
+	const int kKilo = 1024;
+	while (unit_amount >= kKilo && dimension < std::size(kByteStringsUnlocalized) - 1)
+	{
+		unit_amount /= kKilo;
+		dimension++;
+	}
+
+	if (bytes != 0 && dimension > 0 && unit_amount < 100)
+	{
+		return ToWide(fmt::sprintf("%.1lf%s", unit_amount,
+		kByteStringsUnlocalized[dimension]));
+	}
+	else
+	{
+		return ToWide(fmt::sprintf("%.0lf%s", unit_amount,
+		kByteStringsUnlocalized[dimension]));
+	}
+}
+
+
 static bool ShowDownloadNotification(const std::vector<std::pair<GameCacheEntry, bool>>& entries)
 {
 	// iterate over the entries
@@ -587,12 +671,15 @@ static bool ShowDownloadNotification(const std::vector<std::pair<GameCacheEntry,
 
 	bool shouldAllow = true;
 
+	std::string badEntries;
 	for (auto& entry : entries)
 	{
 		// is the file allowed?
 		if (_strnicmp(entry.first.remotePath, "nope:", 5) == 0)
 		{
 			shouldAllow = false;
+			badEntries += entry.first.filename;
+			badEntries += "\n";
 		}
 
 		// if it's a local file...
@@ -600,18 +687,20 @@ static bool ShowDownloadNotification(const std::vector<std::pair<GameCacheEntry,
 		{
 			localSize += entry.first.localSize;
 
-			detailStr << entry.first.filename << L" (local, " << va(L"%.2f", entry.first.localSize / 1024.0 / 1024.0) << L" MB)\n";
+			detailStr << entry.first.filename << L" (local, " << FormatBytes(entry.first.localSize) << L")\n";
 		}
 		else
 		{
 			if (entry.first.remoteSize == SIZE_MAX)
 			{
 				shouldAllow = false;
+				badEntries += entry.first.filename;
+				badEntries += "\n";
 			}
 
 			remoteSize += entry.first.remoteSize;
 
-			detailStr << entry.first.remotePath << L" (download, " << va(L"%.2f", entry.first.remoteSize / 1024.0 / 1024.0) << L" MB)\n";
+			detailStr << entry.first.remotePath << L" (download, " << FormatBytes(entry.first.remoteSize) << L")\n";
 		}
 	}
 
@@ -628,13 +717,13 @@ static bool ShowDownloadNotification(const std::vector<std::pair<GameCacheEntry,
 	taskDialogConfig.hInstance = GetModuleHandle(nullptr);
 	taskDialogConfig.dwFlags = TDF_EXPAND_FOOTER_AREA;
 	taskDialogConfig.dwCommonButtons = TDCBF_YES_BUTTON | TDCBF_NO_BUTTON;
-	taskDialogConfig.pszWindowTitle = PRODUCT_NAME L": Game cache outdated";
+	taskDialogConfig.pszWindowTitle = PRODUCT_NAME L": Game data outdated";
 	taskDialogConfig.pszMainIcon = TD_INFORMATION_ICON;
-	taskDialogConfig.pszMainInstruction = PRODUCT_NAME L" needs to update the game cache";
+	taskDialogConfig.pszMainInstruction = PRODUCT_NAME L" needs to update the local game data";
 
 	if (shouldAllow)
 	{
-		taskDialogConfig.pszContent = va(gettext(L"The local %s game cache is outdated, and needs to be updated. This will copy %.2f MB of data from the local disk, and download %.2f MB of data from the internet.\nDo you wish to continue?"), PRODUCT_NAME, (localSize / 1024.0 / 1024.0), (remoteSize / 1024.0 / 1024.0));
+		taskDialogConfig.pszContent = va(gettext(L"The local %s game data is outdated, and needs to be updated. This will copy %s of data from the local disk, and download %s of data from the internet.\nDo you wish to continue?"), PRODUCT_NAME, FormatBytes(localSize), FormatBytes(remoteSize));
 	}
 	else
 	{
@@ -642,7 +731,10 @@ static bool ShowDownloadNotification(const std::vector<std::pair<GameCacheEntry,
 			{ 42, L"Close" }
 		};
 
-		taskDialogConfig.pszContent = va(gettext(L"DLC files are missing (or corrupted) in your game installation. Please update or verify the game using Steam or the Social Club launcher and try again. See http://rsg.ms/verify step 4 for more info."));
+		std::wstring badEntriesWide = ToWide(badEntries);
+
+		taskDialogConfig.pszMainInstruction = L"Game files missing";
+		taskDialogConfig.pszContent = va(gettext(L"DLC files are missing (or corrupted) in your game installation. Please update or verify the game using Steam, Epic Games Launcher or Rockstar Games Launcher and try again. See http://rsg.ms/verify step 4 for more info.\nCurrently, the game installation in '%s' is being used.\nRelevant files: \n%s"), MakeRelativeGamePath(L""), badEntriesWide.c_str());
 
 		taskDialogConfig.cButtons = 1;
 		taskDialogConfig.dwCommonButtons = 0;
@@ -664,17 +756,34 @@ static bool ShowDownloadNotification(const std::vector<std::pair<GameCacheEntry,
 
 	int outButton;
 
+#if defined(COMPILING_GLUE)
+	TaskDialogEmulated(&taskDialogConfig, &outButton, nullptr, nullptr);
+#else
 	TaskDialogIndirect(&taskDialogConfig, &outButton, nullptr, nullptr);
+#endif
 
 	return (outButton != IDNO && outButton != 42);
 }
 
-extern void StartIPFS();
+static void BumpDownloadCount(const std::shared_ptr<baseDownload>& download, const std::string& key)
+{
+	DWORD count = 0;
+	DWORD countLen = sizeof(count);
+	RegGetValueW(HKEY_CURRENT_USER, L"Software\\CitizenFX\\DownloadCount", ToWide(key).c_str(), RRF_RT_REG_DWORD, NULL, &count, &countLen);
+
+	++count;
+	download->count = count;
+
+	RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\CitizenFX\\DownloadCount", ToWide(key).c_str(), REG_DWORD, &count, sizeof(count));
+}
+
+#include "ZlibDecompressPlugin.h"
 
 static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 {
 	// create UI
 	UI_DoCreation();
+	CL_InitDownloadQueue();
 
 	// hash local files for those that *do* exist, add those that don't match to the download queue and add those that do match to be copied locally
 	std::set<std::string> referencedFiles; // remote URLs that we already requested
@@ -698,8 +807,43 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 		}
 	}
 
-	for (auto& entry : entries)
+	std::vector<std::tuple<DeltaEntry, GameCacheEntry>> theseDeltas;
+
+	for (const auto& baseEntry : entries)
 	{
+		auto entryPtr = &baseEntry;
+		const auto& deltaEntries = baseEntry.deltas;
+
+		// try to get the smallest local entry
+		GameCacheEntry newEntry("", {}, "", 0);
+
+		{
+			std::vector<std::tuple<int64_t, std::wstring>> presentDeltas;
+
+			for (const auto& deltaEntry : deltaEntries)
+			{
+				auto localName = baseEntry.GetCacheFileName(FormatHexString(deltaEntry.fromChecksum));
+
+				if (GetFileAttributesW(localName.c_str()) != INVALID_FILE_ATTRIBUTES)
+				{
+					presentDeltas.emplace_back(int64_t(deltaEntry.dlSize), localName);
+				}
+			}
+
+			if (!presentDeltas.empty())
+			{
+				std::sort(presentDeltas.begin(), presentDeltas.end());
+
+				newEntry = baseEntry;
+				newEntry.SetLocalName(std::get<1>(presentDeltas[0]));
+
+				entryPtr = &newEntry;
+			}
+		}
+
+		// continue on
+		const auto& entry = *entryPtr;
+
 		// check if the file is outdated
 		std::vector<std::array<uint8_t, 20>> hashes;
 
@@ -707,12 +851,18 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 		{
 			hashes.push_back(ParseHexString<20>(checksum));
 		}
+
+		for (auto& deltaEntry : deltaEntries)
+		{
+			hashes.push_back(deltaEntry.fromChecksum);
+		}
 		
 		std::array<uint8_t, 20> outHash;
 		bool fileOutdated = false;
 		
 		if (_strnicmp(entry.remotePath, "nope:", 5) != 0)
 		{
+			// does *not* start with nope: (manual download)
 			UI_UpdateText(0, gettext(L"Verifying game content...").c_str());
 
 			fileOutdated = CheckFileOutdatedWithUI(entry.GetLocalFileName().c_str(), hashes, &fileStart, fileTotal, &outHash);
@@ -754,15 +904,14 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 			}
 		}
 
-		std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
-
 		// if not, copy it from the local filesystem (we're abusing the download code here a lot)
 		if (!fileOutdated)
 		{
 			// should we 'nope' this file?
 			if (_strnicmp(entry.remotePath, "nope:", 5) == 0)
 			{
-				if (FILE* f = _wfopen(MakeRelativeCitPath(L"cache\\game\\cache.dat").c_str(), L"ab"))
+				// *does* start with nope:
+				if (FILE* f = _wfopen(MakeRelativeCitPath(L"data\\game-storage\\game_files.dat").c_str(), L"ab"))
 				{
 					auto hash = outHash;
 
@@ -777,9 +926,40 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 			}
 			else
 			{
-				CL_QueueDownload(va("file:///%s", converter.to_bytes(entry.GetLocalFileName()).c_str()), converter.to_bytes(entry.GetCacheFileName()).c_str(), entry.localSize, false);
+				if (outHash == hashes[0])
+				{
+					std::string escapedUrl;
 
-				notificationEntries.push_back({ entry, true });
+					{
+						auto curl = curl_easy_init();
+
+						char* escapedUrlRaw = curl_easy_escape(curl, ToNarrow(entry.GetLocalFileName()).c_str(), 0);
+						escapedUrl = escapedUrlRaw;
+
+						curl_free(escapedUrlRaw);
+						curl_easy_cleanup(curl);
+					}
+
+					CL_QueueDownload(va("file:///%s", escapedUrl), ToNarrow(entry.GetCacheFileName()).c_str(), entry.localSize, compressionAlgo_e::None);
+
+					notificationEntries.push_back({ entry, true });
+				}
+				else
+				{
+					for (auto& deltaEntry : deltaEntries)
+					{
+						if (outHash == deltaEntry.fromChecksum)
+						{
+							auto download = CL_QueueDownload(deltaEntry.remoteFile.c_str(), ToNarrow(deltaEntry.GetLocalFileName()).c_str(), deltaEntry.dlSize, compressionAlgo_e::None);
+							BumpDownloadCount(download, fmt::sprintf("%s_delta_%s", FormatHexString(deltaEntry.toChecksum), FormatHexString(deltaEntry.fromChecksum)));
+
+							notificationEntries.push_back({ deltaEntry.MakeEntry(), false });
+							theseDeltas.emplace_back(deltaEntry, entry);
+
+							break;
+						}
+					}
+				}
 			}
 		}
 		else
@@ -788,16 +968,17 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 			if (referencedFiles.find(entry.remotePath) == referencedFiles.end())
 			{
 				// download it from the rockstar service
-				std::string localFileName = (entry.archivedFile) ? converter.to_bytes(entry.GetRemoteBaseName()) : converter.to_bytes(entry.GetCacheFileName());
+				std::string localFileName = (entry.archivedFile) ? ToNarrow(entry.GetRemoteBaseName()) : ToNarrow(entry.GetCacheFileName());
 				const char* remotePath = entry.remotePath;
 
-				if (_strnicmp(remotePath, "http", 4) != 0 && _strnicmp(remotePath, "ipfs", 4) != 0)
+				if (_strnicmp(remotePath, "http", 4) != 0)
 				{
 					remotePath = va("rockstar:%s", entry.remotePath);
 				}
 
 				// if the file isn't of the original size
-				CL_QueueDownload(remotePath, localFileName.c_str(), entry.remoteSize, false);
+				auto download = CL_QueueDownload(remotePath, localFileName.c_str(), entry.remoteSize, ((entry.remoteSize != entry.localSize && !entry.archivedFile) ? compressionAlgo_e::XZ : compressionAlgo_e::None));
+				BumpDownloadCount(download, entry.checksums[0]);
 
 				referencedFiles.insert(entry.remotePath);
 
@@ -827,24 +1008,7 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 		return true;
 	}
 
-	// start IPFS
-	std::wstring fpath = MakeRelativeCitPath(L"CitizenFX.ini");
-
-	bool ipfsPeer = true;
-
-	if (GetFileAttributes(fpath.c_str()) != INVALID_FILE_ATTRIBUTES)
-	{
-		ipfsPeer = (GetPrivateProfileInt(L"Game", L"DisableIPFSPeer", 0, fpath.c_str()) != 1);
-	}
-
-	static HostSharedData<CfxState> initState("CfxInitState");
-
-	if (ipfsPeer && initState->IsMasterProcess())
-	{
-		StartIPFS();
-	}
-
-	UI_UpdateText(0, gettext(L"Updating game cache...").c_str());
+	UI_UpdateText(0, gettext(L"Updating game storage...").c_str());
 
 	bool retval = DL_RunLoop();
 
@@ -856,6 +1020,136 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 		{
 			return strcmp(left.remotePath, right.remotePath) < 0;
 		});
+
+		// apply deltas
+		if (!theseDeltas.empty())
+		{
+			for (auto& [ deltaEntry, entry ] : theseDeltas)
+			{
+				if (retval)
+				{
+					hpatch_TStreamInput oldFile;
+					hpatch_TStreamInput deltaFile;
+					hpatch_TStreamOutput outFile;
+
+					auto openRead = [](hpatch_TStreamInput* entry, const std::wstring& fn) 
+					{
+						entry->streamImport = nullptr;
+						FILE* f = _wfopen(fn.c_str(), L"rb");
+
+						if (!f)
+						{
+							return false;
+						}
+
+						_fseeki64(f, 0, SEEK_END);
+						entry->streamImport = (void*)f;
+						entry->streamSize = _ftelli64(f);
+
+						entry->read = [](const hpatch_TStreamInput* entry, hpatch_StreamPos_t at, uint8_t* begin, uint8_t* end) -> hpatch_BOOL {
+							auto size = end - begin;
+
+							FILE* f = (FILE*)entry->streamImport;
+							_fseeki64(f, at, SEEK_SET);
+
+							return (fread(begin, 1, size, f) == size);
+						};
+
+						return true;
+					};
+
+					UI_UpdateText(1, va(L"Patching %s", ToWide(entry.filename)));
+
+					auto outSize = entry.localSize;
+
+					auto openWrite = [outSize](hpatch_TStreamOutput* entry, const std::wstring& fn)
+					{
+						entry->streamImport = nullptr;
+						FILE* f = _wfopen(fn.c_str(), L"wb");
+
+						if (!f)
+						{
+							return false;
+						}
+
+						entry->streamImport = (void*)f;
+						entry->streamSize = outSize;
+						entry->read_writed = NULL;
+
+						static uint64_t numWritten;
+						numWritten = 0;
+
+						entry->write = [](const hpatch_TStreamOutput* entry, hpatch_StreamPos_t at, const uint8_t* begin, const uint8_t* end) -> hpatch_BOOL
+						{
+							auto size = end - begin;
+
+							FILE* f = (FILE*)entry->streamImport;
+							_fseeki64(f, at, SEEK_SET);
+
+							numWritten += size;
+
+							static auto ticks = 0;
+
+							if ((ticks % 400) == 0)
+							{
+								UI_UpdateProgress((numWritten / (double)entry->streamSize) * 100.0);
+
+								MSG msg;
+
+								// poll message loop
+								while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+								{
+									TranslateMessage(&msg);
+									DispatchMessage(&msg);
+								}
+							}
+
+							ticks++;
+
+							return (fwrite(begin, 1, size, f) == size);
+						};
+
+						return true;
+					};
+
+					auto doClose = [](auto* entry) 
+					{
+						if (entry->streamImport)
+						{
+							fclose((FILE*)entry->streamImport);
+							entry->streamImport = nullptr;
+						}
+					};
+
+					auto theFile = entry.GetCacheFileName();
+					auto tmpFile = theFile + L".tmp";
+
+					retval = retval && openRead(&oldFile, entry.GetLocalFileName());
+					retval = retval && openRead(&deltaFile, deltaEntry.GetLocalFileName());
+					retval = retval && openWrite(&outFile, tmpFile);
+
+					retval = retval && patch_decompress(&outFile, &oldFile, &deltaFile, &zlibDecompressPlugin);
+
+					doClose(&oldFile);
+					doClose(&deltaFile);
+					doClose(&outFile);
+
+					if (retval)
+					{
+						_wunlink(theFile.c_str());
+						_wrename(tmpFile.c_str(), theFile.c_str());
+					}
+					else
+					{
+						UI_DisplayError(va(L"Could not patch %s. Do you have enough free disk space on all drives? (~2 GB)", ToWide(entry.filename)));
+
+						_wunlink(tmpFile.c_str());
+					}
+
+					_wunlink(deltaEntry.GetLocalFileName().c_str());
+				}
+			}
+		}
 
 		// batch up entries per archive
 		if (!extractedEntries.empty())
@@ -990,7 +1284,7 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 					// append entries to cache storage if it succeeded
 					if (retval)
 					{
-						if (FILE* f = _wfopen(MakeRelativeCitPath(L"cache\\game\\cache.dat").c_str(), L"ab"))
+						if (FILE* f = _wfopen(MakeRelativeCitPath(L"data\\game-storage\\game_files.dat").c_str(), L"ab"))
 						{
 							for (auto& entry : lastEntries)
 							{
@@ -1036,31 +1330,470 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 
 #include <CrossBuildRuntime.h>
 
+#if defined(COMPILING_GLUE)
+extern int gameCacheTargetBuild;
+
+template<int Build>
+bool IsTargetGameBuild()
+{
+	return (gameCacheTargetBuild == Build);
+}
+
+template<int Build>
+bool IsTargetGameBuildOrGreater()
+{
+	return (gameCacheTargetBuild >= Build);
+}
+#else
+template<int Build>
+bool IsTargetGameBuild()
+{
+	return xbr::IsGameBuild<Build>();
+}
+
+template<int Build>
+bool IsTargetGameBuildOrGreater()
+{
+	return xbr::IsGameBuildOrGreater<Build>();
+}
+#endif
+
 std::map<std::string, std::string> UpdateGameCache()
 {
-	// 1604/1868 toggle
-#ifdef GTA_FIVE
-	if (Is372())
+#if defined(_M_AMD64)
+	std::vector<GameCacheEntry> launcherEntries;
+
+	launcherEntries = {
+		{ "launcher/api-ms-win-core-console-l1-1-0.dll", "724F4F91041AD595E365B724A0348C83ACF12BBB", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-console-l1-1-0.dll", 19208 },
+		{ "launcher/api-ms-win-core-datetime-l1-1-0.dll", "4940D5B92B6B80A40371F8DF073BF3EB406F5658", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-datetime-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-debug-l1-1-0.dll", "E7C8A6C29C3158F8B332EEA5C33C3B1E044B5F73", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-debug-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-errorhandling-l1-1-0.dll", "51CBB7BA47802DC630C2507750432C55F5979C27", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-errorhandling-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-file-l1-1-0.dll", "9ACBEEF0AC510C179B319CA69CD5378D0E70504D", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-file-l1-1-0.dll", 22280 },
+		{ "launcher/api-ms-win-core-file-l1-2-0.dll", "04669214375B25E2DC8A3635484E6EEB206BC4EB", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-file-l1-2-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-file-l2-1-0.dll", "402B7B8F8DCFD321B1D12FC85A1EE5137A5569B2", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-file-l2-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-handle-l1-1-0.dll", "A2E2A40CEA25EA4FD64B8DEAF4FBE4A2DB94107A", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-handle-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-heap-l1-1-0.dll", "B4310929CCB82DD3C3A779CAB68F1F9F368076F2", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-heap-l1-1-0.dll", 19208 },
+		{ "launcher/api-ms-win-core-interlocked-l1-1-0.dll", "F779CDEF9DED19402AA72958085213D6671CA572", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-interlocked-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-libraryloader-l1-1-0.dll", "47143A66B4A2E2BA019BF1FD07BCCA9CFB8BB117", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-libraryloader-l1-1-0.dll", 19720 },
+		{ "launcher/api-ms-win-core-localization-l1-2-0.dll", "9874398548891F6A08FC06437996F84EB7495783", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-localization-l1-2-0.dll", 21256 },
+		{ "launcher/api-ms-win-core-memory-l1-1-0.dll", "9C03356CF48112563BB845479F40BF27B293E95E", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-memory-l1-1-0.dll", 19208 },
+		{ "launcher/api-ms-win-core-namedpipe-l1-1-0.dll", "CB59F1FE73C17446EB196FC0DD7D944A0CD9D81F", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-namedpipe-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-processenvironment-l1-1-0.dll", "2745259F4DBBEFBF6B570EE36D224ABDB18719BC", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-processenvironment-l1-1-0.dll", 19720 },
+		{ "launcher/api-ms-win-core-processthreads-l1-1-0.dll", "50699041060D14576ED7BACBD44BE9AF80EB902A", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-processthreads-l1-1-0.dll", 20744 },
+		{ "launcher/api-ms-win-core-processthreads-l1-1-1.dll", "0BFFB9ED366853E7019452644D26E8E8F236241B", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-processthreads-l1-1-1.dll", 19208 },
+		{ "launcher/api-ms-win-core-profile-l1-1-0.dll", "E7E0B18A40A35BD8B0766AC72253DE827432E148", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-profile-l1-1-0.dll", 18184 },
+		{ "launcher/api-ms-win-core-rtlsupport-l1-1-0.dll", "24F37D46DFC0EF303EF04ABF9956241AF55D25C9", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-rtlsupport-l1-1-0.dll", 19208 },
+		{ "launcher/api-ms-win-core-string-l1-1-0.dll", "637E4A9946691F76E6DEB69BDC21C210921D6F07", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-string-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-synch-l1-1-0.dll", "5584C189216A17228CCA6CD07037AAA9A8603241", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-synch-l1-1-0.dll", 20744 },
+		{ "launcher/api-ms-win-core-synch-l1-2-0.dll", "A9AEBBBB73B7B846B051325D7572F2398F5986EE", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-synch-l1-2-0.dll", 19208 },
+		{ "launcher/api-ms-win-core-sysinfo-l1-1-0.dll", "F20AE25484A1C1B43748A1F0C422F48F092AD2C1", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-sysinfo-l1-1-0.dll", 19720 },
+		{ "launcher/api-ms-win-core-timezone-l1-1-0.dll", "4BF13DB65943E708690D6256D7DDD421CC1CC72B", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-timezone-l1-1-0.dll", 19208 },
+		{ "launcher/api-ms-win-core-util-l1-1-0.dll", "1E1A5AB47E4C2B3C32C81690B94954B7612BB493", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-util-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-crt-conio-l1-1-0.dll", "49002B58CB0DF2EE8D868DEC335133CF225657DF", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-conio-l1-1-0.dll", 19720 },
+		{ "launcher/api-ms-win-crt-convert-l1-1-0.dll", "C84E41FDCC4CA89A76AE683CB390A9B86500D3CA", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-convert-l1-1-0.dll", 22792 },
+		{ "launcher/api-ms-win-crt-environment-l1-1-0.dll", "9A4818897251CACB7FE1C6FE1BE3E854985186AD", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-environment-l1-1-0.dll", 19208 },
+		{ "launcher/api-ms-win-crt-filesystem-l1-1-0.dll", "78FA03C89EA12FF93FA499C38673039CC2D55D40", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-filesystem-l1-1-0.dll", 20744 },
+		{ "launcher/api-ms-win-crt-heap-l1-1-0.dll", "60B4CF246C5F414FC1CD12F506C41A1043D473EE", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-heap-l1-1-0.dll", 19720 },
+		{ "launcher/api-ms-win-crt-locale-l1-1-0.dll", "9C1DF49A8DBDC8496AC6057F886F5C17B2C39E3E", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-locale-l1-1-0.dll", 19208 },
+		{ "launcher/api-ms-win-crt-math-l1-1-0.dll", "8B35EC4676BD96C2C4508DC5F98CA471B22DEED7", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-math-l1-1-0.dll", 27912 },
+		{ "launcher/api-ms-win-crt-multibyte-l1-1-0.dll", "91EEF52C557AEFD0FDE27E8DF4E3C3B7F99862F2", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-multibyte-l1-1-0.dll", 26888 },
+		{ "launcher/api-ms-win-crt-private-l1-1-0.dll", "0C33CFE40EDD278A692C2E73E941184FD24286D9", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-private-l1-1-0.dll", 71432 },
+		{ "launcher/api-ms-win-crt-process-l1-1-0.dll", "EC96F7BEEAEC14D3B6C437B97B4A18A365534B9B", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-process-l1-1-0.dll", 19720 },
+		{ "launcher/api-ms-win-crt-runtime-l1-1-0.dll", "A19ACEFA3F95D1B565650FDBC40EF98C793358E9", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-runtime-l1-1-0.dll", 23304 },
+		{ "launcher/api-ms-win-crt-stdio-l1-1-0.dll", "982B5DA1C1F5B9D74AF6243885BCBA605D54DF8C", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-stdio-l1-1-0.dll", 24840 },
+		{ "launcher/api-ms-win-crt-string-l1-1-0.dll", "7F389E6F2D6E5BEB2A3BAF622A0C0EA24BC4DE60", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-string-l1-1-0.dll", 24840 },
+		{ "launcher/api-ms-win-crt-time-l1-1-0.dll", "EE815A158BAACB357D9E074C0755B6F6C286B625", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-time-l1-1-0.dll", 21256 },
+		{ "launcher/api-ms-win-crt-utility-l1-1-0.dll", "EAA07829D012206AC55FB1AF5CC6A35F341D22BE", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-utility-l1-1-0.dll", 19208 },
+		{ "launcher/Launcher.exe", "F259DE45C50F399D3E278FD39401EF51A3CC031A", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/Launcher.exe", 48490288 },
+		{ "launcher/Launcher.rpf", "237682874D921209CDBDB16E257C65A9480BAD94", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/Launcher.rpf", 858112 },
+		{ "launcher/LauncherPatcher.exe", "BFD3A153979C2CED11F6F8BFDBE767AD502F4655", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/LauncherPatcher.exe", 508208 },
+		{ "launcher/mtl_libovr.dll", "0FF4CEDA9DE3B63C4DE6E1626009D5ED5A475C96", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/mtl_libovr.dll", 178584 },
+		{ "launcher/offline.pak", "53F93E488AA5482C187641CE85164F7C5A1ED8B2", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/offline.pak", 1597382 },
+		{ "launcher/RockstarService.exe", "FCA2A3393CEDB7DE49C6ABAD69F2ACC7354DFD66", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/RockstarService.exe", 2017072 },
+		{ "launcher/RockstarSteamHelper.exe", "8E10781C248612A0F00A2BBFA828FC110978E751", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/RockstarSteamHelper.exe", 1063216 },
+		{ "launcher/ucrtbase.dll", "4189F4459C54E69C6D3155A82524BDA7549A75A6", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/ucrtbase.dll", 1016584 },
+		{ "launcher/ThirdParty/Epic/EOSSDK-Win64-Shipping-1.13.1.dll", "9176F6D58E46153342D7B065D279636DF8298603", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/ThirdParty/Epic/EOSSDK-Win64-Shipping-1.13.1.dll", 23390688 },
+		{ "launcher/ThirdParty/Epic/EOSSDK-Win64-Shipping.dll", "AF01787DDB7DE00239EDC62D33E0B20C0BE80037", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/ThirdParty/Epic/EOSSDK-Win64-Shipping.dll", 9971968 },
+		{ "launcher/ThirdParty/Steam/steam_api64.dll", "BD014660F7978A07BA2F99B6CF0621D678602663", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/ThirdParty/Steam/steam_api64.dll", 121256 }, 
+	};
+
+	for (const auto& entry : launcherEntries)
 	{
-		g_requiredEntries.push_back({ "GTA5.exe", "ae6e9cc116e8435e4dcfb5b870deee00a8b0904c", "https://runtime.fivem.net/patches/GTA_V_Patch_1_0_372_2.exe", "$/GTA5.exe", 55559560, 399999536 });
-		g_requiredEntries.push_back({ "update/update.rpf", "b72884c9af7170908f558ec5d629d805857b80f2", "https://runtime.fivem.net/patches/GTA_V_Patch_1_0_372_2.exe", "$/update/update.rpf", 352569344, 399999536 });
+		g_requiredEntries.push_back(entry);
 	}
-	else if (!Is2060())
+#endif
+
+#if defined(COMPILING_GLUE)
+	g_requiredEntries.clear();
+#endif
+
+	// cross-build toggle
+#ifdef GTA_FIVE
+	if (IsTargetGameBuild<3095>())
 	{
-		g_requiredEntries.push_back({ "GTA5.exe", "8939c8c71aa98ad7ca6ac773fae1463763c420d8", "https://runtime.fivem.net/patches/GTA_V_Patch_1_0_1604_0.exe", "$/GTA5.exe", 72484280, 1031302600 });
-		g_requiredEntries.push_back({ "update/update.rpf", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://runtime.fivem.net/patches/GTA_V_Patch_1_0_1604_0.exe", "$/update/update.rpf", 966805504, 1031302600 });
+		g_requiredEntries.push_back({ "GTA5.exe", "17a074bb8eaca5bd8df863de84869a4ab023e1eb", "https://content.cfx.re/mirrors/patches_fivem/3095/GTA5.exe", 49634800 });
+		g_requiredEntries.push_back({ "update/update.rpf", "fd46de4495d32f0533b8b3ae72507b829e8650f3", "https://content.cfx.re/mirrors/patches_fivem/3095/update.rpf", 1416300544,
+		{
+			{ "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "fd46de4495d32f0533b8b3ae72507b829e8650f3", "https://content.cfx.re/mirrors/patches_fivem/3095/diffs/from_1604_to_3095.update.rpf.hdiff", 923117905 } /* diff sha1: 1b22013721291d5bd65872bd9d179fc01a695fa3 */,
+			{ "736f1cb26e59167f302c22385463d231cce302d3", "fd46de4495d32f0533b8b3ae72507b829e8650f3", "https://content.cfx.re/mirrors/patches_fivem/3095/diffs/from_2060_to_3095.update.rpf.hdiff", 694772098 } /* diff sha1: e3e7071607195ebda498e945b07bc174caba90a5 */,
+			{ "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "fd46de4495d32f0533b8b3ae72507b829e8650f3", "https://content.cfx.re/mirrors/patches_fivem/3095/diffs/from_2189_to_3095.update.rpf.hdiff", 653422887 } /* diff sha1: 7b546f88560c86405cf43c7b4c5bc5c9d0bb4b50 */,
+			{ "1824cdbc27c3e0eaa86920a38751322727872831", "fd46de4495d32f0533b8b3ae72507b829e8650f3", "https://content.cfx.re/mirrors/patches_fivem/3095/diffs/from_2372_to_3095.update.rpf.hdiff", 636414267 } /* diff sha1: c04b08faa8eabbf161f4b7b27d44c114738d668c */,
+			{ "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "fd46de4495d32f0533b8b3ae72507b829e8650f3", "https://content.cfx.re/mirrors/patches_fivem/3095/diffs/from_2545_to_3095.update.rpf.hdiff", 496735908 } /* diff sha1: 4123b2c63d466ee53fb3b8f8e9306bdf44d2d08d */,
+			{ "80f9bd028e5bc781f641fe210a88579eff827989", "fd46de4495d32f0533b8b3ae72507b829e8650f3", "https://content.cfx.re/mirrors/patches_fivem/3095/diffs/from_2612_to_3095.update.rpf.hdiff", 496733750 } /* diff sha1: 53ee1f7b28816eed1f9899b7d09a6547ee9fbbb9 */,
+			{ "86d88c5ea36e67683a138c0e690c42fe288205fa", "fd46de4495d32f0533b8b3ae72507b829e8650f3", "https://content.cfx.re/mirrors/patches_fivem/3095/diffs/from_2699_to_3095.update.rpf.hdiff", 452905479 } /* diff sha1: 0932832b87a22c963165da8d9cf16b8faede1cd2 */,
+			{ "66388a381347511b7b28aaf91741615e45008e8b", "fd46de4495d32f0533b8b3ae72507b829e8650f3", "https://content.cfx.re/mirrors/patches_fivem/3095/diffs/from_2802_to_3095.update.rpf.hdiff", 386841388 } /* diff sha1: c11d4796c020236b173cb01eb99cade83d049319 */,
+			{ "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "fd46de4495d32f0533b8b3ae72507b829e8650f3", "https://content.cfx.re/mirrors/patches_fivem/3095/diffs/from_2944_to_3095.update.rpf.hdiff", 341954506 } /* diff sha1: 62e7153e824e585739105e3610f16b2518356e64 */
+		} });
+		g_requiredEntries.push_back({ "update/update2.rpf", "1c785e7b5cfe8331aad335b3f78952bc66b9fcb6", "https://content.cfx.re/mirrors/patches_fivem/3095/update2.rpf", 403945472,
+		{
+			{ "c993e2d14cce9462fa8ba056f3406d60050a1c92", "1c785e7b5cfe8331aad335b3f78952bc66b9fcb6", "https://content.cfx.re/mirrors/patches_fivem/3095/diffs/from_2612_to_3095.update2.rpf.hdiff", 333194048 } /* diff sha1: 7e3c826eb759abaa35b68c1be25fa6e673ad9802 */,
+			{ "414a04256bf0b00b78324478508a6beaea1ef5a7", "1c785e7b5cfe8331aad335b3f78952bc66b9fcb6", "https://content.cfx.re/mirrors/patches_fivem/3095/diffs/from_2699_to_3095.update2.rpf.hdiff", 331503702 } /* diff sha1: fc111e310931d769d8dfce514d1b567f261ddf40 */,
+			{ "c7de68bdc56ec4577bd4fce5d85cca9a4d529839", "1c785e7b5cfe8331aad335b3f78952bc66b9fcb6", "https://content.cfx.re/mirrors/patches_fivem/3095/diffs/from_2802_to_3095.update2.rpf.hdiff", 331190538 } /* diff sha1: 11683ea488d00b1e3e9bfb733fa9f032cee9b4b0 */,
+			{ "a3181d68a532950da5c584100b35f79eaca7c884", "1c785e7b5cfe8331aad335b3f78952bc66b9fcb6", "https://content.cfx.re/mirrors/patches_fivem/3095/diffs/from_2944_to_3095.update2.rpf.hdiff", 330911852 } /* diff sha1: b018bd07b4d4f3ff3670cd0523cdf2d9ef9466fb */
+		} });
+	}
+	else if (IsTargetGameBuild<2944>())
+	{
+		g_requiredEntries.push_back({ "GTA5.exe", "4d968a0754d59d30b29cd7b01a06e4685a5fa49c", "https://content.cfx.re/mirrors/patches_fivem/2944/GTA5.exe", 49828848 });
+		g_requiredEntries.push_back({ "update/update.rpf", "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "https://content.cfx.re/mirrors/patches_fivem/2944/update.rpf", 1087019008,
+		{
+			{ "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "https://content.cfx.re/mirrors/patches_fivem/2944/diffs/from_1604_to_2944.update.rpf.hdiff", 596587088 } /* diff sha1: 3de54ae4dc5a3d27a4e5621c7690d19f0f6fc432 */,
+			{ "736f1cb26e59167f302c22385463d231cce302d3", "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "https://content.cfx.re/mirrors/patches_fivem/2944/diffs/from_2060_to_2944.update.rpf.hdiff", 368280541 } /* diff sha1: 258f4ee6773872199f664e9c55f8243b0298c48d */,
+			{ "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "https://content.cfx.re/mirrors/patches_fivem/2944/diffs/from_2189_to_2944.update.rpf.hdiff", 326614727 } /* diff sha1: 1bea466fcccfc2b5275995b85786afc3a952a6e3 */,
+			{ "1824cdbc27c3e0eaa86920a38751322727872831", "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "https://content.cfx.re/mirrors/patches_fivem/2944/diffs/from_2372_to_2944.update.rpf.hdiff", 307384637 } /* diff sha1: 92d41ca77ab60a2de950da2f206a8469415f829b */,
+			{ "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "https://content.cfx.re/mirrors/patches_fivem/2944/diffs/from_2545_to_2944.update.rpf.hdiff", 166552358 } /* diff sha1: a20129a7d79d56dc57e477adcf69583f30188d88 */,
+			{ "80f9bd028e5bc781f641fe210a88579eff827989", "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "https://content.cfx.re/mirrors/patches_fivem/2944/diffs/from_2612_to_2944.update.rpf.hdiff", 166551505 } /* diff sha1: c65fad96304ee0205dd9efee508e04b53d50d895 */,
+			{ "86d88c5ea36e67683a138c0e690c42fe288205fa", "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "https://content.cfx.re/mirrors/patches_fivem/2944/diffs/from_2699_to_2944.update.rpf.hdiff", 121830364 } /* diff sha1: 3e3b0549f13e0debbc37cfab480a2b902316c199 */,
+			{ "66388a381347511b7b28aaf91741615e45008e8b", "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "https://content.cfx.re/mirrors/patches_fivem/2944/diffs/from_2802_to_2944.update.rpf.hdiff", 56081281 } /* diff sha1: eb75888e835e3ef58aa736cbb36747194b0eeea6 */,
+			{ "fd46de4495d32f0533b8b3ae72507b829e8650f3", "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "https://content.cfx.re/mirrors/patches_fivem/2944/diffs/from_3095_to_2944.update.rpf.hdiff", 15617655 } /* diff sha1: 5b98a4a7ff869b724d477d03b5b4bd7037468b74 */
+		} });
+		g_requiredEntries.push_back({ "update/update2.rpf", "a3181d68a532950da5c584100b35f79eaca7c884", "https://content.cfx.re/mirrors/patches_fivem/2944/update2.rpf", 352088064,
+		{
+			{ "c993e2d14cce9462fa8ba056f3406d60050a1c92", "a3181d68a532950da5c584100b35f79eaca7c884", "https://content.cfx.re/mirrors/patches_fivem/2944/diffs/from_2612_to_2944.update2.rpf.hdiff", 280860829 } /* diff sha1: 1ec47c39f3c5a504e7ca7d89221eea17335fa555 */,
+			{ "414a04256bf0b00b78324478508a6beaea1ef5a7", "a3181d68a532950da5c584100b35f79eaca7c884", "https://content.cfx.re/mirrors/patches_fivem/2944/diffs/from_2699_to_2944.update2.rpf.hdiff", 277845689 } /* diff sha1: 00c967b55a0d8c299bc265f0979541b3eb49bb8f */,
+			{ "c7de68bdc56ec4577bd4fce5d85cca9a4d529839", "a3181d68a532950da5c584100b35f79eaca7c884", "https://content.cfx.re/mirrors/patches_fivem/2944/diffs/from_2802_to_2944.update2.rpf.hdiff", 277310322 } /* diff sha1: 677514fc14030cdb8645b2b14bae383ba3a841df */,
+			{ "1c785e7b5cfe8331aad335b3f78952bc66b9fcb6", "a3181d68a532950da5c584100b35f79eaca7c884", "https://content.cfx.re/mirrors/patches_fivem/2944/diffs/from_3095_to_2944.update2.rpf.hdiff", 279052198 } /* diff sha1: a9155d4a892c21f9e1589c1b04ea7c53618e4d3e */
+		} });
+	}
+	else if (IsTargetGameBuild<2802>())
+	{
+		g_requiredEntries.push_back({ "GTA5.exe", "ebb6c144c5befe3529235deccbd8f59d6ce1a76c", "https://content.cfx.re/mirrors/patches_fivem/2802/GTA5.exe", 46709592 });
+		g_requiredEntries.push_back({ "update/update.rpf", "66388a381347511b7b28aaf91741615e45008e8b", "https://content.cfx.re/mirrors/patches_fivem/2802/update.rpf", 1079308288,
+		{
+			{ "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "66388a381347511b7b28aaf91741615e45008e8b", "https://content.cfx.re/mirrors/patches_fivem/2802/diffs/from_1604_to_2802.update.rpf.hdiff", 586455637 } /* diff sha1: 5acad3e7e9c44e87f886c8b554395b24a749fa21 */,
+			{ "736f1cb26e59167f302c22385463d231cce302d3", "66388a381347511b7b28aaf91741615e45008e8b", "https://content.cfx.re/mirrors/patches_fivem/2802/diffs/from_2060_to_2802.update.rpf.hdiff", 356615804 } /* diff sha1: cdd476afd0846a50821c5afde019f4e69cec4f9c */,
+			{ "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "66388a381347511b7b28aaf91741615e45008e8b", "https://content.cfx.re/mirrors/patches_fivem/2802/diffs/from_2189_to_2802.update.rpf.hdiff", 314177287 } /* diff sha1: be29acd02d02a7b18f8d1829e00a9d9e225b24ea */,
+			{ "1824cdbc27c3e0eaa86920a38751322727872831", "66388a381347511b7b28aaf91741615e45008e8b", "https://content.cfx.re/mirrors/patches_fivem/2802/diffs/from_2372_to_2802.update.rpf.hdiff", 294843255 } /* diff sha1: be53e3444cec1fe69b8b2d8afe8e509397d47ff3 */,
+			{ "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "66388a381347511b7b28aaf91741615e45008e8b", "https://content.cfx.re/mirrors/patches_fivem/2802/diffs/from_2545_to_2802.update.rpf.hdiff", 153796192 } /* diff sha1: d6e8425fab4b55118bcc3fbd94dfa6c70b17bf82 */,
+			{ "80f9bd028e5bc781f641fe210a88579eff827989", "66388a381347511b7b28aaf91741615e45008e8b", "https://content.cfx.re/mirrors/patches_fivem/2802/diffs/from_2612_to_2802.update.rpf.hdiff", 153795013 } /* diff sha1: 823f2df6a209a6a1dd5d06edcf74402868baedfc */,
+			{ "86d88c5ea36e67683a138c0e690c42fe288205fa", "66388a381347511b7b28aaf91741615e45008e8b", "https://content.cfx.re/mirrors/patches_fivem/2802/diffs/from_2699_to_2802.update.rpf.hdiff", 107750632 } /* diff sha1: ef20902617372028b4caac304b42d38a5d3eec8d */,
+			{ "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "66388a381347511b7b28aaf91741615e45008e8b", "https://content.cfx.re/mirrors/patches_fivem/2802/diffs/from_2944_to_2802.update.rpf.hdiff", 48422944 } /* diff sha1: 8baed7a1e37c6cc37be64e6ba5ebae246c2087dc */,
+			{ "fd46de4495d32f0533b8b3ae72507b829e8650f3", "66388a381347511b7b28aaf91741615e45008e8b", "https://content.cfx.re/mirrors/patches_fivem/2802/diffs/from_3095_to_2802.update.rpf.hdiff", 52843554 } /* diff sha1: 19a5a38d4cc02ec5b086dcd8999cd83bed81e145 */
+		} });
+		g_requiredEntries.push_back({ "update/update2.rpf", "c7de68bdc56ec4577bd4fce5d85cca9a4d529839", "https://content.cfx.re/mirrors/patches_fivem/2802/update2.rpf", 344610816,
+		{
+			{ "c993e2d14cce9462fa8ba056f3406d60050a1c92", "c7de68bdc56ec4577bd4fce5d85cca9a4d529839", "https://content.cfx.re/mirrors/patches_fivem/2802/diffs/from_2612_to_2802.update2.rpf.hdiff", 273248338 } /* diff sha1: 0f392e33b0270e1cdabbff1a30e21e172db2e592 */,
+			{ "414a04256bf0b00b78324478508a6beaea1ef5a7", "c7de68bdc56ec4577bd4fce5d85cca9a4d529839", "https://content.cfx.re/mirrors/patches_fivem/2802/diffs/from_2699_to_2802.update2.rpf.hdiff", 270218937 } /* diff sha1: 54bb6ba1f80437fd8a9742c25d1a1b5075d93f9f */,
+			{ "a3181d68a532950da5c584100b35f79eaca7c884", "c7de68bdc56ec4577bd4fce5d85cca9a4d529839", "https://content.cfx.re/mirrors/patches_fivem/2802/diffs/from_2944_to_2802.update2.rpf.hdiff", 269824187 } /* diff sha1: fc8d8fc5d8eac3cd48d6c7b03c4b6356816d2324 */,
+			{ "1c785e7b5cfe8331aad335b3f78952bc66b9fcb6", "c7de68bdc56ec4577bd4fce5d85cca9a4d529839", "https://content.cfx.re/mirrors/patches_fivem/2802/diffs/from_3095_to_2802.update2.rpf.hdiff", 271850052 } /* diff sha1: e4115d62fdd9f23df93d5daa718431a24883976a */
+		} });
+	}
+	else if (IsTargetGameBuild<2699>())
+	{
+		g_requiredEntries.push_back({ "GTA5.exe", "b9f3960ca0c7c05aab23d3b1d158309bc085fbbe", "https://content.cfx.re/mirrors/patches_fivem/2699/GTA5.exe", 61111680 });
+		g_requiredEntries.push_back({ "update/update.rpf", "86d88c5ea36e67683a138c0e690c42fe288205fa", "https://content.cfx.re/mirrors/patches_fivem/2699/update.rpf", 1073854464,
+		{
+			{ "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "86d88c5ea36e67683a138c0e690c42fe288205fa", "https://content.cfx.re/mirrors/patches_fivem/2699/diffs/from_1604_to_2699.update.rpf.hdiff", 577779656 } /* diff sha1: 00cd98e09e02b24a3dbfb52c272e3e78e945fc4e */,
+			{ "736f1cb26e59167f302c22385463d231cce302d3", "86d88c5ea36e67683a138c0e690c42fe288205fa", "https://content.cfx.re/mirrors/patches_fivem/2699/diffs/from_2060_to_2699.update.rpf.hdiff", 346805883 } /* diff sha1: 180cc0d3498dba3fb09118a670b2185ca8d324e6 */,
+			{ "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "86d88c5ea36e67683a138c0e690c42fe288205fa", "https://content.cfx.re/mirrors/patches_fivem/2699/diffs/from_2189_to_2699.update.rpf.hdiff", 304782654 } /* diff sha1: 1f33549326258481701e1c909e768d60cfdf6c9c */,
+			{ "1824cdbc27c3e0eaa86920a38751322727872831", "86d88c5ea36e67683a138c0e690c42fe288205fa", "https://content.cfx.re/mirrors/patches_fivem/2699/diffs/from_2372_to_2699.update.rpf.hdiff", 285467525 } /* diff sha1: e36f07ae02019e2f313d8f089a61a48b3545f556 */,
+			{ "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "86d88c5ea36e67683a138c0e690c42fe288205fa", "https://content.cfx.re/mirrors/patches_fivem/2699/diffs/from_2545_to_2699.update.rpf.hdiff", 144813901 } /* diff sha1: 997cba235f0925e686220200d7a6758b83784e73 */,
+			{ "80f9bd028e5bc781f641fe210a88579eff827989", "86d88c5ea36e67683a138c0e690c42fe288205fa", "https://content.cfx.re/mirrors/patches_fivem/2699/diffs/from_2612_to_2699.update.rpf.hdiff", 144812091 } /* diff sha1: e5636168e11f31204b6aa7bc26a2f29a15df2ea6 */,
+			{ "66388a381347511b7b28aaf91741615e45008e8b", "86d88c5ea36e67683a138c0e690c42fe288205fa", "https://content.cfx.re/mirrors/patches_fivem/2699/diffs/from_2802_to_2699.update.rpf.hdiff", 102324935 } /* diff sha1: 9e52c963dd498af0abe560241673e2e9963d917f */,
+			{ "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "86d88c5ea36e67683a138c0e690c42fe288205fa", "https://content.cfx.re/mirrors/patches_fivem/2699/diffs/from_2944_to_2699.update.rpf.hdiff", 108745603 } /* diff sha1: 590e601cbc82f332f7619b78dbb93a3d72d7c741 */,
+			{ "fd46de4495d32f0533b8b3ae72507b829e8650f3", "86d88c5ea36e67683a138c0e690c42fe288205fa", "https://content.cfx.re/mirrors/patches_fivem/2699/diffs/from_3095_to_2699.update.rpf.hdiff", 113480643 } /* diff sha1: f57949a6c14e71cfa119d7aacb128796c8fcd2e3 */
+		} });
+		g_requiredEntries.push_back({ "update/update2.rpf", "414a04256bf0b00b78324478508a6beaea1ef5a7", "https://content.cfx.re/mirrors/patches_fivem/2699/update2.rpf", 324530176,
+		{
+			{ "c993e2d14cce9462fa8ba056f3406d60050a1c92", "414a04256bf0b00b78324478508a6beaea1ef5a7", "https://content.cfx.re/mirrors/patches_fivem/2699/diffs/from_2612_to_2699.update2.rpf.hdiff", 252956098 } /* diff sha1: 6a8df16ec61595298907a9204272567a4c9e1a2f */,
+			{ "c7de68bdc56ec4577bd4fce5d85cca9a4d529839", "414a04256bf0b00b78324478508a6beaea1ef5a7", "https://content.cfx.re/mirrors/patches_fivem/2699/diffs/from_2802_to_2699.update2.rpf.hdiff", 250133852 } /* diff sha1: 547a19410dd0f7cb91816b028405cde27b4caa9a */,
+			{ "a3181d68a532950da5c584100b35f79eaca7c884", "414a04256bf0b00b78324478508a6beaea1ef5a7", "https://content.cfx.re/mirrors/patches_fivem/2699/diffs/from_2944_to_2699.update2.rpf.hdiff", 250283500 } /* diff sha1: 76f859c0f2bc7b7c38d1235ee70fc2baf50f6f98 */,
+			{ "1c785e7b5cfe8331aad335b3f78952bc66b9fcb6", "414a04256bf0b00b78324478508a6beaea1ef5a7", "https://content.cfx.re/mirrors/patches_fivem/2699/diffs/from_3095_to_2699.update2.rpf.hdiff", 252084865 } /* diff sha1: b574885cb096adfbf15bb776eac029bc5423add9 */
+		} });
+	}
+	else if (IsTargetGameBuild<2612>())
+	{
+		g_requiredEntries.push_back({ "GTA5.exe", "d423086fd7a7721b8be77cfb9a4f8826784b284b", "https://content.cfx.re/mirrors/patches_fivem/2612/GTA5.exe", 60351952 });
+		g_requiredEntries.push_back({ "update/update.rpf", "80f9bd028e5bc781f641fe210a88579eff827989", "https://content.cfx.re/mirrors/patches_fivem/2612/update.rpf", 1056649216,
+		{
+			{ "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "80f9bd028e5bc781f641fe210a88579eff827989", "https://content.cfx.re/mirrors/patches_fivem/2612/diffs/from_1604_to_2612.update.rpf.hdiff", 560353786 } /* diff sha1: 71780b7e6701c9efe313c8252345ab88df4f3734 */,
+			{ "736f1cb26e59167f302c22385463d231cce302d3", "80f9bd028e5bc781f641fe210a88579eff827989", "https://content.cfx.re/mirrors/patches_fivem/2612/diffs/from_2060_to_2612.update.rpf.hdiff", 330036916 } /* diff sha1: 9b67a7840d9c33a4354b168fb580876d1281d30a */,
+			{ "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "80f9bd028e5bc781f641fe210a88579eff827989", "https://content.cfx.re/mirrors/patches_fivem/2612/diffs/from_2189_to_2612.update.rpf.hdiff", 287033107 } /* diff sha1: 939717a2b3b3b4b25512b0eeb354cf557abc928a */,
+			{ "1824cdbc27c3e0eaa86920a38751322727872831", "80f9bd028e5bc781f641fe210a88579eff827989", "https://content.cfx.re/mirrors/patches_fivem/2612/diffs/from_2372_to_2612.update.rpf.hdiff", 266987849 } /* diff sha1: b1d38bb2ee75d5989201cfb58edcf2f841224c3d */,
+			{ "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "80f9bd028e5bc781f641fe210a88579eff827989", "https://content.cfx.re/mirrors/patches_fivem/2612/diffs/from_2545_to_2612.update.rpf.hdiff", 1840945 } /* diff sha1: 35c6b1e1edb8a73e8156bf6d19f3d5aaee5c01a2 */,
+			{ "86d88c5ea36e67683a138c0e690c42fe288205fa", "80f9bd028e5bc781f641fe210a88579eff827989", "https://content.cfx.re/mirrors/patches_fivem/2612/diffs/from_2699_to_2612.update.rpf.hdiff", 127701528 } /* diff sha1: fa76dab95d4b3a24c9670b1636bcb1fc38030364 */,
+			{ "66388a381347511b7b28aaf91741615e45008e8b", "80f9bd028e5bc781f641fe210a88579eff827989", "https://content.cfx.re/mirrors/patches_fivem/2612/diffs/from_2802_to_2612.update.rpf.hdiff", 131292485 } /* diff sha1: 586b0f78de285133a3234cea71ae87a29174b825 */,
+			{ "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "80f9bd028e5bc781f641fe210a88579eff827989", "https://content.cfx.re/mirrors/patches_fivem/2612/diffs/from_2944_to_2612.update.rpf.hdiff", 136386970 } /* diff sha1: 69a7f2dfa365deee03f273cd45edfef63887d414 */,
+			{ "fd46de4495d32f0533b8b3ae72507b829e8650f3", "80f9bd028e5bc781f641fe210a88579eff827989", "https://content.cfx.re/mirrors/patches_fivem/2612/diffs/from_3095_to_2612.update.rpf.hdiff", 140238453 } /* diff sha1: ec4226c26fe0ab951a064dafc8953d2cf7cd9071 */
+		} });
+		g_requiredEntries.push_back({ "update/update2.rpf", "c993e2d14cce9462fa8ba056f3406d60050a1c92", "https://content.cfx.re/mirrors/patches_fivem/2612/update2.rpf", 312209408,
+		{
+			{ "414a04256bf0b00b78324478508a6beaea1ef5a7", "c993e2d14cce9462fa8ba056f3406d60050a1c92", "https://content.cfx.re/mirrors/patches_fivem/2612/diffs/from_2699_to_2612.update2.rpf.hdiff", 240637812 } /* diff sha1: 847791743b223286abf5cee5ab7f773c895c95c6 */,
+			{ "c7de68bdc56ec4577bd4fce5d85cca9a4d529839", "c993e2d14cce9462fa8ba056f3406d60050a1c92", "https://content.cfx.re/mirrors/patches_fivem/2612/diffs/from_2802_to_2612.update2.rpf.hdiff", 240847147 } /* diff sha1: 34671a51615c1255de4095d47137d81da26a4adf */,
+			{ "a3181d68a532950da5c584100b35f79eaca7c884", "c993e2d14cce9462fa8ba056f3406d60050a1c92", "https://content.cfx.re/mirrors/patches_fivem/2612/diffs/from_2944_to_2612.update2.rpf.hdiff", 240982514 } /* diff sha1: 6bfe4bce142e697d83a039918f99eaf5d4ec3938 */,
+			{ "1c785e7b5cfe8331aad335b3f78952bc66b9fcb6", "c993e2d14cce9462fa8ba056f3406d60050a1c92", "https://content.cfx.re/mirrors/patches_fivem/2612/diffs/from_3095_to_2612.update2.rpf.hdiff", 241447960 } /* diff sha1: 4ea67e0f9fadbe27c3a8b9c7aace9fdfd7f1fc4c */
+		} });
+	}
+	else if (IsTargetGameBuild<2545>())
+	{
+		g_requiredEntries.push_back({ "GTA5.exe", "517556bb548880362c18d502361ce374070994c2", "https://content.cfx.re/mirrors/patches_fivem/2545/GTA5.exe", 59988376 });
+		g_requiredEntries.push_back({ "update/update.rpf", "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "https://content.cfx.re/mirrors/patches_fivem/2545/update.rpf", 1366638592,
+		{
+			{ "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "https://content.cfx.re/mirrors/patches_fivem/2545/diffs/from_1604_to_2545.update.rpf.hdiff", 804698938 } /* diff sha1: be441ec10c867d1a7e5af0bbdbfa5163ec4d620c */,
+			{ "736f1cb26e59167f302c22385463d231cce302d3", "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "https://content.cfx.re/mirrors/patches_fivem/2545/diffs/from_2060_to_2545.update.rpf.hdiff", 573692039 } /* diff sha1: a5c4796b5373c2a9a2273d8a344e27d80f6dcc69 */,
+			{ "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "https://content.cfx.re/mirrors/patches_fivem/2545/diffs/from_2189_to_2545.update.rpf.hdiff", 529825735 } /* diff sha1: 7436ea395e4de45d215a1c7098c48bd10d2364dd */,
+			{ "1824cdbc27c3e0eaa86920a38751322727872831", "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "https://content.cfx.re/mirrors/patches_fivem/2545/diffs/from_2372_to_2545.update.rpf.hdiff", 509055770 } /* diff sha1: 84c9a2bfcd86d994f5c9a8fa5087c9f4dc0d7c6d */,
+			{ "80f9bd028e5bc781f641fe210a88579eff827989", "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "https://content.cfx.re/mirrors/patches_fivem/2545/diffs/from_2612_to_2545.update.rpf.hdiff", 311774185 } /* diff sha1: 621c16a1d9a3be46c2663dde02bd58f1716c5445 */,
+			{ "86d88c5ea36e67683a138c0e690c42fe288205fa", "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "https://content.cfx.re/mirrors/patches_fivem/2545/diffs/from_2699_to_2545.update.rpf.hdiff", 437636032 } /* diff sha1: 1d52798a772db28de7020738ea6aef9b45112eb0 */,
+			{ "66388a381347511b7b28aaf91741615e45008e8b", "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "https://content.cfx.re/mirrors/patches_fivem/2545/diffs/from_2802_to_2545.update.rpf.hdiff", 441227939 } /* diff sha1: 23df563de60020ec4edb6192ab4925ae67af2ae6 */,
+			{ "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "https://content.cfx.re/mirrors/patches_fivem/2545/diffs/from_2944_to_2545.update.rpf.hdiff", 446324800 } /* diff sha1: 0eef4d6c08abd9834bf306ac4e172033bac0f694 */,
+			{ "fd46de4495d32f0533b8b3ae72507b829e8650f3", "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "https://content.cfx.re/mirrors/patches_fivem/2545/diffs/from_3095_to_2545.update.rpf.hdiff", 450172651 } /* diff sha1: 483f1b9d493818afe9fe32d01aa23d265b2f5cd7 */
+		} });
+	}
+	else if (IsTargetGameBuild<2372>())
+	{
+		g_requiredEntries.push_back({ "GTA5.exe", "470235e04299b02aa3aef834ef1ff834cac2327f", "https://content.cfx.re/mirrors/patches_fivem/2372/GTA5.exe", 59716912 });
+		g_requiredEntries.push_back({ "update/update.rpf", "1824cdbc27c3e0eaa86920a38751322727872831", "https://content.cfx.re/mirrors/patches_fivem/2372/update.rpf", 1132066816,
+		{
+			{ "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "1824cdbc27c3e0eaa86920a38751322727872831", "https://content.cfx.re/mirrors/patches_fivem/2372/diffs/from_1604_to_2372.update.rpf.hdiff", 562253582 } /* diff sha1: 49c8a15a9314e71b3931a2c7602f8cd9688fcbd2 */,
+			{ "736f1cb26e59167f302c22385463d231cce302d3", "1824cdbc27c3e0eaa86920a38751322727872831", "https://content.cfx.re/mirrors/patches_fivem/2372/diffs/from_2060_to_2372.update.rpf.hdiff", 329760934 } /* diff sha1: f3f6b96d648583e4427392ccf1df36cb1d435a3b */,
+			{ "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "1824cdbc27c3e0eaa86920a38751322727872831", "https://content.cfx.re/mirrors/patches_fivem/2372/diffs/from_2189_to_2372.update.rpf.hdiff", 284412077 } /* diff sha1: 5870dc5116a7039476da7d714939ac1ec2e5f010 */,
+			{ "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "1824cdbc27c3e0eaa86920a38751322727872831", "https://content.cfx.re/mirrors/patches_fivem/2372/diffs/from_2545_to_2372.update.rpf.hdiff", 276106385 } /* diff sha1: 81b60c9be8f749c7bdd2b4dc6d80bda3913045c0 */,
+			{ "80f9bd028e5bc781f641fe210a88579eff827989", "1824cdbc27c3e0eaa86920a38751322727872831", "https://content.cfx.re/mirrors/patches_fivem/2372/diffs/from_2612_to_2372.update.rpf.hdiff", 343976392 } /* diff sha1: 6d00a65b77838cab4c2cc64cd4fd3eb69f75725d */,
+			{ "86d88c5ea36e67683a138c0e690c42fe288205fa", "1824cdbc27c3e0eaa86920a38751322727872831", "https://content.cfx.re/mirrors/patches_fivem/2372/diffs/from_2699_to_2372.update.rpf.hdiff", 345348050 } /* diff sha1: cd5650fc698852250ab39855ad43c3edb59b5c05 */,
+			{ "66388a381347511b7b28aaf91741615e45008e8b", "1824cdbc27c3e0eaa86920a38751322727872831", "https://content.cfx.re/mirrors/patches_fivem/2372/diffs/from_2802_to_2372.update.rpf.hdiff", 349288020 } /* diff sha1: 2b83c01cbcfa112e62882159b7178527b3aaffe5 */,
+			{ "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "1824cdbc27c3e0eaa86920a38751322727872831", "https://content.cfx.re/mirrors/patches_fivem/2372/diffs/from_2944_to_2372.update.rpf.hdiff", 354164718 } /* diff sha1: 6699a31eb6be4b331d52383322079139aa2e8968 */,
+			{ "fd46de4495d32f0533b8b3ae72507b829e8650f3", "1824cdbc27c3e0eaa86920a38751322727872831", "https://content.cfx.re/mirrors/patches_fivem/2372/diffs/from_3095_to_2372.update.rpf.hdiff", 356862631 } /* diff sha1: 6aa88c4943d6e36071b9ede4bd9b9652b5f76d14 */
+		} });
+	}
+	else if (IsTargetGameBuild<2189>())
+	{
+		g_requiredEntries.push_back({ "GTA5.exe", "fcd5fd8a9f99f2e08b0cab5d500740f28a75b75a", "https://content.cfx.re/mirrors/patches_fivem/2189/GTA5.exe", 63124096 });
+		g_requiredEntries.push_back({ "update/update.rpf", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches_fivem/2189/update.rpf", 1276805120,
+		{
+			{ "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches_fivem/2189/diffs/from_1604_to_2189.update.rpf.hdiff", 562451691 } /* diff sha1: 16be09623e52097da007a166fba80921d7ce5863 */,
+			{ "736f1cb26e59167f302c22385463d231cce302d3", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches_fivem/2189/diffs/from_2060_to_2189.update.rpf.hdiff", 296656003 } /* diff sha1: d9e50da86b802e382b65bfa53a28648a92fe79d8 */,
+			{ "1824cdbc27c3e0eaa86920a38751322727872831", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches_fivem/2189/diffs/from_2372_to_2189.update.rpf.hdiff", 429153146 } /* diff sha1: 608466df488ba54851190d99d0bdc20160ff6815 */,
+			{ "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches_fivem/2189/diffs/from_2545_to_2189.update.rpf.hdiff", 441617306 } /* diff sha1: 3428f7544fd574acbb95c46b2889400f21e260b8 */,
+			{ "80f9bd028e5bc781f641fe210a88579eff827989", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches_fivem/2189/diffs/from_2612_to_2189.update.rpf.hdiff", 508757790 } /* diff sha1: 9b640d294575a5ddcf680c8aab0a019d3b33229d */,
+			{ "86d88c5ea36e67683a138c0e690c42fe288205fa", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches_fivem/2189/diffs/from_2699_to_2189.update.rpf.hdiff", 509396786 } /* diff sha1: bc5037ea0e7e80de9bae1d4d903d769b1bf0179b */,
+			{ "66388a381347511b7b28aaf91741615e45008e8b", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches_fivem/2189/diffs/from_2802_to_2189.update.rpf.hdiff", 513356064 } /* diff sha1: 0dbfc1422fe085d4654311358cf47204ae8360b9 */,
+			{ "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches_fivem/2189/diffs/from_2944_to_2189.update.rpf.hdiff", 518134363 } /* diff sha1: 23cb0ec2ad7aed1f58bd64ce37c1f7c1d7e590ad */,
+			{ "fd46de4495d32f0533b8b3ae72507b829e8650f3", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches_fivem/2189/diffs/from_3095_to_2189.update.rpf.hdiff", 518604133 } /* diff sha1: 73b7e835643658012708e6c280eb24c354fa2b0b */
+		} });
+	}
+	else if (IsTargetGameBuild<2060>())
+	{
+		g_requiredEntries.push_back({ "GTA5.exe", "741c8b91ef57140c023d8d29e38aab599759de76", "https://content.cfx.re/mirrors/patches_fivem/2060/GTA5.exe", 60589184 });
+		g_requiredEntries.push_back({ "update/update.rpf", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches_fivem/2060/update.rpf", 1229002752,
+		{
+			{ "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches_fivem/2060/diffs/from_1604_to_2060.update.rpf.hdiff", 512193764 } /* diff sha1: 67030f9da5c2d9be1e3187e3efcec1c02c8b2af4 */,
+			{ "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches_fivem/2060/diffs/from_2189_to_2060.update.rpf.hdiff", 249363428 } /* diff sha1: 7168f459a2f2a75e3fd253f6c1b5fe1cfa93e6db */,
+			{ "1824cdbc27c3e0eaa86920a38751322727872831", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches_fivem/2060/diffs/from_2372_to_2060.update.rpf.hdiff", 427205591 } /* diff sha1: 49344c636938b690173344c2e8210d8b12bbc296 */,
+			{ "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches_fivem/2060/diffs/from_2545_to_2060.update.rpf.hdiff", 438194552 } /* diff sha1: afe305848d46ac47c56a7c7d7e0f3089734bffe5 */,
+			{ "80f9bd028e5bc781f641fe210a88579eff827989", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches_fivem/2060/diffs/from_2612_to_2060.update.rpf.hdiff", 504469096 } /* diff sha1: a00b8440d3135267f4097932d34d043cc970d54f */,
+			{ "86d88c5ea36e67683a138c0e690c42fe288205fa", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches_fivem/2060/diffs/from_2699_to_2060.update.rpf.hdiff", 504126319 } /* diff sha1: 4c86479be22672bc3497c6da2a4a6151a568d122 */,
+			{ "66388a381347511b7b28aaf91741615e45008e8b", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches_fivem/2060/diffs/from_2802_to_2060.update.rpf.hdiff", 508501688 } /* diff sha1: 02d1f7276d1f93fcc204d7b7e1e31db7058a33ca */,
+			{ "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches_fivem/2060/diffs/from_2944_to_2060.update.rpf.hdiff", 512509365 } /* diff sha1: d69b4ba86899e0692217d4173ba1ba68f6816908 */,
+			{ "fd46de4495d32f0533b8b3ae72507b829e8650f3", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches_fivem/2060/diffs/from_3095_to_2060.update.rpf.hdiff", 512663221 } /* diff sha1: 8fccc8eecc4e44533eac1b8be577dc4260224ec2 */
+		} });
 	}
 	else
 	{
-		g_requiredEntries.push_back({ "GTA5.exe", "741c8b91ef57140c023d8d29e38aab599759de76", "https://mirrors.fivem.net/patches/2060.2/GTA5.exe", 60589184 });
-		g_requiredEntries.push_back({ "update/update.rpf", "736f1cb26e59167f302c22385463d231cce302d3", "https://mirrors.fivem.net/patches/2060.2/update.rpf", 1229002752 });
+		g_requiredEntries.push_back({ "GTA5.exe", "8939c8c71aa98ad7ca6ac773fae1463763c420d8", "https://content.cfx.re/mirrors/patches_fivem/1604/GTA5.exe", 72484280 });
+		g_requiredEntries.push_back({ "update/update.rpf", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches_fivem/1604/update.rpf", 966805504,
+		{
+			{ "736f1cb26e59167f302c22385463d231cce302d3", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches_fivem/1604/diffs/from_2060_to_1604.update.rpf.hdiff", 252578178 } /* diff sha1: a6b119525e18bb37cbf65b23d51317cd47177188 */,
+			{ "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches_fivem/1604/diffs/from_2189_to_1604.update.rpf.hdiff", 255544048 } /* diff sha1: 29d31e6a9d964662a490682b07ecd3ac7f776913 */,
+			{ "1824cdbc27c3e0eaa86920a38751322727872831", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches_fivem/1604/diffs/from_2372_to_1604.update.rpf.hdiff", 400087270 } /* diff sha1: ca3064d9bb8108b626e5e1b7c747c29cca597587 */,
+			{ "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches_fivem/1604/diffs/from_2545_to_1604.update.rpf.hdiff", 409505316 } /* diff sha1: 92998e2e6d977815f0a73137275119f7dda2a68c */,
+			{ "80f9bd028e5bc781f641fe210a88579eff827989", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches_fivem/1604/diffs/from_2612_to_1604.update.rpf.hdiff", 475094324 } /* diff sha1: 1982eb4530c60c9cdaef64c719d8383cd75954ee */,
+			{ "86d88c5ea36e67683a138c0e690c42fe288205fa", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches_fivem/1604/diffs/from_2699_to_1604.update.rpf.hdiff", 475411202 } /* diff sha1: 574d2f5f091ce6e59036fb74cf5ad785252e10af */,
+			{ "66388a381347511b7b28aaf91741615e45008e8b", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches_fivem/1604/diffs/from_2802_to_1604.update.rpf.hdiff", 478650625 } /* diff sha1: 8f8ad96b2939ddf43c9c014af3592a396330f4d4 */,
+			{ "abc628b0ae04e68f88e0581f3572d26dbaed84d2", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches_fivem/1604/diffs/from_2944_to_1604.update.rpf.hdiff", 481127813 } /* diff sha1: ed3677dc68d2c1db95a90b3fd184ef8ed1c82d0c */,
+			{ "fd46de4495d32f0533b8b3ae72507b829e8650f3", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches_fivem/1604/diffs/from_3095_to_1604.update.rpf.hdiff", 481316317 } /* diff sha1: 4cdcfc8e677169799861f5a97247bc7152d75768 */
+		} });
+	}
+
+	if (IsTargetGameBuildOrGreater<2060>())
+	{
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mpsum/dlc.rpf", "ffd81a2ce5741b38eae69e47132ddbfc5cfdf9f4", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 980621312 });
+	}
+
+	if (IsTargetGameBuildOrGreater<2189>())
+	{
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mpheist4/dlc.rpf", "1ddd73a584126793478c835efef9899a1c9d6fe7", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 3452489728 });
+
+		// 2215.0 DLC update
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/patchday24ng/dlc.rpf", "f1d3a69dc31f50dd7741dfe5495568af40da4191", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 384018432 });
+	}
+
+	if (IsTargetGameBuildOrGreater<2372>())
+	{
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mptuner/dlc.rpf", "7a7521b3396701f4fe8ae51347c6206c46306648", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 3482869760 });
+	}
+
+	if (IsTargetGameBuildOrGreater<2545>())
+	{
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mpsecurity/dlc.rpf", "27c8100da2537472ad012df036a95da08188d54a", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 1978963968 });
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mpsecurity/dlc1.rpf", "82f34009966d790a2987c70a2872a5658a71f198", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 1308874752 });
+	}
+
+	if (IsTargetGameBuildOrGreater<2612>())
+	{
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mpg9ec/dlc.rpf", "011114b746a4d5a830241a174b3e16eb2f63f224", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 1847296 });
+	}
+
+	if (IsTargetGameBuildOrGreater<2699>())
+	{
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mpsum2/dlc.rpf", "5cb63b0939a716e899fa1f514b73a14ca4b58129", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 1245167616 });
+	}
+
+	if (IsTargetGameBuildOrGreater<2802>())
+	{
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mpchristmas3/dlc.rpf", "500440406ee1aa825ce2371699b127fce460d9a2", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 1822871552 });
+	}
+
+	if (IsTargetGameBuildOrGreater<2944>())
+	{
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mp2023_01/dlc.rpf", "11519d20c34a5f34d06252078b41e28275dbc67b", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 809424896 });
+	}
+
+	if (IsTargetGameBuildOrGreater<3095>())
+	{
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mp2023_02/dlc.rpf", "a522fe3be01f730e24cc3f43b03b39135cd3b937", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 1605117952 });
+	}
+#elif IS_RDR3
+	if (IsTargetGameBuild<1491>())
+	{
+		g_requiredEntries.push_back({ "RDR2.exe", "25b4ccff61f7f1463bbac7dd44c0d2f28e1b458f", "https://content.cfx.re/mirrors/patches_redm/1491/RDR2.exe", 89004016 });
+		g_requiredEntries.push_back({ "appdata0_update.rpf", "142c6af7a64f2cae06a8f7ac7ad6ee74967afc49", "https://content.cfx.re/mirrors/patches_redm/1491/appdata0_update.rpf", 3164639,
+		{
+			{ "ba1d727a70fa1c204441c8e3768a1a40b02ef67f", "142c6af7a64f2cae06a8f7ac7ad6ee74967afc49", "https://content.cfx.re/mirrors/patches_redm/1491/diffs/from_1436_to_1491.appdata0_update.rpf.hdiff", 1099165 } /* diff sha1: ed4d2b8e1f3a1b1752a9167557bbcb160e5a680a */,
+			{ "307609c164e78adaf4e50e993328485e6264803f", "142c6af7a64f2cae06a8f7ac7ad6ee74967afc49", "https://content.cfx.re/mirrors/patches_redm/1491/diffs/from_1355_to_1491.appdata0_update.rpf.hdiff", 1827774 } /* diff sha1: 0258871d76a9ef416d47d238d4af3090cf6296b5 */,
+			{ "1715741785ce3c28adf9a78633e57f478229bb84", "142c6af7a64f2cae06a8f7ac7ad6ee74967afc49", "https://content.cfx.re/mirrors/patches_redm/1491/diffs/from_1311_to_1491.appdata0_update.rpf.hdiff", 1914087 } /* diff sha1: 8ffbc579612ce5cdbd6e1d86862ae4ff63deb979 */
+		} });
+		g_requiredEntries.push_back({ "shaders_x64.rpf", "f456cbaf70ff921f77279db5a901c6a6e5807e2e", "https://content.cfx.re/mirrors/patches_redm/1491/shaders_x64.rpf", 233917870,
+		{
+			{ "f4f06c18701d66958eb6f0ac243c8467033b864b", "f456cbaf70ff921f77279db5a901c6a6e5807e2e", "https://content.cfx.re/mirrors/patches_redm/1491/diffs/from_1436_to_1491.shaders_x64.rpf.hdiff", 285147 } /* diff sha1: 3aec8b17f202028d7ef23fdbddf0911ae1c3f8ad */,
+			{ "a7a45988a6067964214cc4b3af21797249817469", "f456cbaf70ff921f77279db5a901c6a6e5807e2e", "https://content.cfx.re/mirrors/patches_redm/1491/diffs/from_1355_to_1491.shaders_x64.rpf.hdiff", 4546650 } /* diff sha1: cad6c0efc38cdf58381ec71080d0921c5531dda9 */,
+			{ "77bad0ab74cd1ef7c646206ea12152449ec56cdf", "f456cbaf70ff921f77279db5a901c6a6e5807e2e", "https://content.cfx.re/mirrors/patches_redm/1491/diffs/from_1311_to_1491.shaders_x64.rpf.hdiff", 6375506 } /* diff sha1: a615c2a119dce538cfb8aeba7c1b0edd7f4d4fbf */
+		} });
+		g_requiredEntries.push_back({ "update_1.rpf", "601a4801f739540bebb2b3e141fda022901a7bd1", "https://content.cfx.re/mirrors/patches_redm/1491/update_1.rpf", 2833730538,
+		{
+			{ "9e62163f0383aa4eb30a02fa0f5628bbf4538543", "601a4801f739540bebb2b3e141fda022901a7bd1", "https://content.cfx.re/mirrors/patches_redm/1491/diffs/from_1436_to_1491.update_1.rpf.hdiff", 87208222 } /* diff sha1: 2f4ba62c7356e14ed9015a9d0ab1a576af44fa66 */
+		} });
+		g_requiredEntries.push_back({ "update_2.rpf", "6b3af948543e7a48013bdec930e8dd586be37266", "https://content.cfx.re/mirrors/patches_redm/1491/update_2.rpf", 152038510,
+		{
+			{ "87323b6d0e1c790972041a034a6f293eb774c84d", "6b3af948543e7a48013bdec930e8dd586be37266", "https://content.cfx.re/mirrors/patches_redm/1491/diffs/from_1436_to_1491.update_2.rpf.hdiff", 24379138 } /* diff sha1: 0d0d21be1a0cc54126458fb02191e337bd850f32 */
+		} });
+		g_requiredEntries.push_back({ "update_3.rpf", "9237da54d2267435fc7d7bf0f3ec054bbeea90a9", "https://content.cfx.re/mirrors/patches_redm/1491/update_3.rpf", 132370220,
+		{
+			{ "a2708ff55294d70bda198a1ff98c1f4b55b0c0df", "9237da54d2267435fc7d7bf0f3ec054bbeea90a9", "https://content.cfx.re/mirrors/patches_redm/1491/diffs/from_1436_to_1491.update_3.rpf.hdiff", 116111491 } /* diff sha1: f80844cdb7a26a286c4ecaa10a1d83c0ac6ce707 */
+		} });
+		g_requiredEntries.push_back({ "update_4.rpf", "503c8de5c16e26afdce502b9aedf1ae16a0e8730", "https://content.cfx.re/mirrors/patches_redm/1491/update_4.rpf", 2015025315,
+		{
+			{ "4ec55a211e7cb1d68c8fd471cfb049d7690fc9ee", "503c8de5c16e26afdce502b9aedf1ae16a0e8730", "https://content.cfx.re/mirrors/patches_redm/1491/diffs/from_1436_to_1491.update_4.rpf.hdiff", 19398840 } /* diff sha1: 4df0c3e51cdbc5b778037f363d8544fb2490b343 */
+		} });
+	}
+	else if (IsTargetGameBuild<1436>())
+	{
+		g_requiredEntries.push_back({ "RDR2.exe", "f998b4863b11793547c09c226ab884e1e26931f2", "https://content.cfx.re/mirrors/patches_redm/1436/RDR2.exe", 89104336 });
+		g_requiredEntries.push_back({ "appdata0_update.rpf", "ba1d727a70fa1c204441c8e3768a1a40b02ef67f", "https://content.cfx.re/mirrors/patches_redm/1436/appdata0_update.rpf", 3163551,
+		{
+			{ "307609c164e78adaf4e50e993328485e6264803f", "ba1d727a70fa1c204441c8e3768a1a40b02ef67f", "https://content.cfx.re/mirrors/patches_redm/1436/diffs/from_1355_to_1436.appdata0_update.rpf.hdiff", 1726590 } /* diff sha1: e5375671b7270be06fd55052f78e8afc95a8222d */,
+			{ "1715741785ce3c28adf9a78633e57f478229bb84", "ba1d727a70fa1c204441c8e3768a1a40b02ef67f", "https://content.cfx.re/mirrors/patches_redm/1436/diffs/from_1311_to_1436.appdata0_update.rpf.hdiff", 1785629 } /* diff sha1: 3dec92f13de7440fed0420ebe12522d9f0bcae9e */,
+			{ "142c6af7a64f2cae06a8f7ac7ad6ee74967afc49", "ba1d727a70fa1c204441c8e3768a1a40b02ef67f", "https://content.cfx.re/mirrors/patches_redm/1436/diffs/from_1491_to_1436.appdata0_update.rpf.hdiff", 1093833 } /* diff sha1: 1f81d526052eda00d14c1bf601f811c005c8f052 */
+		} });
+		g_requiredEntries.push_back({ "shaders_x64.rpf", "f4f06c18701d66958eb6f0ac243c8467033b864b", "https://content.cfx.re/mirrors/patches_redm/1436/shaders_x64.rpf", 233898030,
+		{
+			{ "a7a45988a6067964214cc4b3af21797249817469", "f4f06c18701d66958eb6f0ac243c8467033b864b", "https://content.cfx.re/mirrors/patches_redm/1436/diffs/from_1355_to_1436.shaders_x64.rpf.hdiff", 4332901 } /* diff sha1: 5b0ff40e1a76775461903fa9669c950ec0113e46 */,
+			{ "77bad0ab74cd1ef7c646206ea12152449ec56cdf", "f4f06c18701d66958eb6f0ac243c8467033b864b", "https://content.cfx.re/mirrors/patches_redm/1436/diffs/from_1311_to_1436.shaders_x64.rpf.hdiff", 6183735 } /* diff sha1: 22592c1a70552466d8f34c49484bf5475da399ae */,
+			{ "f456cbaf70ff921f77279db5a901c6a6e5807e2e", "f4f06c18701d66958eb6f0ac243c8467033b864b", "https://content.cfx.re/mirrors/patches_redm/1436/diffs/from_1491_to_1436.shaders_x64.rpf.hdiff", 265613 } /* diff sha1: 448dad13cdb90971890418041e38db9bc436cf3e */
+		} });
+		g_requiredEntries.push_back({ "update_1.rpf", "9e62163f0383aa4eb30a02fa0f5628bbf4538543", "https://content.cfx.re/mirrors/patches_redm/1436/update_1.rpf", 2836982634,
+		{
+			{ "601a4801f739540bebb2b3e141fda022901a7bd1", "9e62163f0383aa4eb30a02fa0f5628bbf4538543", "https://content.cfx.re/mirrors/patches_redm/1436/diffs/from_1491_to_1436.update_1.rpf.hdiff", 89907254 } /* diff sha1: f55dae6db48fd0dda668a3ab7bf45cd8a7601359 */
+		} });
+		g_requiredEntries.push_back({ "update_2.rpf", "87323b6d0e1c790972041a034a6f293eb774c84d", "https://content.cfx.re/mirrors/patches_redm/1436/update_2.rpf", 152008542,
+		{
+			{ "6b3af948543e7a48013bdec930e8dd586be37266", "87323b6d0e1c790972041a034a6f293eb774c84d", "https://content.cfx.re/mirrors/patches_redm/1436/diffs/from_1491_to_1436.update_2.rpf.hdiff", 24380905 } /* diff sha1: 0c65b20a6f577d14dd0f9733d03c657542a517c8 */
+		} });
+		g_requiredEntries.push_back({ "update_3.rpf", "a2708ff55294d70bda198a1ff98c1f4b55b0c0df", "https://content.cfx.re/mirrors/patches_redm/1436/update_3.rpf", 132374108,
+		{
+			{ "9237da54d2267435fc7d7bf0f3ec054bbeea90a9", "a2708ff55294d70bda198a1ff98c1f4b55b0c0df", "https://content.cfx.re/mirrors/patches_redm/1436/diffs/from_1491_to_1436.update_3.rpf.hdiff", 116090311 } /* diff sha1: 01695c3f9ba37b0c2e3f52aefae433452c3edc2a */
+		} });
+		g_requiredEntries.push_back({ "update_4.rpf", "4ec55a211e7cb1d68c8fd471cfb049d7690fc9ee", "https://content.cfx.re/mirrors/patches_redm/1436/update_4.rpf", 2014659811,
+		{
+			{ "503c8de5c16e26afdce502b9aedf1ae16a0e8730", "4ec55a211e7cb1d68c8fd471cfb049d7690fc9ee", "https://content.cfx.re/mirrors/patches_redm/1436/diffs/from_1491_to_1436.update_4.rpf.hdiff", 18944420 } /* diff sha1: 0f0ea25c6e763c834a0dbeec98773479af6ccaa2 */
+		} });
+	}
+	else if (IsTargetGameBuild<1355>())
+	{
+		g_requiredEntries.push_back({ "RDR2.exe", "c2fab1d25daef4779aafd2754ec9c593e674e7c3", "https://content.cfx.re/mirrors/patches_redm/1355/RDR2.exe", 84664448 });
+		g_requiredEntries.push_back({ "appdata0_update.rpf", "307609c164e78adaf4e50e993328485e6264803f", "https://content.cfx.re/mirrors/patches_redm/1355/appdata0_update.rpf", 3069247,
+		{
+			{ "142c6af7a64f2cae06a8f7ac7ad6ee74967afc49", "307609c164e78adaf4e50e993328485e6264803f", "https://content.cfx.re/mirrors/patches_redm/1355/diffs/from_1491_to_1355.appdata0_update.rpf.hdiff", 1740781 } /* diff sha1: e6683ad9aa9bd9ca302b07e324d73d20829ac2f1 */,
+			{ "ba1d727a70fa1c204441c8e3768a1a40b02ef67f", "307609c164e78adaf4e50e993328485e6264803f", "https://content.cfx.re/mirrors/patches_redm/1355/diffs/from_1436_to_1355.appdata0_update.rpf.hdiff", 1644378 } /* diff sha1: 24faaa60d4df3d109410d6b58286a1af0d880bba */,
+			{ "1715741785ce3c28adf9a78633e57f478229bb84", "307609c164e78adaf4e50e993328485e6264803f", "https://content.cfx.re/mirrors/patches_redm/1355/diffs/from_1311_to_1355.appdata0_update.rpf.hdiff", 1703692 } /* diff sha1: dbea61ab2e74c2c9c984a16c17233dcfde014af0 */
+		} });
+		g_requiredEntries.push_back({ "shaders_x64.rpf", "a7a45988a6067964214cc4b3af21797249817469", "https://content.cfx.re/mirrors/patches_redm/1355/shaders_x64.rpf", 233585710,
+		{
+			{ "f456cbaf70ff921f77279db5a901c6a6e5807e2e", "a7a45988a6067964214cc4b3af21797249817469", "https://content.cfx.re/mirrors/patches_redm/1355/diffs/from_1491_to_1355.shaders_x64.rpf.hdiff", 4369953 } /* diff sha1: dc67cb46f136f6b028d5c27872256c3bba5e3788 */,
+			{ "f4f06c18701d66958eb6f0ac243c8467033b864b", "a7a45988a6067964214cc4b3af21797249817469", "https://content.cfx.re/mirrors/patches_redm/1355/diffs/from_1436_to_1355.shaders_x64.rpf.hdiff", 4184409 } /* diff sha1: 75ccc162577c4366e151b1b373b2d72ba871ae80 */,
+			{ "77bad0ab74cd1ef7c646206ea12152449ec56cdf", "a7a45988a6067964214cc4b3af21797249817469", "https://content.cfx.re/mirrors/patches_redm/1355/diffs/from_1311_to_1355.shaders_x64.rpf.hdiff", 1875463 } /* diff sha1: ac5fd94f61158f73719290a79e59bb84050ab5dc */
+		} });
+		g_requiredEntries.push_back({ "update.rpf", "5a087ef32e6b30b4fde8bbeda7babc45f2c1cf4d", "https://content.cfx.re/mirrors/patches_redm/1355/update.rpf", 4685758145,
+		{
+			{ "835a767055cfbf2c2ad86cf4462c7dfb931970fd", "5a087ef32e6b30b4fde8bbeda7babc45f2c1cf4d", "https://content.cfx.re/mirrors/patches_redm/1355/diffs/from_1311_to_1355.update.rpf.hdiff", 1513512317 } /* diff sha1: b528f92872385a37302e367de67d9938de918d33 */
+		} });
+	}
+	else
+	{
+		g_requiredEntries.push_back({ "RDR2.exe", "ac3c2abd80bfa949279d8e1d32105a3d9345c6c8", "https://content.cfx.re/mirrors/patches_redm/1311/RDR2.exe", 91439232 });
+		g_requiredEntries.push_back({ "appdata0_update.rpf", "1715741785ce3c28adf9a78633e57f478229bb84", "https://content.cfx.re/mirrors/patches_redm/1311/appdata0_update.rpf", 3003087,
+		{
+			{ "142c6af7a64f2cae06a8f7ac7ad6ee74967afc49", "1715741785ce3c28adf9a78633e57f478229bb84", "https://content.cfx.re/mirrors/patches_redm/1311/diffs/from_1491_to_1311.appdata0_update.rpf.hdiff", 1774323 } /* diff sha1: c06f3cc14eb80628aea0baecdcb510ec027bf80e */,
+			{ "ba1d727a70fa1c204441c8e3768a1a40b02ef67f", "1715741785ce3c28adf9a78633e57f478229bb84", "https://content.cfx.re/mirrors/patches_redm/1311/diffs/from_1436_to_1311.appdata0_update.rpf.hdiff", 1650802 } /* diff sha1: 35291b0d0e2fa862d4a1c52deb954f7a1a182627 */,
+			{ "307609c164e78adaf4e50e993328485e6264803f", "1715741785ce3c28adf9a78633e57f478229bb84", "https://content.cfx.re/mirrors/patches_redm/1311/diffs/from_1355_to_1311.appdata0_update.rpf.hdiff", 1624654 } /* diff sha1: ebd5f32406de1195d5c02482eb036b78060077f3 */
+		} });
+		g_requiredEntries.push_back({ "shaders_x64.rpf", "77bad0ab74cd1ef7c646206ea12152449ec56cdf", "https://content.cfx.re/mirrors/patches_redm/1311/shaders_x64.rpf", 233487310,
+		{
+			{ "f456cbaf70ff921f77279db5a901c6a6e5807e2e", "77bad0ab74cd1ef7c646206ea12152449ec56cdf", "https://content.cfx.re/mirrors/patches_redm/1311/diffs/from_1491_to_1311.shaders_x64.rpf.hdiff", 6142857 } /* diff sha1: 635021d0b676de04b6ebf30fc3ceda54ca58530a */,
+			{ "f4f06c18701d66958eb6f0ac243c8467033b864b", "77bad0ab74cd1ef7c646206ea12152449ec56cdf", "https://content.cfx.re/mirrors/patches_redm/1311/diffs/from_1436_to_1311.shaders_x64.rpf.hdiff", 5981861 } /* diff sha1: bf0116bd17de03b8eac05ac29c74b0a604ce58c6 */,
+			{ "a7a45988a6067964214cc4b3af21797249817469", "77bad0ab74cd1ef7c646206ea12152449ec56cdf", "https://content.cfx.re/mirrors/patches_redm/1311/diffs/from_1355_to_1311.shaders_x64.rpf.hdiff", 1817785 } /* diff sha1: 4865ba920795b6bcc9724e2e6312beb69fafd4b2 */
+		} });
+		g_requiredEntries.push_back({ "update.rpf", "835a767055cfbf2c2ad86cf4462c7dfb931970fd", "https://content.cfx.re/mirrors/patches_redm/1311/update.rpf", 3515071792,
+		{
+			{ "5a087ef32e6b30b4fde8bbeda7babc45f2c1cf4d", "835a767055cfbf2c2ad86cf4462c7dfb931970fd", "https://content.cfx.re/mirrors/patches_redm/1311/diffs/from_1355_to_1311.update.rpf.hdiff", 354416250 } /* diff sha1: 63abb47155024cffdf6fb86d17162c44880a5b57 */
+		} });
+	}
+
+	if (IsTargetGameBuild<1355>())
+	{
+		g_requiredEntries.push_back({ "x64/dlcpacks/mp008/dlc.rpf", "66a50ed07293b92466423e1db5eed159551d8c25", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 487150980 });
+	}
+
+	if (IsTargetGameBuild<1436>() || IsTargetGameBuild<1491>())
+	{
+		g_requiredEntries.push_back({ "x64/dlcpacks/mp009/dlc.rpf", "7ae2012968709d6d1079c88ee40369f4359778bf", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 494360763 });
 	}
 #endif
 
 	// delete bad migration on 2019-01-10 (incorrect update.rpf download URL caused Steam users to fetch 1493.1 instead of 1604.0)
 	{
-		auto dataPath = MakeRelativeCitPath(L"cache\\game\\cache.dat");
-		auto failPath = MakeRelativeCitPath(L"cache\\game\\update+update.rpf_fc941d698834e30e40a06a40f6a35b1b18e1c50c");
+		auto dataPath = MakeRelativeCitPath(L"data\\game-storage\\game_files.dat");
+		auto failPath = MakeRelativeCitPath(L"data\\game-storage\\update+update.rpf_fc941d698834e30e40a06a40f6a35b1b18e1c50c");
 
 		struct _stat64i32 statData;
 		if (_wstat(failPath.c_str(), &statData) == 0)
@@ -1073,7 +1806,48 @@ std::map<std::string, std::string> UpdateGameCache()
 		}
 	}
 
-#ifdef LAUNCHER_PERSONALITY_MAIN
+#if defined(LAUNCHER_PERSONALITY_MAIN) || defined(COMPILING_GLUE)
+	// check the game executable(s)
+	for (auto& entry : g_requiredEntries)
+	{
+		// if it's a root-directory .exe
+		if (entry.filename && strstr(entry.filename, ".exe") && !strstr(entry.filename, "/"))
+		{
+			auto cacheName = entry.GetCacheFileName();
+
+			if (auto f = _wfopen(cacheName.c_str(), L"rb"); f)
+			{
+				SHA_CTX ctx;
+				SHA1_Init(&ctx);
+
+				uint8_t buffer[32768];
+
+				while (!feof(f))
+				{
+					int read = fread(buffer, 1, sizeof(buffer), f);
+					assert(read >= 0);
+
+					SHA1_Update(&ctx, buffer, read);
+				}
+
+				fclose(f);
+
+				uint8_t hash[20];
+				SHA1_Final(hash, &ctx);
+
+				auto origCheck = ParseHexString<20>(entry.checksums[0]);
+				if (memcmp(hash, origCheck.data(), 20) != 0)
+				{
+					// delete both the cache metadata and the corrupted file itself
+					auto dataPath = MakeRelativeCitPath(L"data\\game-storage\\game_files.dat");
+
+					_wunlink(dataPath.c_str());
+					_wunlink(cacheName.c_str());
+				}
+			}
+		}
+	}
+
 	// perform a game update
 	auto differences = CompareCacheDifferences();
 
@@ -1088,15 +1862,14 @@ std::map<std::string, std::string> UpdateGameCache()
 
 	// get a list of cache files that should be mapped given an updated cache
 	std::map<std::string, std::string> retval;
-	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
 
 	for (auto& entry : g_requiredEntries)
 	{
 		std::string origFileName = entry.filename;
 
-		if (origFileName.find("ros_2034/") == 0 || origFileName.find("ros_1241/") == 0)
+		if (origFileName.find("ros_") == 0)
 		{
-			origFileName = "Social Club/" + origFileName.substr(9);
+			origFileName = "Social Club/" + origFileName.substr(origFileName.find_first_of("/\\") + 1);
 		}
 
 		if (origFileName.find("launcher/") == 0)
@@ -1106,7 +1879,7 @@ std::map<std::string, std::string> UpdateGameCache()
 
 		if (GetFileAttributes(entry.GetCacheFileName().c_str()) != INVALID_FILE_ATTRIBUTES)
 		{
-			retval.insert({ origFileName, converter.to_bytes(entry.GetCacheFileName()) });
+			retval.insert({ origFileName, ToNarrow(entry.GetCacheFileName()) });
 		}
 	}
 

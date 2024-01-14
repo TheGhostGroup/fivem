@@ -24,6 +24,9 @@ static __declspec(thread) MumbleClient* g_currentMumbleClient;
 
 using namespace std::chrono_literals;
 
+constexpr const auto kUDPTimeout = 10000ms;
+constexpr const auto kUDPPingInterval = 1000ms;
+
 inline std::chrono::milliseconds msec()
 {
 	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now().time_since_epoch());
@@ -42,8 +45,42 @@ void MumbleClient::Initialize()
 
 	m_loop->EnqueueCallback([this]()
 	{
+		auto recreateUDP = [this]()
+		{
+			// if reconnecting, close the existing UDP handle so that servers that try to match source IP/port pairs won't be unhappy
+			if (m_udp)
+			{
+				auto udp = std::move(m_udp);
+
+				udp->once<uvw::CloseEvent>([udp](const uvw::CloseEvent& ev, uvw::UDPHandle& self)
+				{
+					(void)udp;
+				});
+
+				udp->close();
+			}
+
+			m_udp = m_loop->Get()->resource<uvw::UDPHandle>();
+
+			m_udp->on<uvw::UDPDataEvent>([this](const uvw::UDPDataEvent& ev, uvw::UDPHandle& udp)
+			{
+				std::unique_lock<std::recursive_mutex> lock(m_clientMutex);
+
+				try
+				{
+					HandleUDP(reinterpret_cast<const uint8_t*>(ev.data.get()), ev.length);
+				}
+				catch (std::exception& e)
+				{
+					trace("Mumble exception: %s\n", e.what());
+				}
+			});
+
+			m_udp->recv();
+		};
+
 		m_connectTimer = m_loop->Get()->resource<uvw::TimerHandle>();
-		m_connectTimer->on<uvw::TimerEvent>([this](const uvw::TimerEvent& ev, uvw::TimerHandle& t)
+		m_connectTimer->on<uvw::TimerEvent>([this, recreateUDP](const uvw::TimerEvent& ev, uvw::TimerHandle& t)
 		{
 			if (m_connectionInfo.isConnecting)
 			{
@@ -60,6 +97,10 @@ void MumbleClient::Initialize()
 
 			m_tcp = m_loop->Get()->resource<uvw::TCPHandle>();
 
+			// this is real-time audio, we don't want nagling
+			m_tcp->noDelay(true);
+			m_tcp->keepAlive(true);
+
 			m_tcp->on<uvw::ConnectEvent>([this](const uvw::ConnectEvent& ev, uvw::TCPHandle& tcp)
 			{
 				m_handler.Reset();
@@ -74,6 +115,7 @@ void MumbleClient::Initialize()
 
 					m_tcp->read();
 
+					std::unique_lock lock(m_clientMutex);
 					m_tlsClient = std::make_shared<Botan::TLS::Client>(*this,
 						*(m_sessionManager.get()),
 						*(m_credentials.get()),
@@ -119,7 +161,7 @@ void MumbleClient::Initialize()
 				{
 					if (ev.length > 0)
 					{
-						std::unique_lock<std::recursive_mutex> lock(m_clientMutex);
+						std::unique_lock lock(m_clientMutex);
 						m_tlsClient->received_data(reinterpret_cast<uint8_t*>(ev.data.get()), ev.length);
 					}
 				}
@@ -129,26 +171,7 @@ void MumbleClient::Initialize()
 				}
 			});
 
-			if (!m_udp)
-			{
-				m_udp = m_loop->Get()->resource<uvw::UDPHandle>();
-
-				m_udp->on<uvw::UDPDataEvent>([this](const uvw::UDPDataEvent& ev, uvw::UDPHandle& udp)
-				{
-					std::unique_lock<std::recursive_mutex> lock(m_clientMutex);
-
-					try
-					{
-						HandleUDP(reinterpret_cast<const uint8_t*>(ev.data.get()), ev.length);
-					}
-					catch (std::exception& e)
-					{
-						trace("Mumble exception: %s\n", e.what());
-					}
-				});
-
-				m_udp->recv();
-			}
+			recreateUDP();
 
 			const auto& address = m_connectionInfo.address;
 			m_tcp->connect(*address.GetSocketAddress());
@@ -158,12 +181,46 @@ void MumbleClient::Initialize()
 		});
 
 		m_idleTimer = m_loop->Get()->resource<uvw::TimerHandle>();
-		m_idleTimer->on<uvw::TimerEvent>([this](const uvw::TimerEvent& ev, uvw::TimerHandle& t)
+		m_idleTimer->on<uvw::TimerEvent>([this, recreateUDP](const uvw::TimerEvent& ev, uvw::TimerHandle& t)
 		{
-			if (m_tlsClient && m_tlsClient->is_active() && m_connectionInfo.isConnected)
+			static bool hadUDP = false;
+			static bool warnedUDP = false;
+			bool hasUDP = ((msec() - m_lastUdp) <= kUDPTimeout);
+			
+			if (hasUDP && !hadUDP)
 			{
-				std::lock_guard<std::recursive_mutex> l(m_clientMutex);
+				if (warnedUDP)
+				{
+					console::Printf("mumble", "UDP packets can be received. Switching to UDP mode.\n");
+				}
 
+				warnedUDP = true;
+				hadUDP = true;
+			}
+			else if (!hasUDP && hadUDP)
+			{
+				if (warnedUDP)
+				{
+					console::PrintWarning("mumble", "UDP packets can *not* be received. Switching to TCP tunnel mode.\n");
+				}
+
+				warnedUDP = true;
+				hadUDP = false;
+
+				// try to recreate UDP if need be
+				recreateUDP();
+			}
+
+			auto lockedIsActive = [this]()
+			{
+				std::unique_lock _(m_clientMutex);
+				bool active = m_tlsClient && m_tlsClient->is_active() && m_connectionInfo.isConnected;
+
+				return std::make_tuple(std::move(_), active);
+			};
+
+			if (auto [lock, active] = lockedIsActive(); active)
+			{
 				if (m_curManualChannel != m_lastManualChannel && !m_state.GetChannels().empty())
 				{
 					// check if the channel already exists
@@ -355,10 +412,10 @@ void MumbleClient::Initialize()
 						SendUDP(pingBuf, pds.size());
 					}
 
-					m_nextPing = msec() + 2500ms;
+					m_nextPing = msec() + kUDPPingInterval;
 				}
 			}
-			else
+			else if (m_connectionInfo.address.GetAddressFamily() != 0)
 			{
 				console::DPrintf("Mumble", "Reconnecting.\n");
 
@@ -380,7 +437,14 @@ concurrency::task<MumbleConnectionInfo*> MumbleClient::ConnectAsync(const net::P
 	m_connectionInfo.address = address;
 	m_connectionInfo.username = userName;
 
-	m_curManualChannel = "Root";
+	if (m_curManualChannel.empty())
+	{
+		m_curManualChannel = "Root";
+	}
+	else
+	{
+		m_lastManualChannel = "Root";
+	}
 
 	m_tcpPingAverage = 0.0f;
 	m_tcpPingVariance = 0.0f;
@@ -406,22 +470,49 @@ concurrency::task<MumbleConnectionInfo*> MumbleClient::ConnectAsync(const net::P
 
 concurrency::task<void> MumbleClient::DisconnectAsync()
 {
-	if (m_tlsClient)
 	{
-		m_tlsClient->close();
+		std::unique_lock lock(m_clientMutex);
+
+		if (m_tlsClient)
+		{
+			m_tlsClient->close();
+		}
 	}
 
-	m_loop->EnqueueCallback([this]()
+	auto tcs = concurrency::task_completion_event<void>{};
+
+	m_loop->EnqueueCallback([this, tcs]()
 	{
 		if (m_idleTimer)
 		{
 			m_idleTimer->stop();
 		}
+
+		if (m_connectTimer)
+		{
+			m_connectTimer->stop();
+		}
+
+		if (m_tcp)
+		{
+			m_tcp->once<uvw::CloseEvent>([this, tcs](const uvw::CloseEvent& e, uvw::TCPHandle& h)
+			{
+				tcs.set();
+				m_tcp = {};
+			});
+
+			m_tcp->shutdown();
+			m_tcp->close();
+		}
+		else
+		{
+			tcs.set();
+		}
 	});
 
 	m_connectionInfo = {};
 
-	return concurrency::task_from_result();
+	return concurrency::task<void>(tcs);
 }
 
 void MumbleClient::SetActivationMode(MumbleActivationMode mode)
@@ -505,6 +596,16 @@ void MumbleClient::SetAudioDistance(float distance)
 	m_audioOutput.SetDistance(distance);
 }
 
+void MumbleClient::SetAudioInputDistance(float distance)
+{
+	m_audioInput.SetDistance(distance);
+}
+
+void MumbleClient::SetAudioOutputDistance(float distance)
+{
+	m_audioOutput.SetDistance(distance);
+}
+
 float MumbleClient::GetAudioDistance()
 {
 	return m_audioOutput.GetDistance();
@@ -562,24 +663,31 @@ std::wstring MumbleClient::GetPlayerNameFromServerId(uint32_t serverId)
 	return retName;
 }
 
-uint32_t MumbleClient::GetVoiceChannelFromServerId(uint32_t serverId)
+std::string MumbleClient::GetVoiceChannelFromServerId(uint32_t serverId)
 {
-	uint32_t retId = -1;
+	std::string retString = "";
 
-	m_state.ForAllUsers([serverId, &retId](const std::shared_ptr<MumbleUser>& user)
+	m_state.ForAllUsers([this, serverId, &retString](const std::shared_ptr<MumbleUser>& user)
 	{
-		if (retId != -1)
+		if (!retString.empty())
 		{
 			return;
 		}
 
 		if (user && user->GetServerId() == serverId)
 		{
-			retId = user->GetChannelId();
+			const auto& channels = m_state.GetChannels();
+			auto channelId = user->GetChannelId();
+			auto chit = channels.find(channelId);
+
+			if (chit != channels.end())
+			{
+				retString = ToNarrow(chit->second.GetName());
+			}
 		}
 	});
 
-	return retId;
+	return retString;
 }
 
 void MumbleClient::GetTalkers(std::vector<std::string>* referenceIds)
@@ -626,9 +734,7 @@ void MumbleClient::SetListenerMatrix(float position[3], float front[3], float up
 
 void MumbleClient::SendVoice(const char* buf, size_t size)
 {
-	using namespace std::chrono_literals;
-
-	if ((msec() - m_lastUdp) > 7500ms)
+	if ((msec() - m_lastUdp) > kUDPTimeout)
 	{
 		Send(MumbleMessageType::UDPTunnel, buf, size);
 	}
@@ -706,6 +812,8 @@ void MumbleClient::HandleVoice(const uint8_t* data, size_t size)
 
 		// #TODOMUMBLE: unify with TCP pings
 
+		m_udpPingCount++;
+
 		// which ping this is in the history list
 		size_t thisPing = m_udpPingCount - 1;
 
@@ -768,6 +876,7 @@ void MumbleClient::HandleVoice(const uint8_t* data, size_t size)
 	{
 		pds >> packetLength;
 
+		bool hasTerminator = (packetLength & 0x2000) != 0;
 		size_t len = (packetLength & 0x1FFF);
 		std::vector<uint8_t> bytes(len);
 
@@ -792,7 +901,7 @@ void MumbleClient::HandleVoice(const uint8_t* data, size_t size)
 			break;
 		}
 
-		this->GetOutput().HandleClientVoiceData(*user, sequenceNumber, bytes.data(), bytes.size());
+		this->GetOutput().HandleClientVoiceData(*user, sequenceNumber, bytes.data(), bytes.size(), hasTerminator);
 
 		break;
 	} while ((packetLength & 0x2000) == 0);
@@ -919,7 +1028,7 @@ void MumbleClient::Send(const char* buf, size_t size)
 		return;
 	}
 
-	std::unique_lock<std::recursive_mutex> lock(m_clientMutex);
+	std::unique_lock lock(m_clientMutex);
 
 	if (m_tlsClient->is_active())
 	{

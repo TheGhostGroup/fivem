@@ -1,7 +1,5 @@
 #include "StdInc.h"
 
-//#include <ETWProviders/etwprof.h>
-
 #include <mutex>
 
 #include <d3d11_1.h>
@@ -17,13 +15,18 @@
 
 #include <Error.h>
 
+#include <CrossBuildRuntime.h>
+#include <LaunchMode.h>
 #include <CL2LaunchMode.h>
 
 #include <CoreConsole.h>
+#include <ICoreGameInit.h>
 
 #include <HostSharedData.h>
 
 namespace WRL = Microsoft::WRL;
+
+void WakeWindowThreadFor(std::function<void()>&& func);
 
 fwEvent<> OnGrcCreateDevice;
 fwEvent<> OnPostFrontendRender;
@@ -33,22 +36,99 @@ DLL_EXPORT fwEvent<bool*> OnFlipModelHook;
 fwEvent<bool*> OnRequestInternalScreenshot;
 fwEvent<const uint8_t*, int, int> OnInternalScreenshot;
 
+struct WaitableTimer {
+	WaitableTimer(
+		_In_opt_ LPSECURITY_ATTRIBUTES lpTimerAttributes,
+		_In_ BOOL bManualReset,
+		_In_opt_ LPCWSTR lpTimerName
+	) : handle(CreateWaitableTimer(lpTimerAttributes, bManualReset, lpTimerName)) {}
+	~WaitableTimer() { CloseHandle(handle); }
+
+	template<class Rep, class Period = std::ratio<1>>
+	BOOL Wait(std::chrono::duration<Rep, Period> dueTime)
+	{
+		LARGE_INTEGER liDueTime;
+
+		liDueTime.QuadPart = -(LONGLONG)(std::chrono::duration_cast<std::chrono::microseconds>(dueTime).count() * 10);
+
+		if (handle && SetWaitableTimer(handle, &liDueTime, 0, NULL, NULL, 0))
+		{
+			WaitForSingleObject(handle, INFINITE);
+			return TRUE;
+		}
+
+		return FALSE;
+	}
+private:
+	HANDLE handle;
+};
+
 static void* g_lastBackbufTexture;
 static bool g_useFlipModel = false;
 
 static bool g_overrideVsync;
 
-static void(*g_origCreateCB)(const char*);
-
-static void InvokeCreateCB(const char* arg)
-{
-	g_origCreateCB(arg);
-
-	//OnGrcCreateDevice();
-}
-
 static void CaptureBufferOutput();
 static void CaptureInternalScreenshot();
+
+static hook::cdecl_stub<void()> flushRenderStates([]()
+{
+	return hook::get_pattern("F6 C2 01 74 30 8B", -10);
+});
+
+static hook::cdecl_stub<void(bool)> _grcLighting([]()
+{
+	return hook::get_call(hook::get_pattern("48 83 EC 38 B1 01 E8 ? ? ? ? 48 8B", 6));
+});
+
+static hook::cdecl_stub<void(rage::grcTexture*)> _grcBindTexture([]()
+{
+	return hook::get_call(hook::get_pattern("48 8B D9 33 C9 E8 ? ? ? ? E8 ? ? ? ? 33 C9 E8", 5));
+});
+
+static hook::cdecl_stub<void()> _grcWorldIdentity([]()
+{
+	return hook::get_call(hook::get_pattern("48 8B D9 33 C9 E8 ? ? ? ? E8 ? ? ? ? 33 C9 E8", 10));
+});
+
+namespace rage
+{
+void grcLighting(bool enable)
+{
+	return _grcLighting(enable);
+}
+
+void grcBindTexture(rage::grcTexture* texture)
+{
+	return _grcBindTexture(texture);
+}
+
+void grcWorldIdentity()
+{
+	return _grcWorldIdentity();
+}
+
+struct grcViewport
+{
+};
+
+struct spdViewport : grcViewport
+{
+	static spdViewport* GetCurrent();
+};
+}
+
+static rage::spdViewport** rage__spdViewport__sm_Current;
+
+rage::spdViewport* rage::spdViewport::GetCurrent()
+{
+	return *rage__spdViewport__sm_Current;
+}
+
+static HookFunction hookFunctionSafe([]()
+{
+	rage__spdViewport__sm_Current = hook::get_address<rage::spdViewport**>(hook::get_pattern("48 8B 3D ? ? ? ? 40 8A F2 48 8B D9 75 14", 3));
+});
 
 static void InvokeRender()
 {
@@ -58,6 +138,28 @@ static void InvokeRender()
 	{
 		OnGrcCreateDevice();
 	});
+
+	SetBlendState(GetStockStateIdentifier(BlendStateDefault));
+	SetDepthStencilState(GetStockStateIdentifier(DepthStencilStateNoDepth));
+	SetRasterizerState(GetStockStateIdentifier(RasterizerStateNoCulling));
+
+	rage::grcLighting(false);
+
+	if (rage::spdViewport::GetCurrent())
+	{
+		rage::grcWorldIdentity();
+	}
+
+	rage::grcBindTexture(nullptr);
+
+	flushRenderStates();
+
+	// run a no-op draw call to flush other grcore states
+	rage::grcBegin(3, 3);
+	rage::grcVertex(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, 0.0f, 0.0f);
+	rage::grcVertex(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, 0.0f, 0.0f);
+	rage::grcVertex(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, 0.0f, 0.0f);
+	rage::grcEnd();
 
 	OnPostFrontendRender();
 }
@@ -84,6 +186,41 @@ fwEvent<IDXGIFactory2*, ID3D11Device*, HWND, DXGI_SWAP_CHAIN_DESC1*, DXGI_SWAP_C
 #pragma comment(lib, "dcomp.lib")
 
 #include <mmsystem.h>
+
+static auto LimitFrameTime(WaitableTimer& timer, size_t fpsLimit)
+{
+	using namespace std::chrono_literals;
+
+	static auto getNowUs = []()
+	{
+		return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now().time_since_epoch());
+	};
+	static std::chrono::microseconds lastFrameTime{ 0 };
+
+	struct ReturnToken
+	{
+		~ReturnToken()
+		{
+			lastFrameTime = getNowUs();
+		}
+
+		ReturnToken(const ReturnToken&) = delete;
+	};
+
+	if (fpsLimit > 0)
+	{
+		std::chrono::microseconds fpsLimitUs{ 1000000 / fpsLimit };
+
+		auto timeLeft = std::chrono::duration_cast<std::chrono::microseconds>(fpsLimitUs - (getNowUs() - lastFrameTime));
+
+		if (timeLeft > 0us)
+		{
+			timer.Wait(timeLeft);
+		}
+	}
+
+	return ReturnToken{};
+}
 
 class BufferBackedDXGISwapChain : public WRL::RuntimeClass<WRL::RuntimeClassFlags<WRL::ClassicCom>, IDXGISwapChain>
 {
@@ -120,6 +257,10 @@ public:
 		}
 
 		static HostSharedData<ReverseGameData> rgd("CfxReverseGameData");
+
+		GetD3D11DeviceContext()->Flush();
+
+		auto _ = LimitFrameTime(m_fpsLimitTimer, rgd->fpsLimit);
 
 		int idx = rgd->GetNextSurface(INFINITE);
 
@@ -166,13 +307,14 @@ public:
 private:
 	WRL::ComPtr<ID3D11Texture2D> m_texture;
 	WRL::ComPtr<ID3D11Texture2D> m_frontTextures[4];
+	WaitableTimer m_fpsLimitTimer;
 
 public:
 	DXGI_SWAP_CHAIN_DESC desc;
 	ID3D11Device* device;
 
 	BufferBackedDXGISwapChain(ID3D11Device* device, DXGI_SWAP_CHAIN_DESC desc)
-		: desc(desc), device(device)
+		: desc(desc), device(device), m_fpsLimitTimer(NULL, TRUE, NULL)
 	{
 		RecreateFromDesc();
 	}
@@ -259,12 +401,158 @@ public:
 	}
 };
 
+class DeferredFullscreenSwapChain : public WRL::RuntimeClass<WRL::RuntimeClassFlags<WRL::ClassicCom>, IDXGISwapChain>
+{
+	WRL::ComPtr<IDXGISwapChain> m_orig;
+	bool m_defer = true;
+
+public:
+	DeferredFullscreenSwapChain(WRL::ComPtr<IDXGISwapChain> swapChain)
+		: m_orig(swapChain)
+	{
+	
+	}
+
+	virtual HRESULT __stdcall SetPrivateData(REFGUID Name, UINT DataSize, const void* pData) override
+	{
+		return E_NOTIMPL;
+	}
+	virtual HRESULT __stdcall SetPrivateDataInterface(REFGUID Name, const IUnknown* pUnknown) override
+	{
+		return E_NOTIMPL;
+	}
+	virtual HRESULT __stdcall GetPrivateData(REFGUID Name, UINT* pDataSize, void* pData) override
+	{
+		return E_NOTIMPL;
+	}
+	virtual HRESULT __stdcall GetParent(REFIID riid, void** ppParent) override
+	{
+		return E_NOTIMPL;
+	}
+	virtual HRESULT __stdcall GetDevice(REFIID riid, void** ppDevice) override
+	{
+		return E_NOTIMPL;
+	}
+	virtual HRESULT __stdcall Present(UINT SyncInterval, UINT Flags) override
+	{
+		return m_orig->Present(SyncInterval, Flags);
+	}
+	virtual HRESULT __stdcall GetBuffer(UINT Buffer, REFIID riid, void** ppSurface) override
+	{
+		return m_orig->GetBuffer(Buffer, riid, ppSurface);
+	}
+	virtual HRESULT __stdcall SetFullscreenState(BOOL Fullscreen, IDXGIOutput* pTarget) override
+	{
+		if (m_defer && !Fullscreen)
+		{
+			m_defer = false;
+		}
+
+		return m_orig->SetFullscreenState(Fullscreen, pTarget);
+	}
+	virtual HRESULT __stdcall GetFullscreenState(BOOL* pFullscreen, IDXGIOutput** ppTarget) override
+	{
+		auto rv = m_orig->GetFullscreenState(pFullscreen, ppTarget);
+
+		if (SUCCEEDED(rv))
+		{
+			if (m_defer)
+			{
+				if (!*pFullscreen)
+				{
+					WRL::ComPtr<IDXGIOutput> output;
+					
+					if (SUCCEEDED(m_orig->GetContainingOutput(&output)) && output.Get())
+					{
+						m_orig->SetFullscreenState(TRUE, output.Get());
+
+						if (ppTarget)
+						{
+							output.CopyTo(ppTarget);
+						}
+
+						*pFullscreen = true;
+					}
+				}
+				else
+				{
+					m_defer = false;
+				}
+			}
+		}
+
+		return rv;
+	}
+	virtual HRESULT __stdcall GetDesc(DXGI_SWAP_CHAIN_DESC* pDesc) override
+	{
+		return m_orig->GetDesc(pDesc);
+	}
+	virtual HRESULT __stdcall ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags) override
+	{
+		return m_orig->ResizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags);
+	}
+	virtual HRESULT __stdcall ResizeTarget(const DXGI_MODE_DESC* pNewTargetParameters) override
+	{
+		return m_orig->ResizeTarget(pNewTargetParameters);
+	}
+	virtual HRESULT __stdcall GetContainingOutput(IDXGIOutput** ppOutput) override
+	{
+		return E_NOTIMPL;
+	}
+	virtual HRESULT __stdcall GetFrameStatistics(DXGI_FRAME_STATISTICS* pStats) override
+	{
+		return E_NOTIMPL;
+	}
+	virtual HRESULT __stdcall GetLastPresentCount(UINT* pLastPresentCount) override
+	{
+		return E_NOTIMPL;
+	}
+};
+
 #include <dxgi1_6.h>
 
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dxguid.lib")
 
-static HRESULT CreateD3D11DeviceWrap(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags, _In_reads_opt_(FeatureLevels) CONST D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion, _In_opt_ CONST DXGI_SWAP_CHAIN_DESC* pSwapChainDesc, _Out_opt_ IDXGISwapChain** ppSwapChain, _Out_opt_ ID3D11Device** ppDevice, _Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel, _Out_opt_ ID3D11DeviceContext** ppImmediateContext)
+static HANDLE g_gameWindowEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+void DLL_EXPORT UiDone()
+{
+	static HostSharedData<CfxState> initState("CfxInitState");
+	WaitForSingleObject(g_gameWindowEvent, INFINITE);
+
+	auto uiExitEvent = CreateEventW(NULL, TRUE, FALSE, va(L"CitizenFX_PreUIExit%s", IsCL2() ? L"CL2" : L""));
+	auto uiDoneEvent = CreateEventW(NULL, FALSE, FALSE, va(L"CitizenFX_PreUIDone%s", IsCL2() ? L"CL2" : L""));
+
+	if (uiExitEvent)
+	{
+		SetEvent(uiExitEvent);
+	}
+
+	if (uiDoneEvent && !g_disableRendering)
+	{
+		WaitForSingleObject(uiDoneEvent, INFINITE);
+	}
+}
+
+// graphics mods don't usually block calls from Windows DLLs to themselves in APIs they've hooked
+// and therefore break EnsureChildDevice API
+//
+// as such, we'll block our forced DXGI use if we found any such library in the game folder
+static bool IsSafeToUseDXGI()
+{
+	if (GetFileAttributesW(MakeRelativeGamePath(L"d3d11.dll").c_str()) != INVALID_FILE_ATTRIBUTES ||
+		GetFileAttributesW(MakeRelativeGamePath(L"dxgi.dll").c_str()) != INVALID_FILE_ATTRIBUTES)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+extern HRESULT RootD3D11CreateDevice(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags, _In_reads_opt_(FeatureLevels) CONST D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion, _COM_Outptr_opt_ ID3D11Device** ppDevice, _Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel, _COM_Outptr_opt_ ID3D11DeviceContext** ppImmediateContext);
+
+static void GoGetAdapter(IDXGIAdapter** ppAdapter)
 {
 	{
 		WRL::ComPtr<IDXGIFactory1> dxgiFactory;
@@ -276,11 +564,8 @@ static HRESULT CreateD3D11DeviceWrap(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER
 		if (SUCCEEDED(hr))
 		{
 			for (UINT adapterIndex = 0;
-				DXGI_ERROR_NOT_FOUND != factory6->EnumAdapterByGpuPreference(
-					adapterIndex,
-					DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-					IID_PPV_ARGS(adapter.ReleaseAndGetAddressOf()));
-				adapterIndex++)
+				 DXGI_ERROR_NOT_FOUND != factory6->EnumAdapterByGpuPreference(adapterIndex, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(adapter.ReleaseAndGetAddressOf()));
+				 adapterIndex++)
 			{
 				DXGI_ADAPTER_DESC1 desc;
 				adapter->GetDesc1(&desc);
@@ -291,26 +576,25 @@ static HRESULT CreateD3D11DeviceWrap(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER
 					continue;
 				}
 
-				adapter.CopyTo(&pAdapter);
+				static auto _ = ([&desc]
+				{
+					AddCrashometry("gpu_name", "%s", ToNarrow(desc.Description));
+					AddCrashometry("gpu_id", "%04x:%04x", desc.VendorId, desc.DeviceId);
+					return true;
+				})();
+
+				adapter.CopyTo(ppAdapter);
 				break;
 			}
 		}
 	}
+}
 
-	static HostSharedData<CfxState> initState("CfxInitState");
+static HRESULT CreateD3D11DeviceWrapOrig(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags, _In_reads_opt_(FeatureLevels) CONST D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion, _In_opt_ CONST DXGI_SWAP_CHAIN_DESC* pSwapChainDesc, _Out_opt_ IDXGISwapChain** ppSwapChain, _Out_opt_ ID3D11Device** ppDevice, _Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel, _Out_opt_ ID3D11DeviceContext** ppImmediateContext)
+{
+	GoGetAdapter(&pAdapter);
 
-	auto uiExitEvent = CreateEvent(NULL, FALSE, FALSE, va(L"CitizenFX_PreUIExit%s", IsCL2() ? L"CL2" : L""));
-	auto uiDoneEvent = CreateEvent(NULL, FALSE, FALSE, va(L"CitizenFX_PreUIDone%s", IsCL2() ? L"CL2" : L""));
-
-	if (uiExitEvent)
-	{
-		SetEvent(uiExitEvent);
-	}
-
-	if (uiDoneEvent && !g_disableRendering)
-	{
-		WaitForSingleObject(uiDoneEvent, INFINITE);
-	}
+	SetEvent(g_gameWindowEvent);
 
 	if (g_disableRendering)
 	{
@@ -323,17 +607,19 @@ static HRESULT CreateD3D11DeviceWrap(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER
 
 	if (!IsWindows10OrGreater())
 	{
-		return D3D11CreateDeviceAndSwapChain(/*pAdapter*/pAdapter, /*DriverType*/ pAdapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, Software, Flags | D3D11_CREATE_DEVICE_BGRA_SUPPORT, pFeatureLevels, FeatureLevels/*nullptr, 0*/, SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
+		return D3D11CreateDeviceAndSwapChain(/*pAdapter*/ pAdapter, /*DriverType*/ pAdapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, Software, Flags | D3D11_CREATE_DEVICE_BGRA_SUPPORT, pFeatureLevels, FeatureLevels /*nullptr, 0*/, SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
 	}
 
 	OnFlipModelHook(&g_useFlipModel);
 
-	HRESULT hr = D3D11CreateDevice(pAdapter, /*DriverType*/ pAdapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, Software, Flags | D3D11_CREATE_DEVICE_BGRA_SUPPORT/* | D3D11_CREATE_DEVICE_DEBUG*/, pFeatureLevels, FeatureLevels/*nullptr, 0*/, SDKVersion, ppDevice, pFeatureLevel, ppImmediateContext);
+	HRESULT hr = RootD3D11CreateDevice(pAdapter, /*DriverType*/ pAdapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, Software, Flags | D3D11_CREATE_DEVICE_BGRA_SUPPORT/* | D3D11_CREATE_DEVICE_DEBUG*/, pFeatureLevels, FeatureLevels/*nullptr, 0*/, SDKVersion, ppDevice, pFeatureLevel, ppImmediateContext);
 
 	WRL::ComPtr<IDXGIFactory2> dxgiFactory;
 
 	WRL::ComPtr<IDXGIDevice> dxgiDevice;
 	WRL::ComPtr<IDXGIAdapter> dxgiAdapter;
+
+	static HostSharedData<CfxState> initState("CfxInitState");
 
 	if (SUCCEEDED(hr))
 	{
@@ -378,6 +664,11 @@ static HRESULT CreateD3D11DeviceWrap(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER
 		fsDesc.ScanlineOrdering = pSwapChainDesc->BufferDesc.ScanlineOrdering;
 		fsDesc.Windowed = pSwapChainDesc->Windowed;
 
+		if (!fsDesc.Windowed)
+		{
+			fsDesc.Windowed = true;
+		}
+
 		OnTryCreateSwapChain(dxgiFactory.Get(), *ppDevice, pSwapChainDesc->OutputWindow, &scDesc1, &fsDesc, &swapChain1);
 
 		if (!swapChain1)
@@ -392,6 +683,16 @@ static HRESULT CreateD3D11DeviceWrap(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER
 		if (initState->isReverseGame)
 		{
 			auto sc = WRL::Make<BufferBackedDXGISwapChain>(*ppDevice, *pSwapChainDesc);
+			sc.CopyTo(ppSwapChain);
+		}
+		else if (!pSwapChainDesc->Windowed && IsSafeToUseDXGI())
+		{
+			auto sc = WRL::Make<DeferredFullscreenSwapChain>(*ppSwapChain);
+
+			// release the original swapchain
+			(*ppSwapChain)->Release();
+			*ppSwapChain = NULL;
+
 			sc.CopyTo(ppSwapChain);
 		}
 	}
@@ -411,6 +712,24 @@ static HRESULT CreateD3D11DeviceWrap(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER
 	g_dc = *ppImmediateContext;
 
 	return hr;
+}
+
+static HRESULT CreateD3D11DeviceWrap(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags, _In_reads_opt_(FeatureLevels) CONST D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion, _In_opt_ CONST DXGI_SWAP_CHAIN_DESC* pSwapChainDesc, _Out_opt_ IDXGISwapChain** ppSwapChain, _Out_opt_ ID3D11Device** ppDevice, _Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel, _Out_opt_ ID3D11DeviceContext** ppImmediateContext)
+{
+	HANDLE hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+	HRESULT hresult = E_FAIL;
+
+	WakeWindowThreadFor([&]()
+	{
+		hresult = CreateD3D11DeviceWrapOrig(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
+
+		SetEvent(hEvent);
+	});
+
+	WaitForSingleObject(hEvent, INFINITE);
+	CloseHandle(hEvent);
+
+	return hresult;
 }
 
 struct VideoModeInfo
@@ -479,77 +798,7 @@ bool WrapVideoModeChange(VideoModeInfo* info)
 
 	trace("Changing video mode success: %d.\n", success);
 
-	if (success)
-	{
-		//g_resetVideoMode(info);
-	}
-
-#if 0
-	IUnknown** g_backbuffer = (IUnknown**)0x14299D640;
-	rage::grcRenderTargetDX11** g_backBufferRT = (rage::grcRenderTargetDX11**)0x14299DC50;
-
-	//delete (*g_backBufferRT);
-
-	//ULONG refCnt = (*g_backbuffer)->Release();
-
-	ULONG refCnt = (*g_backBufferRT)->m_rtv->Release();
-	(*g_backBufferRT)->m_rtv = nullptr;
-
-	trace("refcnt %d\n", refCnt);
-
-	if ((*g_backBufferRT)->m_resource2)
-	{
-		(*g_backBufferRT)->m_resource2->Release();
-		(*g_backBufferRT)->m_resource2 = nullptr;
-	}
-
-	for (auto& srv : (*g_backBufferRT)->m_srvs)
-	{
-		srv->Release();
-	}
-
-	(*g_backBufferRT)->m_srvs.Clear();
-
-	hook::put<uint8_t>(0x141299035, 0xC3);
-	hook::put<uint8_t>(0x141298F60, 0x48);
-
-	((void(*)(void*))0x141298F60)(rage::grcTextureFactory::getInstance());
-
-	hook::put<uint8_t>(0x141298F60, 0xC3);
-
-	DXGI_SWAP_CHAIN_DESC desc = {};
-	(*g_dxgiSwapChain)->GetDesc(&desc);
-
-	trace("flags now: %d\n", desc.Flags);
-
-	HRESULT hr = (*g_dxgiSwapChain)->ResizeBuffers(0, info->width, info->height, DXGI_FORMAT_UNKNOWN, desc.Flags);// | DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
-
-	if (FAILED(hr))
-	{
-		TerminateProcess(GetCurrentProcess(), 1);
-	}
-
-	if (FAILED(hr))
-	{
-		trace("Changing video mode: buffers failed. HR: %08x\n", hr);
-		// TODO: fail on D3D error
-	}
-
-	trace("Changing video mode: meheeeeeh.\n");
-
-	((void(*)(void*))0x14129D1C8)(rage::grcTextureFactory::getInstance());
-
-	trace("Woo! %016x\n", (uintptr_t)*g_backBufferRT);
-#endif
-
 	return success;
-}
-
-static bool(*g_origRunGame)();
-
-static int RunGameWrap()
-{
-	return g_origRunGame();
 }
 
 #pragma region shaders
@@ -740,16 +989,10 @@ const BYTE quadVS[] =
 
 struct GameRenderData
 {
-	HANDLE handle;
-	int width;
-	int height;
-	bool requested;
-
-	GameRenderData()
-		: requested(false)
-	{
-
-	}
+	HANDLE handle = NULL;
+	int width = 0;
+	int height = 0;
+	bool requested = false;
 };
 
 static rage::grcRenderTargetDX11** g_backBuffer;
@@ -759,8 +1002,37 @@ static auto GetBackbuf()
 	return *g_backBuffer;
 }
 
+static auto GetInvariantD3D11Device()
+{
+	WRL::ComPtr<IDXGIDevice> realDeviceDxgi;
+	WRL::ComPtr<ID3D11Device> realDevice;
+
+	GetD3D11Device()->QueryInterface(IID_PPV_ARGS(&realDeviceDxgi));
+	realDeviceDxgi.As(&realDevice);
+
+	return realDevice;
+}
+
+static auto GetInvariantD3D11DeviceContext()
+{
+	WRL::ComPtr<IUnknown> realDeviceContextUnk;
+	WRL::ComPtr<ID3D11DeviceContext> realDeviceContext;
+
+	GetD3D11DeviceContext()->QueryInterface(IID_PPV_ARGS(&realDeviceContextUnk));
+	realDeviceContextUnk.As(&realDeviceContext);
+
+	return realDeviceContext;
+}
+
 void RenderBufferToBuffer(ID3D11RenderTargetView* rtv, int width = 0, int height = 0)
 {
+	static auto didCallCrashometry = ([]()
+	{
+		AddCrashometry("did_render_backbuf", "true");
+
+		return true;
+	})();
+
 	D3D11_TEXTURE2D_DESC resDesc = { 0 };
 	auto backBuf = GetBackbuf();
 
@@ -773,7 +1045,17 @@ void RenderBufferToBuffer(ID3D11RenderTargetView* rtv, int width = 0, int height
 	}
 
 	// guess what we can't just CopyResource, so time for copy/pasted D3D11 garbage
+	if (backBuf)
 	{
+		WRL::ComPtr<IUnknown> realSrvUnk;
+		WRL::ComPtr<ID3D11ShaderResourceView> realSrv;
+
+		backBuf->m_srv2->QueryInterface(IID_PPV_ARGS(&realSrvUnk));
+		realSrvUnk.As(&realSrv);
+
+		auto realDevice = GetInvariantD3D11Device();
+		auto realDeviceContext = GetInvariantD3D11DeviceContext();
+
 		auto m_width = resDesc.Width;
 		auto m_height = resDesc.Height;
 
@@ -786,39 +1068,39 @@ void RenderBufferToBuffer(ID3D11RenderTargetView* rtv, int width = 0, int height
 		static ID3D11PixelShader* ps;
 
 		static std::once_flag of;
-		std::call_once(of, []()
+		std::call_once(of, [&realDevice]()
 		{
 			D3D11_SAMPLER_DESC sd = CD3D11_SAMPLER_DESC(CD3D11_DEFAULT());
-			GetD3D11Device()->CreateSamplerState(&sd, &ss);
+			realDevice->CreateSamplerState(&sd, &ss);
 
 			D3D11_BLEND_DESC bd = CD3D11_BLEND_DESC(CD3D11_DEFAULT());
 			bd.RenderTarget[0].BlendEnable = FALSE;
 
-			GetD3D11Device()->CreateBlendState(&bd, &bs);
+			realDevice->CreateBlendState(&bd, &bs);
 
-			GetD3D11Device()->CreateVertexShader(quadVS, sizeof(quadVS), nullptr, &vs);
-			GetD3D11Device()->CreatePixelShader(quadPS, sizeof(quadPS), nullptr, &ps);
+			realDevice->CreateVertexShader(quadVS, sizeof(quadVS), nullptr, &vs);
+			realDevice->CreatePixelShader(quadPS, sizeof(quadPS), nullptr, &ps);
 		});
 
-		ID3DUserDefinedAnnotation* pPerf = NULL;
-		GetD3D11DeviceContext()->QueryInterface(__uuidof(pPerf), reinterpret_cast<void**>(&pPerf));
+		WRL::ComPtr<ID3DUserDefinedAnnotation> pPerf = NULL;
+		realDeviceContext->QueryInterface(IID_PPV_ARGS(&pPerf));
 
 		if (pPerf)
 		{
 			pPerf->BeginEvent(L"DrawRenderTexture");
 		}
 
-		auto deviceContext = GetD3D11DeviceContext();
-
-		ID3D11RenderTargetView* oldRtv = nullptr;
-		ID3D11DepthStencilView* oldDsv = nullptr;
+		auto deviceContext = realDeviceContext;
+		
+		WRL::ComPtr<ID3D11RenderTargetView> oldRtv;
+		WRL::ComPtr<ID3D11DepthStencilView> oldDsv;
 		deviceContext->OMGetRenderTargets(1, &oldRtv, &oldDsv);
 
-		ID3D11SamplerState* oldSs;
-		ID3D11BlendState* oldBs;
-		ID3D11PixelShader* oldPs;
-		ID3D11VertexShader* oldVs;
-		ID3D11ShaderResourceView* oldSrv;
+		WRL::ComPtr<ID3D11SamplerState> oldSs;
+		WRL::ComPtr<ID3D11BlendState> oldBs;
+		WRL::ComPtr<ID3D11PixelShader> oldPs;
+		WRL::ComPtr<ID3D11VertexShader> oldVs;
+		WRL::ComPtr<ID3D11ShaderResourceView> oldSrv;
 
 		D3D11_VIEWPORT oldVp;
 		UINT numVPs = 1;
@@ -839,9 +1121,14 @@ void RenderBufferToBuffer(ID3D11RenderTargetView* rtv, int width = 0, int height
 		deviceContext->OMSetRenderTargets(1, &rtv, nullptr);
 		deviceContext->OMSetBlendState(bs, nullptr, 0xffffffff);
 
+		ID3D11ShaderResourceView* srvs[] =
+		{
+			realSrv.Get()
+		};
+
 		deviceContext->PSSetShader(ps, nullptr, 0);
 		deviceContext->PSSetSamplers(0, 1, &ss);
-		deviceContext->PSSetShaderResources(0, 1, &backBuf->m_srv2);
+		deviceContext->PSSetShaderResources(0, 1, srvs);
 
 		deviceContext->VSSetShader(vs, nullptr, 0);
 
@@ -859,63 +1146,21 @@ void RenderBufferToBuffer(ID3D11RenderTargetView* rtv, int width = 0, int height
 
 		deviceContext->Draw(4, 0);
 
-		deviceContext->OMSetRenderTargets(1, &oldRtv, oldDsv);
+		deviceContext->OMSetRenderTargets(1, oldRtv.GetAddressOf(), oldDsv.Get());
 
 		deviceContext->IASetPrimitiveTopology(oldTopo);
 		deviceContext->IASetInputLayout(oldLayout);
 
-		deviceContext->VSSetShader(oldVs, nullptr, 0);
-		deviceContext->PSSetShader(oldPs, nullptr, 0);
-		deviceContext->PSSetSamplers(0, 1, &oldSs);
-		deviceContext->PSSetShaderResources(0, 1, &oldSrv);
-		deviceContext->OMSetBlendState(oldBs, nullptr, 0xffffffff);
+		deviceContext->VSSetShader(oldVs.Get(), nullptr, 0);
+		deviceContext->PSSetShader(oldPs.Get(), nullptr, 0);
+		deviceContext->PSSetSamplers(0, 1, oldSs.GetAddressOf());
+		deviceContext->PSSetShaderResources(0, 1, oldSrv.GetAddressOf());
+		deviceContext->OMSetBlendState(oldBs.Get(), nullptr, 0xffffffff);
 		deviceContext->RSSetViewports(1, &oldVp);
-
-		if (oldVs)
-		{
-			oldVs->Release();
-		}
-
-		if (oldPs)
-		{
-			oldPs->Release();
-		}
-
-		if (oldBs)
-		{
-			oldBs->Release();
-		}
-
-		if (oldSs)
-		{
-			oldSs->Release();
-		}
-
-		if (oldSrv)
-		{
-			oldSrv->Release();
-		}
-
-		if (oldRtv)
-		{
-			oldRtv->Release();
-		}
-
-		if (oldDsv)
-		{
-			oldDsv->Release();
-		}
-
-		if (oldLayout)
-		{
-			oldLayout->Release();
-		}
 
 		if (pPerf)
 		{
 			pPerf->EndEvent();
-
-			pPerf->Release();
 		}
 	}
 }
@@ -961,14 +1206,14 @@ void CaptureInternalScreenshot()
 			texDesc.MiscFlags = 0;
 
 			WRL::ComPtr<ID3D11Texture2D> d3dTex;
-			HRESULT hr = GetD3D11Device()->CreateTexture2D(&texDesc, nullptr, &d3dTex);
+			HRESULT hr = GetInvariantD3D11Device()->CreateTexture2D(&texDesc, nullptr, &d3dTex);
 			if FAILED(hr)
 			{
 				return;
 			}
 
 			D3D11_RENDER_TARGET_VIEW_DESC rtDesc = CD3D11_RENDER_TARGET_VIEW_DESC(d3dTex.Get(), D3D11_RTV_DIMENSION_TEXTURE2D);
-			GetD3D11Device()->CreateRenderTargetView(d3dTex.Get(), &rtDesc, &rtv);
+			GetInvariantD3D11Device()->CreateRenderTargetView(d3dTex.Get(), &rtDesc, &rtv);
 
 			d3dTex.CopyTo(&myTexture);
 		}
@@ -988,7 +1233,7 @@ void CaptureInternalScreenshot()
 			texDesc.MiscFlags = 0;
 
 			WRL::ComPtr<ID3D11Texture2D> d3dTex;
-			HRESULT hr = GetD3D11Device()->CreateTexture2D(&texDesc, nullptr, &d3dTex);
+			HRESULT hr = GetInvariantD3D11Device()->CreateTexture2D(&texDesc, nullptr, &d3dTex);
 			if FAILED(hr)
 			{
 				return;
@@ -1012,17 +1257,17 @@ void CaptureInternalScreenshot()
 
 	RenderBufferToBuffer(rtv, resDesc.Width / 4, resDesc.Height / 4);
 
-	GetD3D11DeviceContext()->CopyResource(myStagingTexture, myTexture);
+	GetInvariantD3D11DeviceContext()->CopyResource(myStagingTexture, myTexture);
 
 	D3D11_MAPPED_SUBRESOURCE msr;
 	
-	if (SUCCEEDED(GetD3D11DeviceContext()->Map(myStagingTexture, 0, D3D11_MAP_READ, 0, &msr)))
+	if (SUCCEEDED(GetInvariantD3D11DeviceContext()->Map(myStagingTexture, 0, D3D11_MAP_READ, 0, &msr)))
 	{
-		size_t blen = (resDesc.Height / 4) * msr.RowPitch;
+		size_t blen = (static_cast<size_t>(resDesc.Height / 4)) * msr.RowPitch;
 		std::unique_ptr<uint8_t[]> data(new uint8_t[blen]);
 		memcpy(data.get(), msr.pData, blen);
 
-		GetD3D11DeviceContext()->Unmap(myStagingTexture, 0);
+		GetInvariantD3D11DeviceContext()->Unmap(myStagingTexture, 0);
 
 		// convert RGBA to RGB
 		int w = (resDesc.Width / 4);
@@ -1054,11 +1299,6 @@ void CaptureInternalScreenshot()
 
 void CaptureBufferOutput()
 {
-	if (launch::IsSDKGuest())
-	{
-		return;
-	}
-
 	static HostSharedData<GameRenderData> handleData("CfxGameRenderHandle");
 
 	static D3D11_TEXTURE2D_DESC resDesc;
@@ -1075,6 +1315,10 @@ void CaptureBufferOutput()
 			handleData->width = resDesc.Width;
 			handleData->height = resDesc.Height;
 		}
+	}
+	else
+	{
+		return;
 	}
 
 	bool change = false;
@@ -1118,15 +1362,14 @@ void CaptureBufferOutput()
 		texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
 
 		WRL::ComPtr<ID3D11Texture2D> d3dTex;
-		HRESULT hr = GetD3D11Device()->CreateTexture2D(&texDesc, nullptr, &d3dTex);
-		if FAILED(hr)
+		HRESULT hr = GetInvariantD3D11Device()->CreateTexture2D(&texDesc, nullptr, &d3dTex);
+		if (FAILED(hr))
 		{
 			return;
-			// error handling code
 		}
 
 		D3D11_RENDER_TARGET_VIEW_DESC rtDesc = CD3D11_RENDER_TARGET_VIEW_DESC(d3dTex.Get(), D3D11_RTV_DIMENSION_TEXTURE2D);
-		GetD3D11Device()->CreateRenderTargetView(d3dTex.Get(), &rtDesc, &rtv);
+		GetInvariantD3D11Device()->CreateRenderTargetView(d3dTex.Get(), &rtDesc, &rtv);
 
 		d3dTex.CopyTo(&myTexture);
 
@@ -1135,14 +1378,13 @@ void CaptureBufferOutput()
 		hr = d3dTex.As(&dxgiResource);
 		if (FAILED(hr))
 		{
-			// error handling code
 			return;
 		}
 
 		hr = dxgiResource->GetSharedHandle(&sharedHandle);
-		if FAILED(hr)
+		if (FAILED(hr))
 		{
-			// error handling code
+			// no error handling for safety
 		}
 
 		handleData->handle = sharedHandle;
@@ -1164,32 +1406,70 @@ void CaptureBufferOutput()
 	RenderBufferToBuffer(rtv);
 }
 
+extern void RootCheckPresented(int& flags);
+extern void RootSetPresented();
+
 void D3DPresent(int syncInterval, int flags)
 {
+#if __has_include(<ENBApi.h>)
+	static auto beforePresent = GetENBProcedure<TPresentHook>("API_BeforePresent");
+	static auto afterPresent = GetENBProcedure<TPresentHook>("API_AfterPresent");
+
+	if (beforePresent)
+	{
+		beforePresent();
+	}
+#endif
+
 	if (g_overrideVsync)
 	{
 		syncInterval = 1;
 	}
 
-	if (syncInterval == 0)
-	{
-		BOOL fullscreen;
+	RootCheckPresented(flags);
 
-		if (SUCCEEDED((*g_dxgiSwapChain)->GetFullscreenState(&fullscreen, nullptr)) && !fullscreen)
+	if (IsWindows10OrGreater())
+	{
+		if (syncInterval == 0)
 		{
-			if (g_allowTearing)
+			BOOL fullscreen;
+
+			if (SUCCEEDED((*g_dxgiSwapChain)->GetFullscreenState(&fullscreen, nullptr)) && !fullscreen)
 			{
-				flags |= DXGI_PRESENT_ALLOW_TEARING;
+				if (g_allowTearing)
+				{
+					flags |= DXGI_PRESENT_ALLOW_TEARING;
+				}
 			}
 		}
+
+		HRESULT hr = (*g_dxgiSwapChain)->Present(syncInterval, flags);
+
+		if (FAILED(hr))
+		{
+			trace("IDXGISwapChain::Present failed: %08x\n", hr);
+		}
 	}
-
-	HRESULT hr = (*g_dxgiSwapChain)->Present(syncInterval, flags);
-
-	if (FAILED(hr))
+	else
 	{
-		trace("IDXGISwapChain::Present failed: %08x\n", hr);
+		(*g_dxgiSwapChain)->Present(syncInterval, flags);
 	}
+
+	static auto icgi = Instance<ICoreGameInit>::Get();
+	if (icgi->HasVariable("gameMinimized"))
+	{
+		static WaitableTimer fpsTimer{NULL, TRUE, NULL};
+		LimitFrameTime(fpsTimer, 30);
+	}
+
+	RootSetPresented();
+
+#if __has_include(<ENBApi.h>)
+	if (afterPresent)
+	{
+		afterPresent();
+	}
+#endif
 }
 
 static int Return1()
@@ -1199,21 +1479,183 @@ static int Return1()
 
 #include "dxerr.h"
 
-static void DisplayD3DCrashMessage(HRESULT hr)
+static void __declspec(noinline) DisplayD3DCrashMessageGeneric(const std::string& errorBody)
 {
-	wchar_t errorBuffer[16384];
-	DXGetErrorDescriptionW(hr, errorBuffer, _countof(errorBuffer));
-
-	FatalError("DirectX encountered an unrecoverable error: %s - %s", ToNarrow(DXGetErrorStringW(hr)), ToNarrow(errorBuffer));
+	FatalError("DirectX encountered an unrecoverable error: %s", errorBody);
 }
 
-static HRESULT D3DGetData(ID3D11DeviceContext* dc, ID3D11Asynchronous* async, void* data, UINT dataSize, UINT flags)
+static void __declspec(noinline) DisplayD3DCrashMessageReShadeENBSeries(const std::string& errorBody)
 {
-	dc->GetData(async, data, dataSize, flags);
+	FatalError("DirectX encountered an unrecoverable error (R+E): %s", errorBody);
+}
 
-	*(int*)data = 1;
+static void __declspec(noinline) DisplayD3DCrashMessageReShade(const std::string& errorBody)
+{
+	FatalError("DirectX encountered an unrecoverable error (R): %s", errorBody);
+}
 
-	return S_OK;
+static void __declspec(noinline) DisplayD3DCrashMessageENBSeries(const std::string& errorBody)
+{
+	FatalError("DirectX encountered an unrecoverable error (E): %s", errorBody);
+}
+
+static void __declspec(noinline) DisplayD3DCrashMessageGraphicsMods(const std::string& errorBody)
+{
+	FatalError("DirectX encountered an unrecoverable error (M): %s", errorBody);
+}
+
+static std::string GetGraphicsModDetails(const std::string& fileName)
+{
+	std::wstring path = MakeRelativeGamePath(ToWide(fileName));
+	DWORD versionInfoSize = GetFileVersionInfoSize(path.c_str(), nullptr);
+
+	if (versionInfoSize)
+	{
+		std::vector<uint8_t> versionInfo(versionInfoSize);
+
+		if (GetFileVersionInfo(path.c_str(), 0, versionInfo.size(), &versionInfo[0]))
+		{
+			struct LANGANDCODEPAGE
+			{
+				WORD wLanguage;
+				WORD wCodePage;
+			} * lpTranslate;
+
+			UINT cbTranslate = 0;
+
+			// Read the list of languages and code pages.
+
+			VerQueryValue(&versionInfo[0],
+			TEXT("\\VarFileInfo\\Translation"),
+			(LPVOID*)&lpTranslate,
+			&cbTranslate);
+
+			if (cbTranslate > 0)
+			{
+				void* productNameBuffer;
+				UINT productNameSize = 0;
+
+				VerQueryValue(&versionInfo[0],
+				va(L"\\StringFileInfo\\%04x%04x\\ProductName", lpTranslate[0].wLanguage, lpTranslate[0].wCodePage),
+				&productNameBuffer,
+				&productNameSize);
+
+				void* fixedInfoBuffer;
+				UINT fixedInfoSize = 0;
+
+				VerQueryValue(&versionInfo[0], L"\\", &fixedInfoBuffer, &fixedInfoSize);
+
+				VS_FIXEDFILEINFO* fixedInfo = reinterpret_cast<VS_FIXEDFILEINFO*>(fixedInfoBuffer);
+
+				if (productNameSize > 0 && fixedInfoSize > 0)
+				{
+					return fmt::sprintf("%s %d.%d.%d.%d",
+						ToNarrow((wchar_t*)productNameBuffer),
+						fixedInfo->dwProductVersionMS >> 16,
+						fixedInfo->dwProductVersionMS & 0xFFFF,
+						fixedInfo->dwProductVersionLS >> 16,
+						fixedInfo->dwProductVersionLS & 0xFFFF);
+				}
+			}
+		}
+	}
+
+	return "";
+}
+
+static void DisplayD3DCrashMessageWrap(HRESULT hr)
+{
+	constexpr auto errorBufferCount = 8192;
+	auto errorBuffer = std::unique_ptr<wchar_t[]>(new wchar_t[errorBufferCount]);
+	memset(errorBuffer.get(), 0, errorBufferCount * sizeof(wchar_t));
+	DXGetErrorDescriptionW(hr, errorBuffer.get(), errorBufferCount);
+
+	auto errorString = DXGetErrorStringW(hr);
+
+	if (!errorString)
+	{
+		errorString = va(L"0x%08x", hr);
+	}
+
+	std::string removedError;
+
+	if (hr == DXGI_ERROR_DEVICE_REMOVED)
+	{
+		HRESULT removedReason = GetD3D11Device()->GetDeviceRemovedReason();
+
+		auto errorBuffer = std::unique_ptr<wchar_t[]>(new wchar_t[errorBufferCount]);
+		memset(errorBuffer.get(), 0, errorBufferCount * sizeof(wchar_t));
+		DXGetErrorDescriptionW(removedReason, errorBuffer.get(), errorBufferCount);
+
+		auto removedString = DXGetErrorStringW(removedReason);
+
+		if (!removedString)
+		{
+			removedString = va(L"0x%08x", hr);
+		}
+
+		removedError = ToNarrow(fmt::sprintf(L"\nGetDeviceRemovedReason returned %s - %s", removedString, errorBuffer.get()));
+	}
+
+	auto errorBody = fmt::sprintf("%s - %s%s", ToNarrow(errorString), ToNarrow(errorBuffer.get()), removedError);
+
+	std::set<std::string> mods;
+	auto getMod = [&mods](const std::string& filename)
+	{
+		if (auto details = GetGraphicsModDetails(filename); !details.empty())
+		{
+			mods.insert(details);
+		}
+	};
+
+	getMod("d3d11.dll");
+	getMod("dxgi.dll");
+	getMod("d3d10.dll");
+
+	if (!mods.empty())
+	{
+		errorBody += "\n\nThe following graphics mods were found in your GTA V installation:\n";
+
+		for (const auto& mod : mods)
+		{
+			errorBody += fmt::sprintf("- %s\n", mod);
+		}
+
+		errorBody += "\nPlease contact the author of these mods to see if the issue may be related to them.";
+
+		bool reshade = std::find_if(mods.begin(), mods.end(), [](const auto& str)
+					   {
+						   return str.find("ReShade") == 0;
+					   })
+					   != mods.end();
+
+		bool enbseries = std::find_if(mods.begin(), mods.end(), [](const auto& str)
+						 {
+							 return str.find("ENBSeries") == 0;
+						 })
+						 != mods.end();
+
+		if (reshade && enbseries)
+		{
+			DisplayD3DCrashMessageReShadeENBSeries(errorBody);
+		}
+		else if (reshade)
+		{
+			DisplayD3DCrashMessageReShade(errorBody);
+		}
+		else if (enbseries)
+		{
+			DisplayD3DCrashMessageENBSeries(errorBody);
+		}
+		else
+		{
+			DisplayD3DCrashMessageGraphicsMods(errorBody);
+		}
+	}
+	else
+	{
+		DisplayD3DCrashMessageGeneric(errorBody);
+	}
 }
 
 static void(*g_origPresent)();
@@ -1281,12 +1723,30 @@ void GfxForceVsync(bool enabled)
 }
 
 static HWND g_gtaWindow;
+static decltype(&CreateWindowExW) g_origCreateWindowExW;
 
 static HWND WINAPI HookCreateWindowExW(_In_ DWORD dwExStyle, _In_opt_ LPCWSTR lpClassName, _In_opt_ LPCWSTR lpWindowName, _In_ DWORD dwStyle, _In_ int X, _In_ int Y, _In_ int nWidth, _In_ int nHeight, _In_opt_ HWND hWndParent, _In_opt_ HMENU hMenu, _In_opt_ HINSTANCE hInstance, _In_opt_ LPVOID lpParam)
 {
-	static HostSharedData<ReverseGameData> rgd("CfxReverseGameData");
+	static HostSharedData<CfxState> initState("CfxInitState");
+	HWND w;
 
-	auto w = CreateWindowExW(dwExStyle, lpClassName, lpWindowName, WS_POPUP | WS_CLIPSIBLINGS, 0, 0, rgd->width, rgd->height, NULL, hMenu, hInstance, lpParam);
+	auto wndName = (CfxIsSinglePlayer()) ? L"Grand Theft Auto V (FiveM SP)" : L"FiveM® by Cfx.re";
+
+	if (initState->isReverseGame)
+	{
+		static HostSharedData<ReverseGameData> rgd("CfxReverseGameData");
+
+		w = g_origCreateWindowExW(dwExStyle, lpClassName, wndName, WS_POPUP | WS_CLIPSIBLINGS, 0, 0, rgd->width, rgd->height, NULL, hMenu, hInstance, lpParam);
+	}
+	else
+	{
+		w = g_origCreateWindowExW(dwExStyle, lpClassName, wndName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
+	}
+
+	if (lpClassName && wcscmp(lpClassName, L"grcWindow") == 0)
+	{
+		CoreSetGameWindow(w);
+	}
 	
 	g_gtaWindow = w;
 
@@ -1363,13 +1823,27 @@ static LONG_PTR SetWindowLongPtrAHook(HWND hWnd,
 #include <concurrent_unordered_map.h>
 
 static concurrency::concurrent_unordered_map<void*, bool> g_queriesSetUp;
-static void(*g_origWaitForQuery)(void*);
+static bool (*g_isQueryPending)(void*);
+
+static std::atomic<int> g_isInRenderQuery;
+
+DLL_EXPORT bool IsInRenderQuery()
+{
+	return g_isInRenderQuery > 0;
+}
 
 static void WaitForQueryHook(void* query)
 {
 	if (g_queriesSetUp[query])
 	{
-		g_origWaitForQuery(query);
+		++g_isInRenderQuery;
+
+		while (g_isQueryPending(query))
+		{
+			Sleep(1);
+		}
+
+		--g_isInRenderQuery;
 	}
 
 	g_queriesSetUp[query] = false;
@@ -1484,12 +1958,6 @@ static HookFunction hookFunction([] ()
 
 	g_backBuffer = hook::get_address<decltype(g_backBuffer)>(hook::get_pattern("48 8B D0 48 89 05 ? ? ? ? EB 07 48 8B 15", 6));
 
-	// device creation
-	void* ptrFunc = hook::pattern("E8 ? ? ? ? 84 C0 75 ? B2 01 B9 2F A9 C2 F4").count(1).get(0).get<void>(33);
-
-	hook::set_call(&g_origCreateCB, ptrFunc);
-	hook::call(ptrFunc, InvokeCreateCB);
-
 	// end scene
 	{
 		auto location = hook::get_pattern("48 0F 45 C8 48 83 C4 40 5B E9 00 00 00 00", 9);
@@ -1497,35 +1965,30 @@ static HookFunction hookFunction([] ()
 		hook::jump(location, RagePresentWrap);
 	}
 
-	//ptrFunc = hook::pattern("83 64 24 28 00 41 B0 01 C6 44 24 20 01 41 8A C8").count(1).get(0).get<void>(-30);
-	//hook::set_call(&g_origEndScene, ptrFunc);
-	//hook::call(ptrFunc, EndSceneWrap);
+	// present hook function
+	hook::put(hook::get_address<void*>(hook::get_pattern("48 8B 05 ? ? ? ? 48 85 C0 74 0C 8B 4D 50 8B", 3)), D3DPresent);
 
-	ptrFunc = hook::get_pattern("41 83 F9 01 75 34 48 83 C4 28 E9", 10);
-	hook::set_call(&g_origRunGame, ptrFunc);
-	hook::jump(ptrFunc, RunGameWrap);
-
-	// set the present hook
-	if (IsWindows10OrGreater())
+	if (xbr::IsGameBuildOrGreater<3095>())
 	{
-		// present hook function
-		hook::put(hook::get_address<void*>(hook::get_pattern("48 8B 05 ? ? ? ? 48 85 C0 74 0C 8B 4D 50 8B", 3)), D3DPresent);
+		char* fnStart = hook::get_pattern<char>("8B 03 41 BE 01 00 00 00 89 05", -0x43);
+		g_dxgiSwapChain = hook::get_address<IDXGISwapChain**>(fnStart + 0x120);
 
-		// wrap video mode changing
+		MH_CreateHook(fnStart, WrapVideoModeChange, (void**)&g_origVideoModeChange);	
+	}
+	else
+	{
 		char* fnStart = hook::get_pattern<char>("8B 03 41 BE 01 00 00 00 89 05", -0x47);
-
-		MH_CreateHook(fnStart, WrapVideoModeChange, (void**)&g_origVideoModeChange);
-		MH_CreateHook(hook::get_pattern("57 48 83 EC 20 49 83 63 08 00", -0xB), WrapCreateBackbuffer, (void**)&g_origCreateBackbuffer);
-		MH_EnableHook(MH_ALL_HOOKS);
-
 		g_dxgiSwapChain = hook::get_address<IDXGISwapChain**>(fnStart + 0x127);
 
-		g_resetVideoMode = hook::get_pattern<std::remove_pointer_t<decltype(g_resetVideoMode)>>("8B 44 24 50 4C 8B 17 44 8B 4E 04 44 8B 06", -0x61);
-
-		// remove render thread semaphore checks from buffer resizing
-		/*hook::nop((char*)g_resetVideoMode + 0x48, 5);
-		hook::nop((char*)g_resetVideoMode + 0x163, 5);*/
+		MH_CreateHook(fnStart, WrapVideoModeChange, (void**)&g_origVideoModeChange);	
 	}
+
+	g_resetVideoMode = hook::get_pattern<std::remove_pointer_t<decltype(g_resetVideoMode)>>("8B 44 24 50 4C 8B 17 44 8B 4E 04 44 8B 06", -0x61);
+
+	// wrap video mode changing
+	MH_CreateHook(hook::get_pattern("57 48 83 EC 20 49 83 63 08 00", -0xB), WrapCreateBackbuffer, (void**)&g_origCreateBackbuffer);
+
+	MH_EnableHook(MH_ALL_HOOKS);
 
 	if (g_disableRendering)
 	{
@@ -1536,34 +1999,32 @@ static HookFunction hookFunction([] ()
 	if (g_disableRendering)
 	{
 		uint8_t mov[] = { 0x4C, 0x8D, 0x44, 0x24, 0x40 };
-		auto location = hook::get_pattern<char>("8B D6 48 8B 01 4C 8D 44 24 40 FF 50", 2);
+		auto location = hook::get_pattern<char>("8B D6 48 8B 01 4C 8D 44 24 ? FF", 2);
 
 		hook::nop(location, 11);
 		memcpy(location, mov, 5);
 		hook::call(location + 5, FakeOutput);
 	}
 
-	// ignore frozen render device (for PIX and such)
-	//hook::put<uint32_t>(hook::pattern("8B 8E C0 0F 00 00 68 88 13 00 00 51 E8").count(2).get(0).get<void>(7), INFINITE);
-
-	/*ptrFunc = hook::pattern("8B 8E F0 09 00 00 E8 ? ? ? ? 68").count(1).get(0).get<void>(12);
-
-	hook::put(ptrFunc, InvokePostFrontendRender);*/
-
-	// frontend render phase
-	//hook::put(0xE9F1AC, InvokeFrontendCBStub);
-
-	// in-menu check for renderphasefrontend
-	//*(BYTE*)0x43AF21 = 0xEB;
-
-	// temp: d3d debug layer
-	//static void* gFunc = D3D11CreateDeviceAndSwapChain2;
-	//hook::put(0xF107CE, &gFunc);
-
 	// add D3D11_CREATE_DEVICE_BGRA_SUPPORT flag
-	void* createDeviceLoc = hook::pattern("48 8D 45 90 C7 44 24 30 07 00 00 00").count(1).get(0).get<void>(21);
-	hook::nop(createDeviceLoc, 6);
-	hook::call(createDeviceLoc, CreateD3D11DeviceWrap);
+	if (xbr::IsGameBuildOrGreater<3095>())
+	{
+		void* createDeviceLoc = hook::get_pattern("FF 15 ? ? ? ? 48 8B 15 ? ? ? ? 48 8D 0D ? ? ? ? 8B D8");
+		hook::nop(createDeviceLoc, 6);
+		hook::call(createDeviceLoc, CreateD3D11DeviceWrap);
+	}
+	else if (xbr::IsGameBuildOrGreater<2802>())
+	{
+		void* createDeviceLoc = hook::pattern("48 8D 44 24 78 89 74 24 30 89 7C 24 28").count(1).get(0).get<void>(18);
+		hook::nop(createDeviceLoc, 6);
+		hook::call(createDeviceLoc, CreateD3D11DeviceWrap);
+	}
+	else
+	{
+		void* createDeviceLoc = hook::pattern("48 8D 45 90 C7 44 24 30 07 00 00 00").count(1).get(0).get<void>(21);
+		hook::nop(createDeviceLoc, 6);
+		hook::call(createDeviceLoc, CreateD3D11DeviceWrap);
+	}
 
 	// don't crash on ID3D11DeviceContext::GetData call failures
 	// these somehow are caused by NVIDIA driver settings?
@@ -1572,7 +2033,15 @@ static HookFunction hookFunction([] ()
 	// ERR_GFX_D3D_INIT: display valid reasons
 	auto loc = hook::get_pattern<char>("75 0A B9 06 BD F7 9C E8");
 	hook::nop(loc + 2, 5);
-	hook::call(loc + 7, DisplayD3DCrashMessage);
+	hook::call(loc + 7, DisplayD3DCrashMessageWrap);
+
+	// remove infinite loop before grcResourceCache D3D failure
+	{
+		if (auto pattern = hook::pattern("EB FE 8B CF").count_hint(1); pattern.size() > 0)
+		{
+			hook::nop(pattern.get(0).get<void>(), 2);
+		}
+	}
 
 	// texture overrides
 	MH_Initialize();
@@ -1580,12 +2049,13 @@ static HookFunction hookFunction([] ()
 	MH_CreateHook(hook::get_pattern("48 8B D9 48 89 01 48 8B 49 28 E8 ? ? ? ? 48 8D", -0xD), grcTextureDtorHook, (void**)&g_origGrcTextureDtor);
 	MH_EnableHook(MH_ALL_HOOKS);
 
+	g_origCreateWindowExW = hook::iat("user32.dll", HookCreateWindowExW, "CreateWindowExW");
+
 	static HostSharedData<CfxState> initState("CfxInitState");
 
 	if (initState->isReverseGame)
 	{
 		// make window a child
-		hook::iat("user32.dll", HookCreateWindowExW, "CreateWindowExW");
 		hook::iat("user32.dll", HookShowWindow, "ShowWindow");
 		hook::iat("user32.dll", HookGetForegroundWindow, "GetForegroundWindow");
 		hook::iat("user32.dll", HookSetFocus, "SetFocus");
@@ -1604,7 +2074,13 @@ static HookFunction hookFunction([] ()
 
 	// disable render queries if in load screen thread
 	MH_Initialize();
-	MH_CreateHook(hook::get_pattern("84 C0 75 E8 48 83 C4 20 5B C3", -0x1F), WaitForQueryHook, (void**)&g_origWaitForQuery);
+
+	{
+		auto location = hook::get_pattern<char>("84 C0 75 E8 48 83 C4 20 5B C3", -0x1F);
+		hook::set_call(&g_isQueryPending, location + 0x1A);
+		MH_CreateHook(location, WaitForQueryHook, NULL);
+	}
+
 	MH_CreateHook(hook::get_pattern("41 3B C3 74 30 4C 63 CB 44", -0x1F), SetupQueryHook, (void**)&g_origSetupQuery);
 	MH_EnableHook(MH_ALL_HOOKS);
 
@@ -1621,4 +2097,51 @@ static HookFunction hookFunction([] ()
 		},
 		&a1, &a2);
 	}, INT32_MIN + 5);
+
+	// prevent the render thread from knowing present is occluded
+	hook::nop(hook::get_pattern("3D 01 00 7A 08 0F 94"), 5 + 7);
+
+	// dumb render thread sleep
+	*hook::get_address<bool*>(hook::get_pattern("75 08 8D 48 61 E8", -0x18)) = false;
+
+	// don't try to resize on minimize
+	hook::put<uint8_t>(hook::get_pattern("38 1D ? ? ? ? 89 0D ? ? ? ? 75", 12), 0xEB);
+
+	// don't handle that flag either
+	hook::put<uint8_t>(hook::get_pattern("38 05 ? ? ? ? 8A 0D ? ? ? ? 8A 15 ? ? ? ? 74 08", 18), 0xEB);
+
+	// still set up BeginFrame/BeginDraw when occluded
+	hook::put<int32_t>(hook::get_pattern("85 C0 74 2D 8B C8 E8", 0x2D), 0x81);
+
+	// and when minimized
+	hook::nop(hook::get_pattern("74 0C 84 C9 75 08 84 C0 0F", 8), 6);
+});
+
+// load the UMD early by having a 'dummy' D3D11 device so this won't slow down due to scanning
+static InitFunction initFunctionEarlyUMD([]
+{
+	{
+		auto state = CfxState::Get();
+		if (!state->IsGameProcess())
+		{
+			return;
+		}
+	}
+
+	std::thread([]()
+	{
+		IDXGIAdapter* adapter = nullptr;
+		GoGetAdapter(&adapter);
+
+		WRL::ComPtr<ID3D11Device> device;
+		HRESULT hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &device, NULL, NULL);
+
+		// release
+		if (adapter)
+		{
+			adapter->Release();
+		}
+
+		Sleep(20000);
+	}).detach();
 });

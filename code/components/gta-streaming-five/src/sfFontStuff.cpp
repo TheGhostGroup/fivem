@@ -5,6 +5,7 @@
 
 #include <MinHook.h>
 
+#include <jitasm.h>
 #include <Hooking.h>
 
 #include <Streaming.h>
@@ -25,7 +26,7 @@ static std::vector<std::string> g_fontIds = {
 	"$gtaCash",
 	// padding for bad scripts
 	"$Font2",
-	"$Font2",
+	"$Taxi_font", // added in a newer release after a $Font2 for padding
 	"$Font2",
 	"$Font2",
 	"$Font2",
@@ -160,36 +161,47 @@ struct GFxMovieRoot
 static GFxMovieDef* g_md;
 static GFxMovieRoot* g_movie;
 
+static uint32_t g_idx = 0;
+static void** g_scaleformMgr;
+
+static void InitEarlyLoading()
+{
+	if (g_idx != 0)
+	{
+		return;
+	}
+
+	if (!*g_scaleformMgr)
+	{
+		return;
+	}
+
+	uint32_t fileId = 0;
+	streaming::RegisterRawStreamingFile(&fileId, "citizen:/font_lib_cfx.gfx", true, "font_lib_cfx.gfx", false);
+
+	g_idx = fileId;
+
+	auto gfxStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("gfx");
+	auto pool = (atPoolBase*)((char*)gfxStore + 56);
+	auto refBase = pool->GetAt<char>(g_idx - gfxStore->baseIdx);
+	refBase[50] = true; // 'create movie once loaded' flag
+
+	// '7' flag so the game won't try unloading it
+	streaming::Manager::GetInstance()->RequestObject(g_idx, 7);
+
+	// we should load *now*
+	streaming::LoadObjectsNow(false);
+}
+
 template<typename TFn>
 static void HandleEarlyLoading(TFn&& cb)
 {
-	static uint32_t idx = 0;
-
-	if (idx == 0)
-	{
-		uint32_t fileId = 0;
-		streaming::RegisterRawStreamingFile(&fileId, "citizen:/font_lib_cfx.gfx", true, "font_lib_cfx.gfx", false);
-
-		idx = fileId;
-
-		auto gfxStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("gfx");
-		auto pool = (atPoolBase*)((char*)gfxStore + 56);
-		auto refBase = pool->GetAt<char>(idx - gfxStore->baseIdx);
-		refBase[50] = true; // 'create movie once loaded' flag
-
-		// '7' flag so the game won't try unloading it
-		streaming::Manager::GetInstance()->RequestObject(idx, 7);
-
-		// we should load *now*
-		streaming::LoadObjectsNow(false);
-	}
-
-	if (idx != 0)
+	if (g_idx != 0)
 	{
 		auto gfxStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("gfx");
 
 		auto pool = (atPoolBase*)((char*)gfxStore + 56);
-		auto refBase = pool->GetAt<char*>(idx - gfxStore->baseIdx);
+		auto refBase = pool->GetAt<char*>(g_idx - gfxStore->baseIdx);
 
 		auto ref = *refBase;
 
@@ -265,36 +277,6 @@ static hook::cdecl_stub<void*(GFxMovieRoot*, int)> _gfxMovieRoot_getLevelMovie([
 	return hook::get_pattern("48 8B 49 40 44 8B C0 4D 03 C0 42 39 14 C1 74 0D", -0xB);
 });
 
-static void* Alloc_Align(void* self, size_t size, size_t align)
-{
-	return _aligned_malloc(size, align);
-}
-
-static void* Alloc(void* self, size_t size)
-{
-	return _aligned_malloc(size, 16);
-}
-
-static void* Realloc(void* self, void* ptr, size_t size)
-{
-	return _aligned_realloc(ptr, size, 16);
-}
-
-static void Free(void* self, void* ptr)
-{
-	_aligned_free(ptr);
-}
-
-static void* AllocAuto_Align(void* self, void* h, size_t size, size_t align)
-{
-	return _aligned_malloc(size, align);
-}
-
-static void* AllocAuto(void* self, void* h, size_t size)
-{
-	return _aligned_malloc(size, 16);
-}
-
 class GFxMemoryHeap
 {
 public:
@@ -314,11 +296,6 @@ public:
 };
 
 extern GFxMemoryHeap** g_gfxMemoryHeap;
-
-static void* GetHeap(void* self)
-{
-	return self;
-}
 
 static LONG SafetyFilter(PEXCEPTION_POINTERS pointers)
 {
@@ -532,6 +509,16 @@ static HookFunction hookFunction([]()
 		hook::call(location + 32, AssignFontLibWrap);
 	}
 
+	{
+		auto location = hook::get_pattern<char>("74 1A 80 3D ? ? ? ? 00 74 11 E8 ? ? ? ? 48 8B");
+		g_scaleformMgr = hook::get_address<void**>(location + 19);
+	}
+
+	OnLookAliveFrame.Connect([]()
+	{
+		InitEarlyLoading();
+	});
+
 	OnMainGameFrame.Connect([]()
 	{
 		UpdateFontLoading();
@@ -720,25 +707,57 @@ static HookFunction hookFunction([]()
 
 	hook::call(hook::get_pattern("F3 0F 58 55 34 F3 0F 11 4D C0 F3 0F 11 55 CC", 24), lineBufferStub.GetCode());
 
-	// formerly debuggability for GFx heap, but as it seems now this is required to not get memory corruption
-	// (memory locking, maybe? GFx allows disabling thread safety of its heap)
-	// TODO: figure this out
-	auto memoryHeapPt = hook::get_address<void**>(hook::get_call(hook::get_pattern<char>("41 F6 06 04 75 03 83 CD 20", 12)) + 0x19);
-	memoryHeapPt[9] = Alloc_Align;
-	memoryHeapPt[10] = Alloc;
-	memoryHeapPt[11] = Realloc;
-	memoryHeapPt[12] = Free;
-	memoryHeapPt[13] = AllocAuto_Align;
-	memoryHeapPt[14] = AllocAuto;
-	memoryHeapPt[15] = GetHeap;
+	// fix bug when img tag is last in a text formatting tag (https://github.com/citizenfx/fivem/issues/1112)
+	static void (*origPopBack)(void* vec, size_t len);
+
+	struct TextFormat
+	{
+		char pad[66];
+		uint16_t presentMask;
+		char pad2[12];
+	};
+
+	struct ElemDesc
+	{
+		char pad[32];
+		TextFormat fmt;
+		char paraFmt[24];
+	};
+
+	static struct : jitasm::Frontend
+	{
+		void InternalMain() override
+		{
+			lea(r8, qword_ptr[rbp + 0x300]);
+			mov(rax, (uint64_t)ParseHtmlReset);
+			jmp(rax);
+		}
+
+		static void ParseHtmlReset(ElemDesc** vec, size_t len, TextFormat* format)
+		{
+			if (len > 0)
+			{
+				(*vec)[len - 1].fmt.presentMask |= (*vec)[len].fmt.presentMask;
+			}
+			else
+			{
+				format->presentMask |= (*vec)[len].fmt.presentMask;
+			}
+
+			origPopBack(vec, len);
+		}
+	} parseHtmlStub;
+
+	{
+		auto location = hook::get_pattern<char>("49 8D 54 24 FF 48 8D 4D 80 E8", 9);
+		hook::set_call(&origPopBack, location);
+		hook::call(location, parseHtmlStub.GetCode());
+		hook::call(location + 0x62, parseHtmlStub.GetCode());
+	}
 
 	// undo fonts if reloading
 	OnKillNetworkDone.Connect([]()
 	{
 		g_loadedFonts.clear();
 	});
-
-	// always enable locking for GFx heap
-	// doesn't fix it, oddly - probably singlethreaded non-atomic reference counts?
-	//hook::put<uint8_t>(hook::get_pattern("24 01 41 88 87 C0 00 00 00 41 8B"), 0xB0);
 });

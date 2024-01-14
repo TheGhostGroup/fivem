@@ -24,7 +24,7 @@ inline bool IsSDKGuest()
 	static auto isSdkGuest = ([]()
 	{
 #ifndef IS_FXSERVER
-		if (wcsstr(GetCommandLineW(), L"dkguest") != nullptr)
+		if (getenv("CitizenFX_SDK_Guest"))
 		{
 			return true;
 		}
@@ -35,7 +35,24 @@ inline bool IsSDKGuest()
 
 	return isSdkGuest;
 }
-	
+
+inline bool IsFXNode()
+{
+	static auto isFXNode = ([]()
+	{
+#ifndef IS_FXSERVER
+		if (wcsstr(GetCommandLineW(), L"--start-node") != nullptr)
+		{
+			return true;
+		}
+#endif
+
+		return false;
+	})();
+
+	return isFXNode;
+}
+
 inline bool IsSDK()
 {
 	static auto isSdk = ([]()

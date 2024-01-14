@@ -110,6 +110,36 @@ int Client_getfds(struct pollfd *pollfds)
 	return 0;
 }
 
+bool Client_is_player_muted(int serverId)
+{
+	auto convertedServerId = fmt::sprintf("[%d]", serverId);
+	struct dlist *itr, *save;
+	list_iterate_safe(itr, save, &clients)
+	{
+		client_t* c;
+		c = list_get_entry(itr, client_t, node);
+		if (c->username && strstr(c->username, convertedServerId.c_str()))
+		{
+			return c->mute;
+		}
+	}
+}
+
+void Client_set_player_muted(int serverId, bool muted)
+{
+	auto convertedServerId = fmt::sprintf("[%d]", serverId);
+	struct dlist *itr, *save;
+	list_iterate_safe(itr, save, &clients)
+	{
+		client_t* c;
+		c = list_get_entry(itr, client_t, node);
+		if (c->username && strstr(c->username, convertedServerId.c_str())) {
+			c->mute = muted;
+			break;
+		}
+	}
+}
+
 void Client_janitor()
 {
 	std::unique_lock<std::recursive_mutex> lock(g_mumbleClientMutex);
@@ -392,11 +422,15 @@ int Client_add(fwRefContainer<net::TcpServerStream> stream, client_t** client)
 	return 0;
 }
 
+extern void Server_onFree(client_t* client);
+
 void Client_free(client_t *client)
 {
 	struct dlist *itr, *save;
 	message_t *sendmsg;
 	bool_t authenticatedLeft = client->authenticated;
+
+	Server_onFree(client);
 
 	if (client->authenticated) {
 		int leave_id;
@@ -637,8 +671,8 @@ int Client_send_message(client_t *client, message_t *msg)
 	}
 	if (client->txsize != 0) {
 		/* Queue message */
-		if ((client->txQueueCount > 5 &&  msg->messageType == UDPTunnel) ||
-			client->txQueueCount > 30) {
+		if ((client->txQueueCount > 25 &&  msg->messageType == UDPTunnel) ||
+			client->txQueueCount > 150) {
 			Msg_free(msg);
 			return -1;
 		}
@@ -911,7 +945,7 @@ int Client_voiceMsg(client_t *client, uint8_t *data, int len)
 	channel_t *ch = (channel_t *)client->channel;
 	struct dlist *itr;
 
-	eastl::fixed_set<client_t*, 10> listeningUsers;
+	eastl::fixed_set<client_t*, 256> listeningUsers;
 
 	if (!client->authenticated || client->mute || client->self_mute || !ch || ch->silent)
 		goto out;
@@ -953,7 +987,7 @@ int Client_voiceMsg(client_t *client, uint8_t *data, int len)
 		list_iterate(itr, &ch->clients) {
 			client_t *c;
 			c = list_get_entry(itr, client_t, chan_node);
-			Client_send_voice(client, c, buffer, pds->offset + 1, poslen);
+			listeningUsers.insert(c);
 		}
 
 		for (unsigned int currentSession : ChannelListener::getListenersForChannel(ch))
@@ -987,7 +1021,7 @@ int Client_voiceMsg(client_t *client, uint8_t *data, int len)
 			list_iterate(itr, &ch->clients) {
 				client_t *c;
 				c = list_get_entry(itr, client_t, chan_node);
-				Client_send_voice(client, c, buffer, pds->offset + 1, poslen);
+				listeningUsers.insert(c);
 			}
 
 			// Send audio to all users that are listening to the channel
@@ -1040,7 +1074,7 @@ int Client_voiceMsg(client_t *client, uint8_t *data, int len)
 						if (!ChannelListener::isListening(c, ch_link))
 						{
 							Log_debug("Linked voice from %s -> %s", ch->name, ch_link->name);
-							Client_send_voice(client, c, buffer, pds->offset + 1, poslen);
+							listeningUsers.insert(c);
 						}
 					}
 				}
@@ -1057,7 +1091,7 @@ int Client_voiceMsg(client_t *client, uint8_t *data, int len)
 						client_t *c;
 						c = list_get_entry(itr, client_t, chan_node);
 						Log_debug("Child voice from %s -> %s", ch->name, sub->name);
-						Client_send_voice(client, c, buffer, pds->offset + 1, poslen);
+						listeningUsers.insert(c);
 					}
 				}
 				Chan_freeTreeList(&chanlist);
@@ -1071,7 +1105,7 @@ int Client_voiceMsg(client_t *client, uint8_t *data, int len)
 			while (Client_iterate(&c) != NULL) {
 				channel_t* ch = (channel_t*)c->channel;
 				if ((!ch || targeted_channels.find(ch->id) == targeted_channels.end()) && c->sessionId == vt->sessions[i]) {
-					Client_send_voice(client, c, buffer, pds->offset + 1, poslen);
+					listeningUsers.insert(c);
 					break;
 				}
 			}

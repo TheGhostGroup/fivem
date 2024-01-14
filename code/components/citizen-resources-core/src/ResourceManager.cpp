@@ -12,8 +12,6 @@
 
 #include <skyr/url.hpp>
 
-#include <ETWProviders/etwprof.h>
-
 static fx::ResourceManager* g_globalManager;
 static thread_local fx::ResourceManager* g_currentManager;
 
@@ -22,16 +20,6 @@ namespace fx
 ResourceManagerImpl::ResourceManagerImpl()
 {
 	OnInitializeInstance(this);
-
-	OnTick.Connect([this]()
-	{
-		// execute resource tick functions
-		ForAllResources([](fwRefContainer<Resource> resource)
-		{
-			CETWScope etwScope(va("%s tick", resource->GetName()));
-			resource->Tick();
-		});
-	});
 }
 
 fwRefContainer<ResourceMounter> ResourceManagerImpl::GetMounterForUri(const std::string& uri)
@@ -86,6 +74,7 @@ pplx::task<tl::expected<fwRefContainer<Resource>, ResourceManagerError>> Resourc
 		{
 			if (resourceRef)
 			{
+				std::unique_lock<std::recursive_mutex> lock(m_resourcesMutex);
 				auto resource = resourceRef.value();
 
 				// handle provides
@@ -93,7 +82,6 @@ pplx::task<tl::expected<fwRefContainer<Resource>, ResourceManagerError>> Resourc
 
 				for (const auto& entry : md->GetEntries("provide"))
 				{
-					std::unique_lock<std::recursive_mutex> lock(m_resourcesMutex);
 					m_resourceProvides.emplace(entry.second, resource);
 				}
 			}
@@ -191,23 +179,16 @@ void ResourceManagerImpl::ResetResources()
 	auto lastManager = g_currentManager;
 	g_currentManager = this;
 
-	auto cfxInternal = m_resources["_cfx_internal"];
-
 	ForAllResources([] (fwRefContainer<Resource> resource)
 	{
 		fwRefContainer<ResourceImpl> impl = resource;
 
-		if (impl->GetName() != "_cfx_internal")
-		{
-			impl->Stop();
-			impl->Destroy();
-		}
+		impl->Stop();
+		impl->Destroy();
 	});
 
 	m_resourceProvides.clear();
 	m_resources.clear();
-
-	m_resources["_cfx_internal"] = cfxInternal;
 
 	OnAfterReset();
 

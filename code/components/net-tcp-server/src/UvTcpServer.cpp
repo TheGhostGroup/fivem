@@ -102,6 +102,11 @@ bool UvTcpServer::Listen(std::shared_ptr<uvw::TCPHandle>&& server)
 
 	auto threadCount = std::min(std::max(int(std::thread::hardware_concurrency() / 2), 1), 8);
 
+	// client builds don't need that many threads
+#ifndef IS_FXSERVER
+	threadCount = std::min(threadCount, 3);
+#endif
+
 	for (int i = 0; i < threadCount; i++)
 	{
 		auto cs = std::make_shared<UvTcpChildServer>(this, m_pipeName, m_helloMessage, i);
@@ -189,7 +194,7 @@ void UvTcpServer::OnConnection(int status)
 #ifdef _WIN32
 	if (m_tryDetachFromIOCP)
 	{
-		auto fd = clientHandle->fileno();
+		auto fd = clientHandle->fd();
 
 		FILE_COMPLETION_INFORMATION info = { 0 };
 		IO_STATUS_BLOCK block;
@@ -310,6 +315,11 @@ void UvTcpServerStream::CloseClient()
 		if (writeCallback)
 		{
 			writeCallback->clear();
+
+			writeCallback->once<uvw::CloseEvent>([writeCallback](const uvw::CloseEvent&, uvw::AsyncHandle& h)
+			{
+				(void)writeCallback;
+			});
 			writeCallback->close();
 		}
 
@@ -322,12 +332,40 @@ void UvTcpServerStream::CloseClient()
 		if (writeTimeout)
 		{
 			writeTimeout->clear();
+
+			writeTimeout->once<uvw::CloseEvent>([writeTimeout](const uvw::CloseEvent&, uvw::TimerHandle& h)
+			{
+				(void)writeTimeout;
+			});
 			writeTimeout->close();
 		}
 
+		auto clientPtr = std::make_shared<decltype(client)>(client);
+
+		auto onShutdown = [clientPtr]()
+		{
+			(*clientPtr)->once<uvw::CloseEvent>([clientPtr](const uvw::CloseEvent& e, uvw::TCPHandle& h)
+			{
+				*clientPtr = {};
+			});
+
+			(*clientPtr)->close();
+		};
+
+		// if uv_shutdown() fails, we still need to close the handle!
+		// therefore also trip on ErrorEvent.
+		client->once<uvw::ErrorEvent>([onShutdown](const uvw::ErrorEvent& e, uvw::TCPHandle& h)
+		{
+			onShutdown();
+		});
+
+		client->once<uvw::ShutdownEvent>([onShutdown](const uvw::ShutdownEvent& e, uvw::TCPHandle& h)
+		{
+			onShutdown();
+		});
+
 		client->stop();
 		client->shutdown();
-		client->close();
 
 		m_client = {};
 	}
@@ -560,14 +598,6 @@ void UvTcpServerStream::WriteInternal(std::unique_ptr<char[]> data, size_t size,
 
 			client->once<uvw::WriteEvent>([clientWeak, cb, c1 = std::move(c1), c2 = std::move(c2)](const uvw::WriteEvent& e, uvw::TCPHandle& h) mutable
 			{
-				auto client = clientWeak.lock();
-
-				if (client)
-				{
-					client->erase<uvw::EndEvent>(c1);
-					client->erase<uvw::ErrorEvent>(c2);
-				}
-
 				auto c = *cb;
 
 				if (c)

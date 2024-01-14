@@ -8,6 +8,8 @@
 #include "StdInc.h"
 
 #include <imgui.h>
+
+#define GImGui ImGui::GetCurrentContext()
 #include <imgui_internal.h>
 #include <ConsoleHost.h>
 
@@ -19,16 +21,30 @@
 
 #include <regex>
 
-#ifndef IS_LAUNCHER
+#if __has_include("nutsnbolts.h")
 #include <nutsnbolts.h>
 #endif
 
 #include <se/Security.h>
 
+#include <boost/circular_buffer.hpp>
 #include <concurrent_queue.h>
 
+bool IsNonProduction();
+
+DLL_EXPORT console::Context* g_customConsoleContext;
+
+console::Context* GetConsoleContext()
+{
+	if (g_customConsoleContext)
+	{
+		return g_customConsoleContext;
+	}
+
+	return console::GetDefaultContext();
+}
+
 extern ImFont* consoleFontSmall;
-extern ImFont* consoleFontTiny;
 
 // following 2 functions based on https://www.programmingalgorithms.com/algorithm/hsl-to-rgb/cpp/
 static float HueToRGB(float v1, float v2, float vH) {
@@ -84,10 +100,14 @@ static CRGBA HSLToRGB(HSL hsl) {
 
 struct FiveMConsoleBase
 {
-	ImVector<char*> Items;
-	ImVector<char*> ItemKeys;
+	boost::circular_buffer<std::string> Items{ 2500 };
+	boost::circular_buffer<std::string> ItemKeys{ 2500 };
 
 	std::recursive_mutex ItemsMutex;
+
+	virtual void RunCommandQueue()
+	{
+	}
 
 	// Portable helpers
 	static int Stricmp(const char* str1, const char* str2) { int d; while ((d = toupper(*str2) - toupper(*str1)) == 0 && *str1) { str1++; str2++; } return d; }
@@ -105,9 +125,8 @@ struct FiveMConsoleBase
 
 		{
 			std::unique_lock<std::recursive_mutex> lock(ItemsMutex);
-
-			ItemKeys.push_back(Strdup(key));
-			Items.push_back(Strdup(buf));
+			ItemKeys.push_back(key);
+			Items.push_back(buf);
 
 			OnAddLog(key, buf);
 		}
@@ -132,14 +151,12 @@ struct FiveMConsoleBase
 
 	virtual void DrawItem(int i, float alpha = 1.0f, bool fullBg = false)
 	{
-		const char* item = Items[i];
-		const char* key = ItemKeys[i];
+		const auto& item = Items[i];
+		auto key = ItemKeys[i];
 
-		if (strlen(key) > 0 && strlen(item) > 0)
+		if (strlen(key.c_str()) > 0 && strlen(item.c_str()) > 0)
 		{
-			ImGui::PushFont(consoleFontSmall);
-
-			auto hue = int{ HashRageString(key) % 360 };
+			auto hue = int{ HashRageString(key.c_str()) % 360 };
 			auto color = HSLToRGB(HSL{ hue, 0.8f, 0.4f });
 			color.alpha = alpha * 255.0f;
 
@@ -147,11 +164,10 @@ struct FiveMConsoleBase
 
 			if (fullBg)
 			{
-				refStr = fmt::sprintf("[%s]:", key);
-				key = refStr.c_str();
+				key = fmt::sprintf("[%s]:", key);
 			}
 
-			auto textSize = ImGui::CalcTextSize(key);
+			auto textSize = ImGui::CalcTextSize(key.c_str());
 
 			auto dl = ImGui::GetCurrentContext()->CurrentWindow->DrawList;
 			auto startPos = ImGui::GetCursorScreenPos();
@@ -160,30 +176,30 @@ struct FiveMConsoleBase
 
 			if (fullBg)
 			{
-				itemSize = ImGui::CalcTextSize(item);
+				itemSize = ImGui::CalcTextSize(item.c_str());
 				itemSize.x += 8.0f;
 
 				color.alpha *= 0.8f;
 			}
 
-			dl->AddRectFilled(ImVec2(startPos.x, startPos.y + 1.0f), ImVec2(startPos.x + textSize.x + itemSize.x + 8.0f, startPos.y + 22.f - 1.0f), color.AsARGB(), fullBg ? 10.0f : 6.0f);
+			dl->AddRectFilled(ImVec2(startPos.x, startPos.y + 1.0f), ImVec2(startPos.x + textSize.x + itemSize.x + 8.0f, startPos.y + textSize.y - 1.0f), color.AsARGB(), fullBg ? 10.0f : 6.0f);
 			ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 4.0f);
 
 			//ImGui::PushStyleColor(ImGuiCol_Text, col);
-			ImGui::TextUnformatted(key);
+			ImGui::TextUnformatted(key.c_str());
 			//ImGui::PopStyleColor();
-
-			ImGui::PopFont();
 
 			ImGui::SameLine(textSize.x + 16.0f);
 		}
 
 		ImVec4 col = ImVec4(1.0f, 1.0f, 1.0f, alpha);
 
-		if (strstr(item, "[error]")) col = ImColor(1.0f, 0.4f, 0.4f, alpha);
-		else if (strncmp(item, "# ", 2) == 0) col = ImColor(1.0f, 0.78f, 0.58f, alpha);
+		if (strstr(item.c_str(), "[error]"))
+			col = ImColor(1.0f, 0.4f, 0.4f, alpha);
+		else if (strncmp(item.c_str(), "# ", 2) == 0)
+			col = ImColor(1.0f, 0.78f, 0.58f, alpha);
 		ImGui::PushStyleColor(ImGuiCol_Text, col);
-		ImGui::TextUnformatted(item);
+		ImGui::TextUnformatted(item.c_str());
 		ImGui::PopStyleColor();
 	}
 
@@ -191,16 +207,36 @@ struct FiveMConsoleBase
 	{
 		std::unique_lock<std::recursive_mutex> lock(ItemsMutex);
 
-		for (int i = 0; i < Items.Size; i++)
-		{
-			free(Items[i]);
-			free(ItemKeys[i]);
-		}
-
 		Items.clear();
 		ItemKeys.clear();
 	}
 };
+
+extern float g_menuHeight;
+
+#ifndef IS_FXSERVER
+#include <HostSharedData.h>
+#include <../launcher/TickCountData.h>
+
+#include <shellapi.h>
+
+static void OpenLogFile()
+{
+	static TickCountData initTickCount = ([]()
+	{
+		HostSharedData<TickCountData> initTickCountRef("CFX_SharedTickCount");
+		return *initTickCountRef;
+	})();
+
+	static fwPlatformString dateStamp = fmt::sprintf(L"%04d-%02d-%02dT%02d%02d%02d", initTickCount.initTime.wYear, initTickCount.initTime.wMonth,
+	initTickCount.initTime.wDay, initTickCount.initTime.wHour, initTickCount.initTime.wMinute, initTickCount.initTime.wSecond);
+
+	auto fileName = MakeRelativeCitPath(fmt::sprintf(L"logs/CitizenFX_log_%s.log", dateStamp));
+
+	ShellExecuteW(NULL, L"open", fileName.c_str(), NULL, NULL, SW_SHOWNORMAL);
+}
+
+#endif
 
 struct CfxBigConsole : FiveMConsoleBase
 {
@@ -247,28 +283,53 @@ struct CfxBigConsole : FiveMConsoleBase
 		ScrollToBottom = true;
 	}
 
+	virtual bool PreStartWindow()
+	{
+#ifndef IS_FXSERVER
+		if (GetKeyState(VK_CONTROL) & 0x8000 && GetKeyState(VK_MENU) & 0x8000)
+		{
+			return false;
+		}
+#endif
+
+		return true;
+	}
+
+	virtual bool StartWindow(const char* title, bool* p_open)
+	{
+		ImGui::SetNextWindowPos(ImVec2(ImGui::GetMainViewport()->Pos.x + 0, ImGui::GetMainViewport()->Pos.y + g_menuHeight));
+		ImGui::SetNextWindowSize(ImVec2(ImGui::GetIO().DisplaySize.x,
+#ifndef IS_FXSERVER
+								 ImGui::GetFrameHeightWithSpacing() * 12.0f
+#else
+								 ImGui::GetIO().DisplaySize.y - g_menuHeight
+#endif
+								 ),
+		ImGuiCond_Always);
+
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+
+		ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+		return ImGui::Begin(title, nullptr, flags);
+	}
+
+	virtual void EndWindow()
+	{
+		ImGui::End();
+		ImGui::PopStyleVar();
+	}
+
 	void Draw(const char* title, bool* p_open) override
 	{
-		if (GetKeyState(VK_CONTROL) & 0x8000 && GetKeyState(VK_MENU) & 0x8000)
+		if (!PreStartWindow())
 		{
 			return;
 		}
 
-		ImGui::SetNextWindowSize(ImVec2(ImGui::GetIO().DisplaySize.x, ImGui::GetFrameHeightWithSpacing() * 12.0f), ImGuiCond_FirstUseEver);
-		ImGui::SetNextWindowPos(ImVec2(0, 0));
-
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-
-		ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
-			ImGuiWindowFlags_NoScrollbar |
-			ImGuiWindowFlags_NoMove |
-			ImGuiWindowFlags_NoResize |
-			ImGuiWindowFlags_NoSavedSettings;
-
-		if (!ImGui::Begin(title, nullptr, flags))
+		if (!StartWindow(title, p_open))
 		{
-			ImGui::End();
-			ImGui::PopStyleVar();
+			EndWindow();
 			return;
 		}
 
@@ -307,7 +368,7 @@ struct CfxBigConsole : FiveMConsoleBase
 		// and appending newly elements as they are inserted. This is left as a task to the user until we can manage to improve this example code!
 		// If your items are of variable size you may want to implement code similar to what ImGuiListClipper does. Or split your data into fixed height items to allow random-seeking into your list.
 		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 1)); // Tighten spacing
-		ImGuiListClipper clipper(Items.Size);
+		ImGuiListClipper clipper(Items.size());
 		while (clipper.Step())
 		{
 			for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++)
@@ -317,7 +378,7 @@ struct CfxBigConsole : FiveMConsoleBase
 		}
 
 		if (ScrollToBottom)
-			ImGui::SetScrollHere();
+			ImGui::SetScrollHereY();
 
 		ScrollToBottom = false;
 		ImGui::PopStyleVar();
@@ -325,22 +386,57 @@ struct CfxBigConsole : FiveMConsoleBase
 		ImGui::Separator();
 
 		// Command-line
-		if (ImGui::InputText("_", InputBuf, _countof(InputBuf), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackCompletion | ImGuiInputTextFlags_CallbackHistory, &TextEditCallbackStub, (void*)this))
+		float w = 0.0f;
+		
+#ifndef IS_FXSERVER
+		w = (ImGui::CalcTextSize("Open log").x + (ImGui::GetStyle().ItemSpacing.x * 4));
+#endif
+
+		ImGui::PushItemWidth(ImGui::GetWindowWidth() - w);
+
+		bool reclaim_focus = false;
+		if (ImGui::InputText("##_Input", InputBuf, _countof(InputBuf), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackCompletion | ImGuiInputTextFlags_CallbackHistory, &TextEditCallbackStub, (void*)this))
 		{
 			char* input_end = InputBuf + strlen(InputBuf);
 			while (input_end > InputBuf && input_end[-1] == ' ') input_end--; *input_end = 0;
 			if (InputBuf[0])
 				ExecCommand(InputBuf);
 			strcpy(InputBuf, "");
+			reclaim_focus = true;
+		}
+		ImGui::PopItemWidth();
+
+		// Auto-focus on window apparition
+		ImGui::SetItemDefaultFocus();
+		if (ImGui::IsWindowAppearing())
+		{
+			ImGui::ActivateItem(ImGui::GetItemID());
+			GImGui->NavNextActivateFlags = ImGuiActivateFlags_PreferInput;
 		}
 
-		// Demonstrate keeping auto focus on the input box
-		if (ImGui::IsItemHovered() || (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::IsAnyItemActive() && !ImGui::IsMouseClicked(0)))
+		if (reclaim_focus)
+		{
 			ImGui::SetKeyboardFocusHere(-1); // Auto focus previous widget
+		}
 
-		ImGui::End();
+#ifndef IS_FXSERVER
+		ImGui::SameLine();
 
-		ImGui::PopStyleVar();
+		static bool shouldOpenLog;
+
+		if (shouldOpenLog)
+		{
+			OpenLogFile();
+			shouldOpenLog = false;
+		}
+
+		if (ImGui::Button("Open log"))
+		{
+			shouldOpenLog = true;
+		}
+#endif
+
+		EndWindow();
 	}
 
 	void ExecCommand(const char* command_line)
@@ -375,13 +471,13 @@ struct CfxBigConsole : FiveMConsoleBase
 		}
 	}
 
-	static int TextEditCallbackStub(ImGuiTextEditCallbackData* data) // In C++11 you are better off using lambdas for this sort of forwarding callbacks
+	static int TextEditCallbackStub(ImGuiInputTextCallbackData* data) // In C++11 you are better off using lambdas for this sort of forwarding callbacks
 	{
 		CfxBigConsole* console = (CfxBigConsole*)data->UserData;
 		return console->TextEditCallback(data);
 	}
 
-	int TextEditCallback(ImGuiTextEditCallbackData* data)
+	int TextEditCallback(ImGuiInputTextCallbackData* data)
 	{
 		//AddLog("cursor: %d, selection: %d-%d", data->CursorPos, data->SelectionStart, data->SelectionEnd);
 		switch (data->EventFlag)
@@ -402,26 +498,50 @@ struct CfxBigConsole : FiveMConsoleBase
 			}
 
 			// Build a list of candidates
-			ImVector<const char*> candidates;
+			std::set<std::string> candidates;
 
-			console::GetDefaultContext()->GetCommandManager()->ForAllCommands([&](const std::string& command)
+			auto hasAccess = [](const std::string& command)
 			{
-				if (Strnicmp(command.c_str(), word_start, (int)(word_end - word_start)) == 0)
+				if (IsNonProduction())
 				{
-					candidates.push_back(Strdup(command.c_str()));
+					return true;
+				}
+
+				se::ScopedPrincipalReset reset;
+				se::ScopedPrincipal principal{
+					se::Principal{
+					"system.extConsole" }
+				};
+
+				return seCheckPrivilege(fmt::sprintf("command.%s", command));
+			};
+
+			GetConsoleContext()->GetCommandManager()->ForAllCommands([&](const std::string& command)
+			{
+				if (Strnicmp(command.c_str(), word_start, (int)(word_end - word_start)) == 0 && hasAccess(command))
+				{
+					candidates.insert(command);
 				}
 			});
 
-			if (candidates.Size == 0)
+			console::GetDefaultContext()->GetCommandManager()->ForAllCommands([&](const std::string& command)
+			{
+				if (Strnicmp(command.c_str(), word_start, (int)(word_end - word_start)) == 0 && hasAccess(command))
+				{
+					candidates.insert(command);
+				}
+			});
+
+			if (candidates.empty())
 			{
 				// No match
 				AddLog("", "No match for \"%.*s\"!\n", (int)(word_end - word_start), word_start);
 			}
-			else if (candidates.Size == 1)
+			else if (candidates.size() == 1)
 			{
 				// Single match. Delete the beginning of the word and replace it entirely so we've got nice casing
 				data->DeleteChars((int)(word_start - data->Buf), (int)(word_end - word_start));
-				data->InsertChars(data->CursorPos, candidates[0]);
+				data->InsertChars(data->CursorPos, candidates.begin()->c_str());
 				data->InsertChars(data->CursorPos, " ");
 			}
 			else
@@ -432,11 +552,21 @@ struct CfxBigConsole : FiveMConsoleBase
 				{
 					int c = 0;
 					bool all_candidates_matches = true;
-					for (int i = 0; i < candidates.Size && all_candidates_matches; i++)
+					int i = 0;
+					for (const auto& candidate : candidates)
+					{
 						if (i == 0)
-							c = toupper(candidates[i][match_len]);
-						else if (c == 0 || c != toupper(candidates[i][match_len]))
+							c = toupper(candidate[match_len]);
+						else if (c == 0 || c != toupper(candidate[match_len]))
 							all_candidates_matches = false;
+
+						i++;
+
+						if (!all_candidates_matches)
+						{
+							break;
+						}
+					}
 					if (!all_candidates_matches)
 						break;
 					match_len++;
@@ -445,18 +575,13 @@ struct CfxBigConsole : FiveMConsoleBase
 				if (match_len > 0)
 				{
 					data->DeleteChars((int)(word_start - data->Buf), (int)(word_end - word_start));
-					data->InsertChars(data->CursorPos, candidates[0], candidates[0] + match_len);
+					data->InsertChars(data->CursorPos, candidates.begin()->c_str(), candidates.begin()->c_str() + match_len);
 				}
 
 				// List matches
 				AddLog("", "Possible matches:\n");
-				for (int i = 0; i < candidates.Size; i++)
-					AddLog("", "- %s\n", candidates[i]);
-			}
-
-			for (auto& candidate : candidates)
-			{
-				free(const_cast<char*>(candidate));
+				for (const auto& candidate : candidates)
+					AddLog("", "- %s\n", candidate.c_str());
 			}
 
 			break;
@@ -490,18 +615,61 @@ struct CfxBigConsole : FiveMConsoleBase
 		return 0;
 	}
 
-	void RunCommandQueue()
+	virtual void RunCommandQueue() override
 	{
 		std::string command_line;
 
 		while (CommandQueue.try_pop(command_line))
 		{
-			se::ScopedPrincipal scope(se::Principal{ "system.console" });
+			se::ScopedPrincipal scope(se::Principal{ (IsNonProduction()) ? "system.console" : "system.extConsole" });
 
-			console::GetDefaultContext()->AddToBuffer(command_line);
-			console::GetDefaultContext()->AddToBuffer("\n");
-			console::GetDefaultContext()->ExecuteBuffer();
+			GetConsoleContext()->AddToBuffer(command_line);
+			GetConsoleContext()->AddToBuffer("\n");
+			GetConsoleContext()->ExecuteBuffer();
 		}
+	}
+
+	virtual bool FilterLog(const std::string& channel) override
+	{
+		if (IsNonProduction())
+		{
+			return true;
+		}
+
+		if (channel == "script:game:nui")
+		{
+			return false;
+		}
+
+		if (channel == "cmd" || channel == "IO")
+		{
+			return true;
+		}
+
+		return channel.find("script:") == 0;
+	}
+};
+
+// WinConsole is a midway point between minicon and the f8 console
+struct CfxWinConsole : CfxBigConsole
+{
+	virtual bool PreStartWindow() override
+	{
+		return true;
+	}
+
+	virtual bool StartWindow(const char* title, bool* p_open) override
+	{
+		ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar;
+
+		ImGui::SetNextWindowSize(ImVec2(800, 480), ImGuiCond_FirstUseEver);
+
+		return ImGui::Begin(title, p_open, flags);
+	}
+
+	virtual void EndWindow() override
+	{
+		ImGui::End();
 	}
 };
 
@@ -524,7 +692,7 @@ struct MiniConsole : CfxBigConsole
 
 	MiniConsole()
 	{
-		m_miniconChannels = new ConVar<std::string>("con_miniconChannels", ConVar_Archive, "minicon:*");
+		m_miniconChannels = new ConVar<std::string>("con_miniconChannels", ConVar_Archive | ConVar_UserPref, "minicon:*");
 		m_miniconLastValue = m_miniconChannels->GetValue();
 
 		try
@@ -545,12 +713,12 @@ struct MiniConsole : CfxBigConsole
 		ImGui::PushFont(consoleFontSmall);
 
 		ImGui::SetNextWindowBgAlpha(0.0f);
-		ImGui::SetNextWindowPos(ImVec2(20, io.DisplaySize.y - 20), ImGuiCond_Once, ImVec2(0.0f, 1.0f));
+		ImGui::SetNextWindowPos(ImVec2(ImGui::GetMainViewport()->Pos.x + 20, ImGui::GetMainViewport()->Pos.y + io.DisplaySize.y - 20), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
 		ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * 0.4f, ImGui::GetFrameHeightWithSpacing() * 12.0f));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
 		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 4)); // Tighten spacing
 
-		if (ImGui::Begin("MiniCon", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar))
+		if (ImGui::Begin("MiniCon", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoFocusOnAppearing))
 		{
 			auto t = msec();
 
@@ -560,9 +728,6 @@ struct MiniConsole : CfxBigConsole
 			{
 				while ((ItemTimes.size() > 1 && (t - ItemTimes[0]) > std::chrono::seconds(10)) || Items.size() > 14)
 				{
-					free(Items[0]);
-					free(ItemKeys[0]);
-
 					Items.erase(Items.begin());
 					ItemKeys.erase(ItemKeys.begin());
 					ItemTimes.erase(ItemTimes.begin());
@@ -570,16 +735,13 @@ struct MiniConsole : CfxBigConsole
 
 				if (ItemTimes.size() == 1 && ((t - ItemTimes[0]) > std::chrono::seconds(10)))
 				{
-					free(Items[0]);
-					free(ItemKeys[0]);
-
-					Items[0] = Strdup("");
-					ItemKeys[0] = Strdup("");
+					Items[0] = "";
+					ItemKeys[0] = "";
 					ItemTimes[0] = t;
 				}
 			}
 
-			ImGuiListClipper clipper(Items.Size);
+			ImGuiListClipper clipper(Items.size());
 			while (clipper.Step())
 			{
 				for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++)
@@ -601,7 +763,7 @@ struct MiniConsole : CfxBigConsole
 				}
 			}
 
-			ImGui::SetScrollHere();
+			ImGui::SetScrollHereY();
 		}
 
 		ImGui::PopStyleVar();
@@ -667,15 +829,39 @@ struct MiniConsole : CfxBigConsole
 	}
 };
 
-static std::unique_ptr<FiveMConsoleBase> g_consoles[2];
+static std::unique_ptr<FiveMConsoleBase> g_consoles[3];
+static std::recursive_mutex g_consolesMutex;
 
 static void EnsureConsoles()
 {
+	std::unique_lock _(g_consolesMutex);
+
 	if (!g_consoles[0])
 	{
 		g_consoles[0] = std::make_unique<CfxBigConsole>();
 		g_consoles[1] = std::make_unique<MiniConsole>();
+		g_consoles[2] = std::make_unique<CfxWinConsole>();
 	}
+}
+
+bool IsNonProduction()
+{
+#if !defined(GTA_FIVE) || defined(_DEBUG)
+	return true;
+#else
+	static ConVar<int> moo("moo", ConVar_None, 0);
+
+	static auto isProd = ([]()
+	{
+		wchar_t resultPath[1024];
+		static std::wstring fpath = MakeRelativeCitPath(L"CitizenFX.ini");
+		GetPrivateProfileString(L"Game", L"UpdateChannel", L"production", resultPath, std::size(resultPath), fpath.c_str());
+
+		return _wcsicmp(resultPath, L"production") == 0 || _wcsicmp(resultPath, L"prod") == 0;
+	})();
+
+	return !isProd || moo.GetValue() == 31337;
+#endif
 }
 
 void DrawConsole()
@@ -683,7 +869,7 @@ void DrawConsole()
 	EnsureConsoles();
 
 	static bool pOpen = true;
-	g_consoles[0]->Draw("", &pOpen);
+	g_consoles[0]->Draw("##_BigConsole", &pOpen);
 }
 
 void DrawMiniConsole()
@@ -691,20 +877,36 @@ void DrawMiniConsole()
 	EnsureConsoles();
 
 	static bool pOpen = true;
-	g_consoles[1]->Draw("", &pOpen);
+	g_consoles[1]->Draw("##_MiniConsole", &pOpen);
+}
+
+void DrawWinConsole(bool* pOpen)
+{
+	EnsureConsoles();
+
+	g_consoles[2]->Draw("WinConsole", pOpen);
 }
 
 #include <sstream>
 
 void SendPrintMessage(const std::string& channel, const std::string& message)
 {
-	EnsureConsoles();
-
-	for (auto& console : g_consoles)
+	if (channel == "no_console")
 	{
-		if (console->Items.Size == 0)
+		return;
+	}
+
+	{
+		std::unique_lock _(g_consolesMutex);
+
+		EnsureConsoles();
+
+		for (auto& console : g_consoles)
 		{
-			console->AddLog("", "");
+			if (console->Items.size() == 0)
+			{
+				console->AddLog("", "");
+			}
 		}
 	}
 
@@ -721,10 +923,8 @@ void SendPrintMessage(const std::string& channel, const std::string& message)
 			{
 				std::unique_lock<std::recursive_mutex> lock(console->ItemsMutex);
 
-				auto strRef = FiveMConsoleBase::Strdup((console->Items[console->Items.size() - 1] + str).c_str());
+				auto strRef = (console->Items[console->Items.size() - 1] + str);
 				std::swap(console->Items[console->Items.size() - 1], strRef);
-
-				free(strRef);
 
 				console->UpdateLog(console->Items.size() - 1);
 			}
@@ -767,13 +967,13 @@ void SendPrintMessage(const std::string& channel, const std::string& message)
 
 DLL_EXPORT void RunConsoleGameFrame()
 {
-	if (g_consoles[0])
+	for (auto& console : g_consoles)
 	{
-		((CfxBigConsole*)g_consoles[0].get())->RunCommandQueue();
+		console->RunCommandQueue();
 	}
 }
 
-#ifndef IS_LAUNCHER
+#if __has_include("nutsnbolts.h")
 static InitFunction initFunction([]()
 {
 	ConHost::OnShouldDrawGui.Connect([](bool* should)
@@ -782,10 +982,31 @@ static InitFunction initFunction([]()
 		{
 			std::unique_lock<std::recursive_mutex> lock(g_consoles[1]->ItemsMutex);
 
-			*should = *should || ((g_consoles[1]->Items.size() > 1) || (g_consoles[1]->Items[0] && *g_consoles[1]->Items[0]));
+			*should = *should || ((g_consoles[1]->Items.size() > 1) || (!g_consoles[1]->Items[0].empty()));
 		}
 	}, 999);
 
-	OnGameFrame.Connect([] { RunConsoleGameFrame(); });
+	OnCriticalGameFrame.Connect([] { RunConsoleGameFrame(); });
 });
 #endif
+
+#include "ProductionWhitelist.h"
+
+static InitFunction initFunctionCon([]()
+{
+	console::GetDefaultContext()->GetCommandManager()->AccessDeniedEvent.Connect([](std::string_view commandName)
+	{
+		if (!IsNonProduction())
+		{
+			console::Printf("cmd", "Command %s is disabled in production mode. See ^2https://aka.cfx.re/prod-console^7 for further information.\n", commandName);
+			return false;
+		}
+
+		return true;
+	});
+
+	for (auto& command : g_prodCommandsWhitelist)
+	{
+		seGetCurrentContext()->AddAccessControlEntry(se::Principal{ "system.extConsole" }, se::Object{ fmt::sprintf("command.%s", command) }, se::AccessType::Allow);
+	}
+});

@@ -29,6 +29,172 @@
 
 #include <sstream>
 
+inline std::chrono::microseconds usec()
+{
+	return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now().time_since_epoch());
+}
+
+struct Bookmark
+{
+	fx::Resource* resource;
+	std::chrono::microseconds deadline;
+	IScriptTickRuntimeWithBookmarks* scRT;
+	uint64_t bookmark;
+
+	inline Bookmark(IScriptTickRuntimeWithBookmarks* scRT, std::nullptr_t)
+		: resource(nullptr), deadline(0), scRT(scRT), bookmark(0)
+	{
+		
+	}
+
+	inline Bookmark(fx::Resource* resource,
+					std::chrono::microseconds deadline,
+					IScriptTickRuntimeWithBookmarks * scRT,
+					uint64_t bookmark)
+		: resource(resource), deadline(deadline), scRT(scRT), bookmark(bookmark)
+	{
+	
+	}
+};
+
+static struct  
+{
+	std::list<Bookmark> list;
+	std::list<IScriptTickRuntimeWithBookmarks*> removeList;
+
+	std::unordered_map<IScriptTickRuntimeWithBookmarks*, std::list<Bookmark>::iterator> resourceInsertionIterators;
+
+	bool executing = false;
+	std::list<Bookmark>::iterator* executingIt = nullptr;
+} bookmarkRefs;
+
+static void QueueBookmark(fx::Resource* resource, IScriptTickRuntimeWithBookmarks* scRT, uint64_t bookmark, std::chrono::microseconds deadline)
+{
+	auto refIt = bookmarkRefs.resourceInsertionIterators.find(scRT);
+	assert(refIt != bookmarkRefs.resourceInsertionIterators.end());
+	bookmarkRefs.list.insert(refIt->second, Bookmark{ resource, deadline, scRT, bookmark });
+}
+
+static void CreateBookmarks(IScriptTickRuntimeWithBookmarks* scRT)
+{
+	bookmarkRefs.resourceInsertionIterators.emplace(scRT, bookmarkRefs.list.insert(bookmarkRefs.list.end(), Bookmark{ scRT, nullptr }));
+}
+
+static void RemoveBookmarks(IScriptTickRuntimeWithBookmarks* scRT)
+{
+	auto exIt = (bookmarkRefs.executing) ? bookmarkRefs.executingIt : nullptr;
+
+	auto list = &bookmarkRefs.list;
+
+	{
+		for (auto it = list->begin(); it != list->end();)
+		{
+			if (it->scRT == scRT)
+			{
+				if (exIt && *exIt == it)
+				{
+					*exIt = it = list->erase(it);
+				}
+				else
+				{
+					it = list->erase(it);
+				}
+			}
+			else
+			{
+				++it;
+			}
+		}
+	}
+
+	bookmarkRefs.resourceInsertionIterators.erase(scRT);
+}
+
+static void RunBookmarks()
+{
+	bookmarkRefs.executing = true;
+
+	auto now = usec();
+
+	fx::Resource* lastResource = nullptr;
+	IScriptTickRuntimeWithBookmarks* lastScRT = nullptr;
+
+	std::vector<uint64_t> nextBookmarks;
+
+	auto deq = [&]()
+	{
+		if (nextBookmarks.size())
+		{
+			lastResource->Run([&]()
+			{
+				lastScRT->TickBookmarks(nextBookmarks.data(), nextBookmarks.size());
+			});
+
+			nextBookmarks.clear();
+		}
+	};
+
+	for (auto it = bookmarkRefs.list.begin(); it != bookmarkRefs.list.end();)
+	{
+		const auto& entry = *it;
+
+		if (entry.resource && entry.deadline <= now)
+		{
+			auto scRT = entry.scRT;
+
+			if (lastScRT != scRT)
+			{
+				auto saveIt = it;
+				bookmarkRefs.executingIt = &it;
+				deq();
+
+				bookmarkRefs.executingIt = nullptr;
+
+				// if deq() has been changing the executingIt, we should skip the next execution outright
+				// as it was a removed resource
+				if (it != saveIt)
+				{
+					lastScRT = nullptr;
+					lastResource = nullptr;
+					continue;
+				}
+
+				lastScRT = scRT;
+				lastResource = entry.resource;
+			}
+
+			nextBookmarks.push_back(entry.bookmark);
+
+			it = bookmarkRefs.list.erase(it);
+		}
+		else
+		{
+			++it;
+		}
+	}
+
+	deq();
+
+	bookmarkRefs.executing = false;
+}
+
+static InitFunction initBMFunction([]()
+{
+	fx::ResourceManager::OnInitializeInstance.Connect([](fx::ResourceManager* self)
+	{
+		self->OnTick.Connect([]()
+		{
+			RunBookmarks();
+		});
+	});
+});
+
+#ifdef _WIN32
+#define SAFE_BUFFERS __declspec(safebuffers)
+#else
+#define SAFE_BUFFERS
+#endif
+
 #ifdef __has_feature
 #define HAS_FEATURE(x) __has_feature(x)
 #else
@@ -91,7 +257,7 @@ result_t StreamWrapper::GetLength(uint64_t *length)
 	return FX_S_OK;
 }
 
-class TestScriptHost : public OMClass<TestScriptHost, IScriptHost, IScriptHostWithResourceData, IScriptHostWithManifest>
+class TestScriptHost : public OMClass<TestScriptHost, IScriptHost, IScriptHostWithResourceData, IScriptHostWithManifest, IScriptHostWithBookmarks>
 {
 public:
 	NS_DECL_ISCRIPTHOST;
@@ -99,6 +265,8 @@ public:
 	NS_DECL_ISCRIPTHOSTWITHRESOURCEDATA;
 
 	NS_DECL_ISCRIPTHOSTWITHMANIFEST;
+
+	NS_DECL_ISCRIPTHOSTWITHBOOKMARKS;
 
 private:
 	Resource* m_resource;
@@ -124,7 +292,7 @@ result_t TestScriptHost::GetLastErrorText(char** text)
 	return FX_S_OK;
 }
 
-result_t TestScriptHost::InvokeNative(fxNativeContext & context)
+result_t SAFE_BUFFERS TestScriptHost::InvokeNative(fxNativeContext & context)
 {
 #if SCRT_HAS_CALLNATIVEHANDLER
 	// prepare an invocation context
@@ -216,7 +384,7 @@ result_t TestScriptHost::OpenHostFile(char *fileName, fxIStream * *stream)
 	std::string_view fn = fileName;
 	std::string fileNameStr = m_resource->GetPath() + "/" + fileName;
 
-	if (fn.length() > 1 && fn[0] == '@')
+	if (fn.length() > 1 && fn[0] == '@' && fn.find_first_of('/') != std::string::npos)
 	{
 		std::string_view resName = fn.substr(1, fn.find_first_of('/') - 1);
 		fn = fn.substr(1 + resName.length() + 1);
@@ -309,6 +477,34 @@ result_t TestScriptHost::SubmitBoundaryEnd(char* boundaryData, int boundarySize)
 		}
 	}
 
+	return FX_S_OK;
+}
+
+result_t TestScriptHost::CreateBookmarks(IScriptTickRuntimeWithBookmarks* scRT)
+{
+	::CreateBookmarks(scRT);
+	return FX_S_OK;
+}
+
+result_t TestScriptHost::ScheduleBookmark(IScriptTickRuntimeWithBookmarks* scRT, uint64_t bookmark, int64_t deadline)
+{
+	auto newDeadline = std::chrono::microseconds{
+		deadline
+	};
+
+	if (deadline < 0)
+	{
+		newDeadline = usec() + std::chrono::milliseconds{ -deadline };
+	}
+
+	QueueBookmark(m_resource, scRT, bookmark, newDeadline);
+
+	return FX_S_OK;
+}
+
+result_t TestScriptHost::RemoveBookmarks(IScriptTickRuntimeWithBookmarks* scRT)
+{
+	::RemoveBookmarks(scRT);
 	return FX_S_OK;
 }
 
@@ -420,18 +616,13 @@ result_t ScriptRuntimeHandler::GetInvokingRuntime(IScriptRuntime** runtime)
 		return FX_E_INVALIDARG;
 	}
 
-	// std::stack is bad, even more so as we're copying the entire stack
-	// TODO: redo since we're a deque now
-	auto copyStack = ms_runtimeStack;
-	copyStack.pop_front();
-
-	if (copyStack.empty())
+	if (ms_runtimeStack.size() <= 1)
 	{
 		*runtime = nullptr;
 	}
 	else
 	{
-		auto lastRuntime = copyStack.front();
+		auto lastRuntime = *(ms_runtimeStack.begin() + 1);
 		*runtime = lastRuntime;
 
 		// conventions state we should AddRef anything we return, so we will
@@ -479,7 +670,10 @@ static InitFunction initFunction([]()
 {
 	fx::ScriptEngine::RegisterNativeHandler("FORMAT_STACK_TRACE", [](fx::ScriptContext& context)
 	{
-		if (fx::g_suppressErrors)
+		auto topLevelStackBlob = context.GetArgument<char*>(0);
+		auto topLevelStackSize = context.GetArgument<uint32_t>(1);
+
+		if (fx::g_suppressErrors && topLevelStackBlob != nullptr)
 		{
 			context.SetResult(nullptr);
 			return;
@@ -487,23 +681,25 @@ static InitFunction initFunction([]()
 
 		fx::g_suppressErrors = true;
 
-		auto topLevelStackBlob = context.GetArgument<char*>(0);
-		auto topLevelStackSize = context.GetArgument<uint32_t>(1);
-
 		auto vis = fx::MakeNew<StringifyingStackVisitor>();
 
 		if (topLevelStackBlob)
 		{
 			msgpack::unpacked up = msgpack::unpack(topLevelStackBlob, topLevelStackSize);
 
-			auto o = up.get().as<std::vector<msgpack::object>>();
+			const auto& ref = up.get();
 
-			for (auto& e : o)
+			if (ref.type == msgpack::type::ARRAY)
 			{
-				msgpack::sbuffer sb;
-				msgpack::pack(sb, e);
+				auto o = ref.as<std::vector<msgpack::object>>();
 
-				vis->SubmitStackFrame(sb.data(), sb.size());
+				for (auto& e : o)
+				{
+					msgpack::sbuffer sb;
+					msgpack::pack(sb, e);
+
+					vis->SubmitStackFrame(sb.data(), sb.size());
+				}
 			}
 		}
 
@@ -520,7 +716,7 @@ static InitFunction initFunction([]()
 				auto& b = bit->first;
 				auto& e = bit->second;
 
-				srt->WalkStack(e ? (char*)e->data() : NULL, e ? e->size() : 0, b ? (char*)b->data() : NULL, b ? b->size() : NULL, vis.GetRef());
+				srt->WalkStack(e ? (char*)e->data() : NULL, e ? e->size() : 0, b ? (char*)b->data() : NULL, b ? b->size() : 0, vis.GetRef());
 			}
 		}
 

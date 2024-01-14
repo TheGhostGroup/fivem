@@ -25,7 +25,8 @@
 	"citizen:scripting:lua",
 	"citizen:scripting:lua54",
 	"citizen:scripting:mono",
-	"citizen:scripting:v8",
+	"citizen:scripting:v8client",
+	"citizen:scripting:v8node",
 	"gta:core:rdr3",
 	"http-client",
 	"debug:net",
@@ -41,10 +42,15 @@
 	"scrbind:base",
 	"nui:resources",
 	"citizen:game:ipc",
+	"devtools:rdr3",
 	"extra-natives:rdr3",
 	"citizen:playernames:rdr3",
 	"rage:formats:x",
 	"devcon",
 	"adhesive",
-	"tool:formats"
+	"tool:formats",
+	"citizen:devtools",
+	"lovely-script",
+	"discord",
+	"voip:mumble"
 ]

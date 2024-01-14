@@ -9,6 +9,9 @@
 #include <MsgpackJson.h>
 #include <rapidjson/writer.h>
 
+#include <SharedFunction.h>
+#include <UvLoopManager.h>
+
 #include <MonoThreadAttachment.h>
 
 namespace fx
@@ -16,12 +19,63 @@ namespace fx
 ClientDeferral::ClientDeferral(fx::ServerInstanceBase* instance, const fx::ClientSharedPtr& client)
 	: m_client(client), m_instance(instance), m_completed(false)
 {
-
 }
 
 ClientDeferral::~ClientDeferral()
 {
-	
+	if (auto loop = std::move(m_loop); loop.GetRef())
+	{
+		if (auto kat = std::move(m_keepAliveTimer))
+		{
+			loop->EnqueueCallback([kat]()
+			{
+				kat->clear();
+				kat->once<uvw::CloseEvent>([kat](const uvw::CloseEvent&, uvw::TimerHandle& h)
+				{
+					(void)kat;
+				});
+
+				kat->close();
+			});
+		}
+	}
+}
+
+void ClientDeferral::StartTimer()
+{
+	using namespace std::chrono_literals;
+
+	auto loop = Instance<net::UvLoopManager>::Get()->GetOrCreate("svMain");
+	m_loop = loop;
+
+	auto thisRef = weak_from_this();
+
+	loop->EnqueueCallback([thisRef]()
+	{
+		if (auto self = thisRef.lock())
+		{
+			self->StartTimerOnLoopThread();
+		}
+	});
+}
+
+void ClientDeferral::StartTimerOnLoopThread()
+{
+	auto thisWeak = weak_from_this();
+
+	m_keepAliveTimer = m_loop->Get()->resource<uvw::TimerHandle>();
+	m_keepAliveTimer->on<uvw::TimerEvent>([thisWeak](const uvw::TimerEvent&, uvw::TimerHandle& h)
+	{
+		if (auto self = thisWeak.lock())
+		{
+			if (auto cb = self->m_messageCallback)
+			{
+				cb("");
+			}
+		}
+	});
+
+	m_keepAliveTimer->start(1000ms, 1000ms);
 }
 
 bool ClientDeferral::IsDeferred()
@@ -31,6 +85,12 @@ bool ClientDeferral::IsDeferred()
 
 void ClientDeferral::UpdateDeferrals()
 {
+	if (!m_ranEvents)
+	{
+		m_pending = true;
+		return;
+	}
+
 	bool allDone = true;
 	bool rejected = false;
 	std::string rejectionMsg;
@@ -88,8 +148,30 @@ void ClientDeferral::UpdateDeferrals()
 	}
 }
 
+void ClientDeferral::RanEvents()
+{
+	m_ranEvents = true;
+
+	if (m_pending)
+	{
+		UpdateDeferrals();
+		m_pending = false;
+	}
+
+	if (auto card = std::move(m_nextCard); !card.empty())
+	{
+		PresentCard(card);
+	}
+}
+
 void ClientDeferral::PresentCard(const std::string& cardJson)
 {
+	if (!m_ranEvents)
+	{
+		m_nextCard = cardJson;
+		return;
+	}
+
 	if (m_cardCallback)
 	{
 		m_cardCallback(cardJson);
@@ -102,32 +184,6 @@ void ClientDeferral::HandleCardResponse(const std::string& dataJson)
 	{
 		m_cardResponseCallback(dataJson);
 	}
-}
-
-// blindly copypasted from StackOverflow (to allow std::function to store the funcref types with their move semantics)
-// TODO: we use this *thrice* now, time for a shared header?
-template<class F>
-struct shared_function
-{
-	std::shared_ptr<F> f;
-	shared_function() = default;
-	shared_function(F&& f_) : f(std::make_shared<F>(std::move(f_))) {}
-	shared_function(shared_function const&) = default;
-	shared_function(shared_function&&) = default;
-	shared_function& operator=(shared_function const&) = default;
-	shared_function& operator=(shared_function&&) = default;
-
-	template<class...As>
-	auto operator()(As&& ...as) const
-	{
-		return (*f)(std::forward<As>(as)...);
-	}
-};
-
-template<class F>
-shared_function<std::decay_t<F>> make_shared_function(F&& f)
-{
-	return { std::forward<F>(f) };
 }
 
 TCallbackMap ClientDeferral::GetCallbacks()
@@ -144,16 +200,9 @@ TCallbackMap ClientDeferral::GetCallbacks()
 	{
 		return [ref, cb](const msgpack::unpacked& unpacked)
 		{
-			auto& deferral = ref->deferral;
+			auto defRef = ref->deferral.lock();
 
-			if (deferral.expired())
-			{
-				return;
-			}
-
-			auto defRef = deferral.lock();
-
-			if (defRef->m_completed)
+			if (!defRef || defRef->m_completed)
 			{
 				return;
 			}
@@ -184,6 +233,8 @@ TCallbackMap ClientDeferral::GetCallbacks()
 		self->m_deferralStates[deferralKey] = std::move(ds);
 
 		self->UpdateDeferrals();
+
+		self->StartTimer();
 	}));
 
 	cbs["update"] = cbComponent->CreateCallback(createDeferralCallback([](const std::shared_ptr<ClientDeferral>& self, const std::string& deferralKey, const msgpack::unpacked& unpacked)
@@ -237,22 +288,26 @@ TCallbackMap ClientDeferral::GetCallbacks()
 					{
 						fx::FunctionRef functionRef{ std::string{callback.via.ext.data(), callback.via.ext.size} };
 
-						self->SetCardResponseHandler(make_shared_function([self, functionRef = std::move(functionRef)](const std::string& cardJson)
+						auto instance = self->m_instance;
+
+						self->SetCardResponseHandler(make_shared_function([instance, functionRef = std::move(functionRef)](const std::string& cardJson)
 						{
-							rapidjson::Document cardJSON;
-							cardJSON.Parse(cardJson.c_str(), cardJson.size());
+							auto fnRef = functionRef.GetRef();
 
-							if (!cardJSON.HasParseError())
+							gscomms_execute_callback_on_main_thread([instance, fnRef, cardJson]
 							{
-								msgpack::object cardObject;
-								msgpack::zone zone;
-								ConvertToMsgPack(cardJSON, cardObject, zone);
+								rapidjson::Document cardJSON;
+								cardJSON.Parse(cardJson.c_str(), cardJson.size());
 
-								// make sure the monkeys are happy
-								MonoEnsureThreadAttached();
+								if (!cardJSON.HasParseError())
+								{
+									msgpack::object cardObject;
+									msgpack::zone zone;
+									ConvertToMsgPack(cardJSON, cardObject, zone);
 
-								self->m_instance->GetComponent<fx::ResourceManager>()->CallReference<void>(functionRef.GetRef(), cardObject, cardJson);
-							}
+									instance->GetComponent<fx::ResourceManager>()->CallReference<void>(fnRef, cardObject, cardJson);
+								}
+							});
 						}));
 					}
 				}

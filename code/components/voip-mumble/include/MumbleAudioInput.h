@@ -11,6 +11,9 @@
 #include <wrl.h>
 #include <audioclient.h>
 #include <mmdeviceapi.h>
+
+#include <CoreConsole.h>
+
 extern "C"
 {
 #include <libswresample/swresample.h>
@@ -34,6 +37,8 @@ using namespace Microsoft::WRL;
 
 class MumbleClient;
 
+struct DenoiseState;
+
 class MumbleAudioInput
 {
 private:
@@ -45,6 +50,8 @@ private:
 
 	ComPtr<IAudioCaptureClient> m_audioCaptureClient;
 
+	ComPtr<ISimpleAudioVolume> m_audioVolume;
+
 	WAVEFORMATEX m_waveFormat;
 
 	HANDLE m_startEvent;
@@ -53,17 +60,29 @@ private:
 
 	webrtc::AudioProcessing* m_apm;
 
+	DenoiseState* m_denoiseState;
+
 	uint8_t* m_resampledBytes;
 
 	uint32_t m_cachedLen;
 
 	uint8_t m_cachedBytes[512 * 1024];
 
-	uint8_t m_encodedBytes[65536];
+	uint8_t m_encodedBytes[131072];
+
+	int m_lastBitrate;
+
+	int m_curBitrate;
+
+	std::shared_ptr<ConVar<int>> m_bitrateVar;
+
+	bool m_denoise = true;
+
+	std::shared_ptr<ConVar<bool>> m_denoiseVar;
 
 	OpusEncoder* m_opus;
 
-	std::queue<std::string> m_opusPackets;
+	std::queue<std::tuple<std::string, int>> m_opusPackets;
 
 	uint64_t m_sequence;
 
@@ -100,7 +119,8 @@ private:
 
 	void HandleData(const uint8_t* buffer, size_t numBytes);
 
-	void EnqueueOpusPacket(std::string packet);
+	// numFrames is 10ms Opus frames
+	void EnqueueOpusPacket(std::string&& packet, int numFrames);
 
 	void SendQueuedOpusPackets();
 

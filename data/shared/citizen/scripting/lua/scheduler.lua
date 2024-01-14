@@ -1,9 +1,54 @@
-local GetGameTimer = GetGameTimer
-local _sbs = Citizen.SubmitBoundaryStart
-local coresume, costatus = coroutine.resume, coroutine.status
+local type = type
+local error = error
+local pairs = pairs
+local rawget = rawget
+local tonumber = tonumber
+local getmetatable = getmetatable
+local setmetatable = setmetatable
+
 local debug = debug
+local debug_getinfo = debug.getinfo
+
+local table_pack = table.pack
+local table_unpack = table.unpack
+local table_insert = table.insert
+
+local coroutine_create = coroutine.create
+local coroutine_yield = coroutine.yield
+local coroutine_resume = coroutine.resume
+local coroutine_status = coroutine.status
+local coroutine_running = coroutine.running
 local coroutine_close = coroutine.close or (function(c) end) -- 5.3 compatibility
+
+--[[ Custom extensions --]]
+local msgpack = msgpack
+local msgpack_pack = msgpack.pack
+local msgpack_unpack = msgpack.unpack
+local msgpack_pack_args = msgpack.pack_args
+
+local Citizen = Citizen
+local Citizen_SubmitBoundaryStart = Citizen.SubmitBoundaryStart
+local Citizen_InvokeFunctionReference = Citizen.InvokeFunctionReference
+local GetGameTimer = GetGameTimer
+local ProfilerEnterScope = ProfilerEnterScope
+local ProfilerExitScope = ProfilerExitScope
+
 local hadThread = false
+local curTime = 0
+local hadProfiler = false
+local isDuplicityVersion = IsDuplicityVersion()
+
+local function _ProfilerEnterScope(name)
+	if hadProfiler then
+		ProfilerEnterScope(name)
+	end
+end
+
+local function _ProfilerExitScope()
+	if hadProfiler then
+		ProfilerExitScope()
+	end
+end
 
 -- setup msgpack compat
 msgpack.set_string('string_compat')
@@ -23,24 +68,7 @@ local function FormatStackTrace()
 	return _in(`FORMAT_STACK_TRACE` & 0xFFFFFFFF, nil, 0, Citizen.ResultAsString())
 end
 
-local function ProfilerEnterScope(scopeName)
-	return _in(`PROFILER_ENTER_SCOPE` & 0xFFFFFFFF, scopeName)
-end
-
-local function ProfilerExitScope()
-	return _in(`PROFILER_EXIT_SCOPE` & 0xFFFFFFFF)
-end
-
-local newThreads = {}
-local threads = setmetatable({}, {
-	-- This circumvents undefined behaviour in "next" (and therefore "pairs")
-	__newindex = newThreads,
-	-- This is needed for CreateThreadNow to work correctly
-	__index = newThreads
-})
-
 local boundaryIdx = 1
-local runningThread
 
 local function dummyUseBoundary(idx)
 	return nil
@@ -48,225 +76,71 @@ end
 
 local function getBoundaryFunc(bfn, bid)
 	return function(fn, ...)
-		local boundary = bid or (boundaryIdx + 1)
-		boundaryIdx = boundaryIdx + 1
+		local boundary = bid
+		if not boundary then
+			boundary = boundaryIdx + 1
+			boundaryIdx = boundary
+		end
 		
-		bfn(boundary, coroutine.running())
+		bfn(boundary, coroutine_running())
 
 		local wrap = function(...)
 			dummyUseBoundary(boundary)
 			
-			local v = table.pack(fn(...))
-			return table.unpack(v)
+			local v = table_pack(fn(...))
+			return table_unpack(v)
 		end
 		
-		local v = table.pack(wrap(...))
+		local v = table_pack(wrap(...))
 		
 		bfn(boundary, nil)
 		
-		return table.unpack(v)
+		return table_unpack(v)
 	end
 end
 
 local runWithBoundaryStart = getBoundaryFunc(Citizen.SubmitBoundaryStart)
 local runWithBoundaryEnd = getBoundaryFunc(Citizen.SubmitBoundaryEnd)
 
---[[
-
-	Thread handling
-
-]]
-local function resumeThread(coro) -- Internal utility
-	if coroutine.status(coro) == "dead" then
-		threads[coro] = nil
-		coroutine_close(coro)
-		return false
-	end
-
-	runningThread = coro
-	
-	local thread = threads[coro]
-
-	if thread then
-		if thread.name then
-			ProfilerEnterScope(thread.name)
-		else
-			ProfilerEnterScope('thread')
-		end
-
-		_sbs(thread.boundary, coro)
-	end
-	
-	local ok, wakeTimeOrErr = coresume(coro)
-	
-	if ok then
-		thread = threads[coro]
-		if thread then
-			thread.wakeTime = wakeTimeOrErr or 0
-			hadThread = true
-		end
-	else
-		--Citizen.Trace("Error resuming coroutine: " .. debug.traceback(coro, wakeTimeOrErr) .. "\n")
-		local fst = FormatStackTrace()
-		
-		if fst then
-			Citizen.Trace("^1SCRIPT ERROR: " .. wakeTimeOrErr .. "^7\n")
-			Citizen.Trace(fst)
-		end
-	end
-	
-	runningThread = nil
-	
-	ProfilerExitScope()
-	
-	-- Return not finished
-	return costatus(coro) ~= "dead"
-end
-
-function Citizen.CreateThread(threadFunction)
-	local bid = boundaryIdx + 1
-	boundaryIdx = boundaryIdx + 1
-
-	local tfn = function()
-		return runWithBoundaryStart(threadFunction, bid)
-	end
-	
-	local di = debug.getinfo(threadFunction, 'S')
-	
-	threads[coroutine.create(tfn)] = {
-		wakeTime = 0,
-		boundary = bid,
-		name = ('thread %s[%d..%d]'):format(di.short_src, di.linedefined, di.lastlinedefined)
-	}
-
-	hadThread = true
-end
-
-function Citizen.Wait(msec)
-	coroutine.yield(GetGameTimer() + msec)
-end
-
--- legacy alias (and to prevent people from calling the game's function)
-Wait = Citizen.Wait
-CreateThread = Citizen.CreateThread
-
-function Citizen.CreateThreadNow(threadFunction, name)
-	local bid = boundaryIdx + 1
-	boundaryIdx = boundaryIdx + 1
-	
-	local di = debug.getinfo(threadFunction, 'S')
-	name = name or ('thread_now %s[%d..%d]'):format(di.short_src, di.linedefined, di.lastlinedefined)
-
-	local tfn = function()
-		return runWithBoundaryStart(threadFunction, bid)
-	end
-
-	local coro = coroutine.create(tfn)
-	threads[coro] = {
-		wakeTime = 0,
-		boundary = bid,
-		name = name
-	}
-
-	return resumeThread(coro)
-end
+local AwaitSentinel = Citizen.AwaitSentinel()
+Citizen.AwaitSentinel = nil
 
 function Citizen.Await(promise)
-	local coro = coroutine.running()
-	if not coro then
-		error("Current execution context is not in the scheduler, you should use CreateThread / SetTimeout or Event system (AddEventHandler) to be able to Await")
-	end
+	local coro = coroutine_running()
+	assert(coro, "Current execution context is not in the scheduler, you should use CreateThread / SetTimeout or Event system (AddEventHandler) to be able to Await")
 
-	-- Indicates if the promise has already been resolved or rejected
-	-- This is a hack since the API does not expose its state
-	local isDone = false
-	local result, err
-	promise = promise:next(function(...)
-		isDone = true
-		result = {...}
-	end,function(error)
-		isDone = true
-		err = error
-	end)
-
-	if not isDone then
-		local threadData = threads[coro]
-		threads[coro] = nil
-
-		local function reattach()
-			threads[coro] = threadData
-			resumeThread(coro)
-		end
-
+	if promise.state == 0 then
+		local reattach = coroutine_yield(AwaitSentinel)
 		promise:next(reattach, reattach)
-		Citizen.Wait(0)
+		coroutine_yield()
 	end
 
-	if err then
-		error(err)
+	if promise.state == 2 or promise.state == 4 then
+		error(promise.value, 2)
 	end
 
-	return table.unpack(result)
+	return promise.value
 end
 
-function Citizen.SetTimeout(msec, callback)
-	local bid = boundaryIdx + 1
+Citizen.SetBoundaryRoutine(function(f)
 	boundaryIdx = boundaryIdx + 1
 
-	local tfn = function()
-		return runWithBoundaryStart(callback, bid)
-	end
-
-	local coro = coroutine.create(tfn)
-	threads[coro] = {
-		wakeTime = GetGameTimer() + msec,
-		boundary = bid
-	}
-
-	hadThread = true
-end
-
-SetTimeout = Citizen.SetTimeout
-
-Citizen.SetTickRoutine(function()
-	if not hadThread then
-		return
-	end
-
-	-- flag to skip thread exec if we don't have any
-	local thisHadThread = false
-	local curTime = GetGameTimer()
-
-	for coro, thread in pairs(newThreads) do
-		rawset(threads, coro, thread)
-		newThreads[coro] = nil
-
-		thisHadThread = true
-	end
-
-	for coro, thread in pairs(threads) do
-		if curTime >= thread.wakeTime then
-			resumeThread(coro)
-		end
-
-		thisHadThread = true
-	end
-
-	if not thisHadThread then
-		hadThread = false
+	local bid = boundaryIdx
+	return bid, function()
+		return runWithBoundaryStart(f, bid)
 	end
 end)
+
+-- root-level alias (to prevent people from calling the game's function accidentally)
+Wait = Citizen.Wait
+CreateThread = Citizen.CreateThread
+SetTimeout = Citizen.SetTimeout
 
 --[[
 
 	Event handling
 
 ]]
-
-local alwaysSafeEvents = {
-	["playerDropped"] = true,
-	["playerConnecting"] = true
-}
 
 local eventHandlers = {}
 local deserializingNetEvent = false
@@ -278,21 +152,25 @@ Citizen.SetEventRoutine(function(eventName, eventPayload, eventSource)
 
 	-- try finding an event handler for the event
 	local eventHandlerEntry = eventHandlers[eventName]
-	
+
 	-- deserialize the event structure (so that we end up adding references to delete later on)
-	local data = msgpack.unpack(eventPayload)
+	local data = msgpack_unpack(eventPayload)
 
 	if eventHandlerEntry and eventHandlerEntry.handlers then
 		-- if this is a net event and we don't allow this event to be triggered from the network, return
 		if eventSource:sub(1, 3) == 'net' then
-			if not eventHandlerEntry.safeForNet and not alwaysSafeEvents[eventName] then
+			if not eventHandlerEntry.safeForNet then
 				Citizen.Trace('event ' .. eventName .. " was not safe for net\n")
 
+				_G.source = lastSource
 				return
 			end
 
 			deserializingNetEvent = { source = eventSource }
 			_G.source = tonumber(eventSource:sub(5))
+		elseif isDuplicityVersion and eventSource:sub(1, 12) == 'internal-net' then
+			deserializingNetEvent = { source = eventSource:sub(10) }
+			_G.source = tonumber(eventSource:sub(14))
 		end
 
 		-- return an empty table if the data is nil
@@ -307,11 +185,20 @@ Citizen.SetEventRoutine(function(eventName, eventPayload, eventSource)
 		if type(data) == 'table' then
 			-- loop through all the event handlers
 			for k, handler in pairs(eventHandlerEntry.handlers) do
-				local di = debug.getinfo(handler)
-			
-				Citizen.CreateThreadNow(function()
-					handler(table.unpack(data))
-				end, ('event %s [%s[%d..%d]]'):format(eventName, di.short_src, di.linedefined, di.lastlinedefined))
+				local handlerFn = handler
+				local handlerMT = getmetatable(handlerFn)
+
+				if handlerMT and handlerMT.__call then
+					handlerFn = handlerMT.__call
+				end
+
+				if type(handlerFn) == 'function' then
+					local di = debug_getinfo(handlerFn)
+				
+					Citizen.CreateThreadNow(function()
+						handler(table_unpack(data))
+					end, ('event %s [%s[%d..%d]]'):format(eventName, di.short_src, di.linedefined, di.lastlinedefined))
+				end
 			end
 		end
 	end
@@ -327,7 +214,7 @@ Citizen.SetStackTraceRoutine(function(bs, ts, be, te)
 	end
 
 	local t
-	local n = 1
+	local n = 0
 	
 	local frames = {}
 	local skip = false
@@ -335,14 +222,14 @@ Citizen.SetStackTraceRoutine(function(bs, ts, be, te)
 	if bs then
 		skip = true
 	end
-	
+
 	repeat
 		if ts then
-			t = debug.getinfo(ts, n, 'nlfS')
+			t = debug_getinfo(ts, n, 'nlfS')
 		else
-			t = debug.getinfo(n, 'nlfS')
+			t = debug_getinfo(n + 1, 'nlfS')
 		end
-		
+
 		if t then
 			if t.name == 'wrap' and t.source == '@citizen:/scripting/lua/scheduler.lua' then
 				if not stackTraceBoundaryIdx then
@@ -375,7 +262,7 @@ Citizen.SetStackTraceRoutine(function(bs, ts, be, te)
 			
 			if not skip then
 				if t.source and t.source:sub(1, 1) ~= '=' and t.source:sub(1, 10) ~= '@citizen:/' then
-					table.insert(frames, {
+					table_insert(frames, {
 						file = t.source:sub(2),
 						line = t.currentline,
 						name = t.name or '[global chunk]'
@@ -387,7 +274,7 @@ Citizen.SetStackTraceRoutine(function(bs, ts, be, te)
 		end
 	until not t
 	
-	return msgpack.pack(frames)
+	return msgpack_pack(frames)
 end)
 
 local eventKey = 10
@@ -418,42 +305,52 @@ end
 
 function RemoveEventHandler(eventData)
 	if not eventData.key and not eventData.name then
-		error('Invalid event data passed to RemoveEventHandler()')
+		error('Invalid event data passed to RemoveEventHandler()', 2)
 	end
 
 	-- remove the entry
 	eventHandlers[eventData.name].handlers[eventData.key] = nil
 end
 
-function RegisterNetEvent(eventName)
-	local tableEntry = eventHandlers[eventName]
+local ignoreNetEvent = {
+	['__cfx_internal:commandFallback'] = true,
+}
 
-	if not tableEntry then
-		tableEntry = { }
+function RegisterNetEvent(eventName, cb)
+	if not ignoreNetEvent[eventName] then
+		local tableEntry = eventHandlers[eventName]
 
-		eventHandlers[eventName] = tableEntry
+		if not tableEntry then
+			tableEntry = { }
+
+			eventHandlers[eventName] = tableEntry
+		end
+
+		tableEntry.safeForNet = true
 	end
 
-	tableEntry.safeForNet = true
+	if cb then
+		return AddEventHandler(eventName, cb)
+	end
 end
 
 function TriggerEvent(eventName, ...)
-	local payload = msgpack.pack({...})
+	local payload = msgpack_pack_args(...)
 
 	return runWithBoundaryEnd(function()
 		return TriggerEventInternal(eventName, payload, payload:len())
 	end)
 end
 
-if IsDuplicityVersion() then
+if isDuplicityVersion then
 	function TriggerClientEvent(eventName, playerId, ...)
-		local payload = msgpack.pack({...})
+		local payload = msgpack_pack_args(...)
 
 		return TriggerClientEventInternal(eventName, playerId, payload, payload:len())
 	end
 	
 	function TriggerLatentClientEvent(eventName, playerId, bps, ...)
-		local payload = msgpack.pack({...})
+		local payload = msgpack_pack_args(...)
 
 		return TriggerLatentClientEventInternal(eventName, playerId, payload, payload:len(), tonumber(bps))
 	end
@@ -468,7 +365,18 @@ if IsDuplicityVersion() then
 		local t = {}
 
 		for i = 0, numIds - 1 do
-			table.insert(t, GetPlayerIdentifier(player, i))
+			table_insert(t, GetPlayerIdentifier(player, i))
+		end
+
+		return t
+	end
+
+	function GetPlayerTokens(player)
+		local numIds = GetNumPlayerTokens(player)
+		local t = {}
+
+		for i = 0, numIds - 1 do
+			table_insert(t, GetPlayerToken(player, i))
 		end
 
 		return t
@@ -479,43 +387,53 @@ if IsDuplicityVersion() then
 		local t = {}
 
 		for i = 0, num - 1 do
-			table.insert(t, GetPlayerFromIndex(i))
+			table_insert(t, GetPlayerFromIndex(i))
 		end
 
 		return t
 	end
 
 	local httpDispatch = {}
-	AddEventHandler('__cfx_internal:httpResponse', function(token, status, body, headers)
+	AddEventHandler('__cfx_internal:httpResponse', function(token, status, body, headers, errorData)
 		if httpDispatch[token] then
 			local userCallback = httpDispatch[token]
 			httpDispatch[token] = nil
-			userCallback(status, body, headers)
+			userCallback(status, body, headers, errorData)
 		end
 	end)
 
-	function PerformHttpRequest(url, cb, method, data, headers)
+	function PerformHttpRequest(url, cb, method, data, headers, options)
+		local followLocation = true
+		
+		if options and options.followLocation ~= nil then
+			followLocation = options.followLocation
+		end
+	
 		local t = {
 			url = url,
 			method = method or 'GET',
 			data = data or '',
-			headers = headers or {}
+			headers = headers or {},
+			followLocation = followLocation
 		}
 
-		local d = json.encode(t)
-		local id = PerformHttpRequestInternal(d, d:len())
+		local id = PerformHttpRequestInternalEx(t)
 
-		httpDispatch[id] = cb
+		if id ~= -1 then
+			httpDispatch[id] = cb
+		else
+			cb(0, nil, {}, 'Failure handling HTTP request')
+		end
 	end
 else
 	function TriggerServerEvent(eventName, ...)
-		local payload = msgpack.pack({...})
+		local payload = msgpack_pack_args(...)
 
 		return TriggerServerEventInternal(eventName, payload, payload:len())
 	end
 	
 	function TriggerLatentServerEvent(eventName, bps, ...)
-		local payload = msgpack.pack({...})
+		local payload = msgpack_pack_args(...)
 
 		return TriggerLatentServerEventInternal(eventName, payload, payload:len(), tonumber(bps))
 	end
@@ -567,20 +485,20 @@ Citizen.SetCallRefRoutine(function(refId, argsSerialized)
 	if not refPtr then
 		Citizen.Trace('Invalid ref call attempt: ' .. refId .. "\n")
 
-		return msgpack.pack({})
+		return msgpack_pack(nil)
 	end
 	
 	local ref = refPtr.func
 
 	local err
-	local retvals
+	local retvals = false
 	local cb = {}
 	
-	local di = debug.getinfo(ref)
+	local di = debug_getinfo(ref)
 
 	local waited = Citizen.CreateThreadNow(function()
 		local status, result, error = xpcall(function()
-			retvals = { ref(table.unpack(msgpack.unpack(argsSerialized))) }
+			retvals = { ref(table_unpack(msgpack_unpack(argsSerialized))) }
 		end, doStackFormat)
 
 		if not status then
@@ -588,23 +506,20 @@ Citizen.SetCallRefRoutine(function(refId, argsSerialized)
 		end
 
 		if cb.cb then
-			cb.cb(retvals or false, err)
+			cb.cb(retvals, err)
+		elseif err then
+			Citizen.Trace(err)
 		end
 	end, ('ref call [%s[%d..%d]]'):format(di.short_src, di.linedefined, di.lastlinedefined))
 
 	if not waited then
 		if err then
-			--error(err)
-			if err ~= '' then
-				Citizen.Trace(err)
-			end
-			
-			return msgpack.pack(nil)
+			return msgpack_pack(nil)
 		end
 
-		return msgpack.pack(retvals)
+		return msgpack_pack(retvals)
 	else
-		return msgpack.pack({{
+		return msgpack_pack({{
 			__cfx_async_retval = function(rvcb)
 				cb.cb = rvcb
 			end
@@ -616,8 +531,6 @@ Citizen.SetDuplicateRefRoutine(function(refId)
 	local ref = funcRefs[refId]
 
 	if ref then
-		--print(('%s %s ref %d - new refcount %d (from %s)'):format(GetCurrentResourceName(), 'duplicating', refId, ref.refs + 1, GetInvokingResource() or 'nil'))
-	
 		ref.refs = ref.refs + 1
 
 		return refId
@@ -630,8 +543,6 @@ Citizen.SetDeleteRefRoutine(function(refId)
 	local ref = funcRefs[refId]
 	
 	if ref then
-		--print(('%s %s ref %d - new refcount %d (from %s)'):format(GetCurrentResourceName(), 'deleting', refId, ref.refs - 1, GetInvokingResource() or 'nil'))
-	
 		ref.refs = ref.refs - 1
 		
 		if ref.refs <= 0 then
@@ -653,7 +564,7 @@ if GetCurrentResourceName() == 'sessionmanager' then
 
 		local eventTriggerFn = TriggerServerEvent
 		
-		if IsDuplicityVersion() then
+		if isDuplicityVersion then
 			eventTriggerFn = function(name, ...)
 				TriggerClientEvent(name, source, ...)
 			end
@@ -680,14 +591,14 @@ if GetCurrentResourceName() == 'sessionmanager' then
 		makeArgRefs(args)
 
 		runWithBoundaryEnd(function()
-			local payload = Citizen.InvokeFunctionReference(refId, msgpack.pack(args))
+			local payload = Citizen_InvokeFunctionReference(refId, msgpack_pack(args))
 
 			if #payload == 0 then
 				returnEvent(false, 'err')
 				return
 			end
 
-			local rvs = msgpack.unpack(payload)
+			local rvs = msgpack_unpack(payload)
 
 			if type(rvs[1]) == 'table' and rvs[1].__cfx_async_retval then
 				rvs[1].__cfx_async_retval(returnEvent)
@@ -725,7 +636,7 @@ AddEventHandler(repName, function(retId, args, err)
 	end
 end)
 
-if IsDuplicityVersion() then
+if isDuplicityVersion then
 	AddEventHandler('playerDropped', function(reason)
 		local source = source
 
@@ -750,15 +661,15 @@ msgpack.extend_clear(EXT_FUNCREF, EXT_LOCALFUNCREF)
 
 -- RPC INVOCATION
 InvokeRpcEvent = function(source, ref, args)
-	if not coroutine.running() then
-		error('RPC delegates can only be invoked from a thread.')
+	if not coroutine_running() then
+		error('RPC delegates can only be invoked from a thread.', 2)
 	end
 
 	local src = source
 
 	local eventTriggerFn = TriggerServerEvent
 
-	if IsDuplicityVersion() then
+	if isDuplicityVersion then
 		eventTriggerFn = function(name, ...)
 			TriggerClientEvent(name, src, ...)
 		end
@@ -793,11 +704,11 @@ funcref_mt = msgpack.extend({
 	end,
 
 	__index = function(t, k)
-		error('Cannot index a funcref')
+		error('Cannot index a funcref', 2)
 	end,
 
 	__newindex = function(t, k, v)
-		error('Cannot set indexes on a funcref')
+		error('Cannot set indexes on a funcref', 2)
 	end,
 
 	__call = function(t, ...)
@@ -805,16 +716,16 @@ funcref_mt = msgpack.extend({
 		local ref = rawget(t, '__cfx_functionReference')
 
 		if not netSource then
-			local args = msgpack.pack({...})
+			local args = msgpack_pack_args(...)
 
 			-- as Lua doesn't allow directly getting lengths from a data buffer, and _s will zero-terminate, we have a wrapper in the game itself
 			local rv = runWithBoundaryEnd(function()
-				return Citizen.InvokeFunctionReference(ref, args)
+				return Citizen_InvokeFunctionReference(ref, args)
 			end)
-			local rvs = msgpack.unpack(rv)
+			local rvs = msgpack_unpack(rv)
 
 			-- handle async retvals from refs
-			if rvs and type(rvs[1]) == 'table' and rawget(rvs[1], '__cfx_async_retval') and coroutine.running() then
+			if rvs and type(rvs[1]) == 'table' and rawget(rvs[1], '__cfx_async_retval') and coroutine_running() then
 				local p = promise.new()
 
 				rvs[1].__cfx_async_retval(function(r, e)
@@ -825,10 +736,14 @@ funcref_mt = msgpack.extend({
 					end
 				end)
 
-				return table.unpack(Citizen.Await(p))
+				return table_unpack(Citizen.Await(p))
 			end
 
-			return table.unpack(rvs)
+			if not rvs then
+				error()
+			end
+
+			return table_unpack(rvs)
 		else
 			return InvokeRpcEvent(tonumber(netSource.source:sub(5)), ref, {...})
 		end
@@ -841,7 +756,7 @@ funcref_mt = msgpack.extend({
 		if refstr then
 			return refstr
 		else
-			error(("Unknown funcref type: %d %s"):format(tag, type(self)))
+			error(("Unknown funcref type: %d %s"):format(tag, type(self)), 2)
 		end
 	end,
 
@@ -883,7 +798,7 @@ end
 -- callback cache to avoid extra call to serialization / deserialization process at each time getting an export
 local exportsCallbackCache = {}
 
-local exportKey = (IsDuplicityVersion() and 'server_export' or 'export')
+local exportKey = (isDuplicityVersion and 'server_export' or 'export')
 
 do
 	local resource = GetCurrentResourceName()
@@ -904,11 +819,37 @@ end
 
 -- Remove cache when resource stop to avoid calling unexisting exports
 local function lazyEventHandler() -- lazy initializer so we don't add an event we don't need
-	AddEventHandler(('on%sResourceStop'):format(IsDuplicityVersion() and 'Server' or 'Client'), function(resource)
+	AddEventHandler(('on%sResourceStop'):format(isDuplicityVersion and 'Server' or 'Client'), function(resource)
 		exportsCallbackCache[resource] = {}
 	end)
 
 	lazyEventHandler = function() end
+end
+
+-- Helper for newlines in nested error message
+local function prefixNewlines(str, prefix)
+	str = tostring(str)
+
+	local out = ''
+
+	for bit in str:gmatch('[^\r\n]*\r?\n') do
+		out = out .. prefix .. bit
+	end
+
+	if #out == 0 or out:sub(#out) ~= '\n' then
+		out = out .. '\n'
+	end
+
+	return out
+end
+
+-- Handle an export with multiple return values.
+local function exportProcessResult(resource, exportName, status, ...)
+	if not status then
+		local result = tostring(select(1, ...))
+		error(('\n^5 An error occurred while calling export `%s` in resource `%s`:\n%s^5 ---'):format(exportName, resource, prefixNewlines(result, '  ')), 2)
+	end
+	return ...
 end
 
 -- invocation bit
@@ -932,29 +873,23 @@ setmetatable(exports, {
 					end)
 
 					if not exportsCallbackCache[resource][k] then
-						error('No such export ' .. k .. ' in resource ' .. resource)
+						error('No such export ' .. k .. ' in resource ' .. resource, 2)
 					end
 				end
 
-				return function(self, ...)
-					local status, result = pcall(exportsCallbackCache[resource][k], ...)
-
-					if not status then
-						error('An error happened while calling export ' .. k .. ' of resource ' .. resource .. ' (' .. result .. '), see above for details')
-					end
-
-					return result
+				return function(self, ...) -- TAILCALL
+					return exportProcessResult(resource, k, pcall(exportsCallbackCache[resource][k], ...))
 				end
 			end,
 
 			__newindex = function(t, k, v)
-				error('cannot set values on an export resource')
+				error('cannot set values on an export resource', 2)
 			end
 		})
 	end,
 
 	__newindex = function(t, k, v)
-		error('cannot set values on exports')
+		error('cannot set values on exports', 2)
 	end,
 
 	__call = function(t, exportName, func)
@@ -965,17 +900,67 @@ setmetatable(exports, {
 })
 
 -- NUI callbacks
-if not IsDuplicityVersion() then
-	function RegisterNUICallback(type, callback)
-		RegisterNuiCallbackType(type)
+if not isDuplicityVersion then
+	local origRegisterNuiCallback = RegisterNuiCallback
 
-		AddEventHandler('__cfx_nui:' .. type, function(body, resultCallback)
+	local cbHandler
+
+--[==[
+	local cbHandler = load([[
+		-- Lua 5.4: Create a to-be-closed variable to monitor the NUI callback handle.
+		local callback, body, resultCallback = ...
+
+		local hasCallback = false
+		local _ <close> = defer(function()
+			if not hasCallback then
+				local di = debug.getinfo(callback, 'S')
+				local name = ('function %s[%d..%d]'):format(di.short_src, di.linedefined, di.lastlinedefined)
+				warn(("No NUI callback captured: %s"):format(name))
+			end
+		end)
+
+		local status, err = pcall(function()
+			callback(body, function(...)
+				hasCallback = true
+				resultCallback(...)
+			end)
+		end)
+
+		return status, err
+	]], '@citizen:/scripting/lua/scheduler.lua#nui')]==]
+
+	if not cbHandler then
+		cbHandler = load([[
+			local callback, body, resultCallback = ...
+
 			local status, err = pcall(function()
 				callback(body, resultCallback)
 			end)
 
+			return status, err
+		]], '@citizen:/scripting/lua/scheduler.lua#nui')
+	end
+
+	-- wrap RegisterNuiCallback to handle errors (and 'missed' callbacks)
+	function RegisterNuiCallback(type, callback)
+		origRegisterNuiCallback(type, function(body, resultCallback)
+			local status, err = cbHandler(callback, body, resultCallback)
+
 			if err then
-				Citizen.Trace("error during NUI callback " .. type .. ": " .. err .. "\n")
+				Citizen.Trace("error during NUI callback " .. type .. ": " .. tostring(err) .. "\n")
+			end
+		end)
+	end
+
+	-- 'old' function (uses events for compatibility, as people may have relied on this implementation detail)
+	function RegisterNUICallback(type, callback)
+		RegisterNuiCallbackType(type)
+
+		AddEventHandler('__cfx_nui:' .. type, function(body, resultCallback)
+			local status, err = cbHandler(callback, body, resultCallback)
+
+			if err then
+				Citizen.Trace("error during NUI callback " .. type .. ": " .. tostring(err) .. "\n")
 			end
 		end)
 	end
@@ -994,13 +979,11 @@ local EXT_PLAYER = 42
 msgpack.extend_clear(EXT_ENTITY, EXT_PLAYER)
 
 local function NewStateBag(es)
-	local sv = IsDuplicityVersion()
-
 	return setmetatable({}, {
 		__index = function(_, s)
 			if s == 'set' then
 				return function(_, s, v, r)
-					local payload = msgpack.pack(v)
+					local payload = msgpack_pack(v)
 					SetStateBagValue(es, s, payload, payload:len(), r)
 				end
 			end
@@ -1009,20 +992,30 @@ local function NewStateBag(es)
 		end,
 		
 		__newindex = function(_, s, v)
-			local payload = msgpack.pack(v)
-			SetStateBagValue(es, s, payload, payload:len(), sv)
+			local payload = msgpack_pack(v)
+			SetStateBagValue(es, s, payload, payload:len(), isDuplicityVersion)
 		end
 	})
 end
 
 GlobalState = NewStateBag('global')
 
-local entityTM = {
+local function GetEntityStateBagId(entityGuid)
+	if isDuplicityVersion or NetworkGetEntityIsNetworked(entityGuid) then
+		return ('entity:%d'):format(NetworkGetNetworkIdFromEntity(entityGuid))
+	else
+		EnsureEntityStateBag(entityGuid)
+		return ('localEntity:%d'):format(entityGuid)
+	end
+end
+
+local entityMT
+entityMT = {
 	__index = function(t, s)
 		if s == 'state' then
-			local es = ('entity:%d'):format(NetworkGetNetworkIdFromEntity(t.__data))
+			local es = GetEntityStateBagId(t.__data)
 			
-			if IsDuplicityVersion() then
+			if isDuplicityVersion then
 				EnsureEntityStateBag(t.__data)
 			end
 		
@@ -1033,7 +1026,7 @@ local entityTM = {
 	end,
 	
 	__newindex = function()
-		error('Not allowed at this time.')
+		error('Setting values on Entity is not supported at this time.', 2)
 	end,
 	
 	__ext = EXT_ENTITY,
@@ -1047,13 +1040,14 @@ local entityTM = {
 		
 		return setmetatable({
 			__data = ref
-		}, entityTM)
+		}, entityMT)
 	end
 }
 
-msgpack.extend(entityTM)
+msgpack.extend(entityMT)
 
-local playerTM = {
+local playerMT
+playerMT = {
 	__index = function(t, s)
 		if s == 'state' then
 			local pid = t.__data
@@ -1071,7 +1065,7 @@ local playerTM = {
 	end,
 	
 	__newindex = function()
-		error('Not allowed at this time.')
+		error('Setting values on Player is not supported at this time.', 2)
 	end,
 	
 	__ext = EXT_PLAYER,
@@ -1085,17 +1079,17 @@ local playerTM = {
 		
 		return setmetatable({
 			__data = ref
-		}, playerTM)
+		}, playerMT)
 	end
 }
 
-msgpack.extend(playerTM)
+msgpack.extend(playerMT)
 
 function Entity(ent)
 	if type(ent) == 'number' then
 		return setmetatable({
 			__data = ent
-		}, entityTM)
+		}, entityMT)
 	end
 	
 	return ent
@@ -1105,12 +1099,12 @@ function Player(ent)
 	if type(ent) == 'number' or type(ent) == 'string' then
 		return setmetatable({
 			__data = tonumber(ent)
-		}, playerTM)
+		}, playerMT)
 	end
 	
 	return ent
 end
 
-if not IsDuplicityVersion() then
+if not isDuplicityVersion then
 	LocalPlayer = Player(-1)
 end

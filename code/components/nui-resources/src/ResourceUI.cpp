@@ -16,6 +16,7 @@
 
 #include <ResourceManager.h>
 
+#include <boost/algorithm/string/predicate.hpp>
 #include <mutex>
 
 ResourceUI::ResourceUI(Resource* resource)
@@ -31,6 +32,15 @@ ResourceUI::~ResourceUI()
 
 bool ResourceUI::Create()
 {
+	m_isDead = false;
+
+	// initialize callback handlers
+	auto resourceName = m_resource->GetName();
+	std::transform(resourceName.begin(), resourceName.end(), resourceName.begin(), ::ToLower);
+	nui::RegisterSchemeHandlerFactory("http", resourceName, Instance<NUISchemeHandlerFactory>::Get());
+	nui::RegisterSchemeHandlerFactory("https", resourceName, Instance<NUISchemeHandlerFactory>::Get());
+	nui::RegisterSchemeHandlerFactory("https", "cfx-nui-" + resourceName, Instance<NUISchemeHandlerFactory>::Get());
+
 	// get the metadata component
 	fwRefContainer<fx::ResourceMetaDataComponent> metaData = m_resource->GetComponent<fx::ResourceMetaDataComponent>();
 
@@ -57,18 +67,17 @@ bool ResourceUI::Create()
 	// get the page name from the iterator
 	std::string pageName = uiPageData.begin()->second;
 
-	// initialize the page
-	auto resourceName = m_resource->GetName();
-	std::transform(resourceName.begin(), resourceName.end(), resourceName.begin(), ::ToLower);
-	CefRegisterSchemeHandlerFactory("http", resourceName, Instance<NUISchemeHandlerFactory>::Get());
-	CefRegisterSchemeHandlerFactory("https", resourceName, Instance<NUISchemeHandlerFactory>::Get());
-	CefRegisterSchemeHandlerFactory("https", "cfx-nui-" + resourceName, Instance<NUISchemeHandlerFactory>::Get());
-
 	// create the NUI frame
 	auto rmvRes = metaData->IsManifestVersionBetween("cerulean", "");
 	auto uiPrefix = (!rmvRes || !*rmvRes) ? "nui://" : "https://cfx-nui-";
 
 	std::string path = uiPrefix + m_resource->GetName() + "/" + pageName;
+
+	// allow direct mentions of absolute URIs
+	if (pageName.find("://") != std::string::npos)
+	{
+		path = pageName;
+	}
 
 	auto uiPagePreloadData = metaData->GetEntries("ui_page_preload");
 	bool uiPagePreload = std::distance(uiPagePreloadData.begin(), uiPagePreloadData.end()) > 0;
@@ -94,8 +103,16 @@ bool ResourceUI::Create()
 
 void ResourceUI::Destroy()
 {
-	// destroy the target frame
-	nui::DestroyFrame(m_resource->GetName());
+	m_isDead = true;
+
+	if (m_hasFrame)
+	{
+		// destroy the target frame
+		nui::DestroyFrame(m_resource->GetName());
+
+		// mark as no frame
+		m_hasFrame = false;
+	}
 }
 
 void ResourceUI::AddCallback(const std::string& type, ResUICallback callback)
@@ -103,19 +120,57 @@ void ResourceUI::AddCallback(const std::string& type, ResUICallback callback)
 	m_callbacks.insert({ type, callback });
 }
 
-bool ResourceUI::InvokeCallback(const std::string& type, const std::string& data, ResUIResultCallback resultCB)
+void ResourceUI::RemoveCallback(const std::string& type)
+{
+	// Note: This is called by UNREGISTER_RAW_NUI_CALLBACK but
+	// can still technically target event based NUI Callbacks
+	m_callbacks.erase(type);
+}
+
+static std::mutex g_nuiCallbackMutex;
+static std::queue<std::function<void()>> g_nuiCallbackQueue;
+
+bool ResourceUI::InvokeCallback(const std::string& type, const std::string& query, const std::multimap<std::string, std::string>& headers, const std::string& data, ResUIResultCallback resultCB)
 {
 	auto set = fx::GetIteratorView(m_callbacks.equal_range(type));
 
 	if (set.begin() == set.end())
 	{
-		return false;
+		// try mapping only the first part
+		auto firstType = type.substr(0, type.find_first_of('/'));
+
+		set = fx::GetIteratorView(m_callbacks.equal_range(firstType));
+
+		if (set.begin() == set.end())
+		{
+			return false;
+		}
 	}
+
+	std::vector<ResUICallback> cbSet;
 
 	for (auto& cb : set)
 	{
-		cb.second(data, resultCB);
+		cbSet.push_back(cb.second);
 	}
+
+	fwRefContainer selfRef = this;
+
+	std::function<void()> cb = [selfRef, cbSet = std::move(cbSet), type, query, headers, data, resultCB = std::move(resultCB)]()
+	{
+		if (selfRef->IsDead())
+		{
+			return;
+		}
+
+		for (const auto& cb : cbSet)
+		{
+			cb(type, query, headers, data, resultCB);
+		}
+	};
+
+	std::unique_lock _(g_nuiCallbackMutex);
+	g_nuiCallbackQueue.push(std::move(cb));
 
 	return true;
 }
@@ -125,18 +180,64 @@ void ResourceUI::SignalPoll()
 	nui::SignalPoll(m_resource->GetName());
 }
 
-static std::map<std::string, fwRefContainer<ResourceUI>> g_resourceUIs;
-static std::mutex g_resourceUIMutex;
-
 #include <boost/algorithm/string.hpp>
+
+static bool NameMatches(std::string_view name, std::string_view match)
+{
+	if (name == match)
+	{
+		return true;
+	}
+
+	if (boost::algorithm::starts_with(name, match))
+	{
+		if (name[match.length()] == '/')
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
 
 static InitFunction initFunction([] ()
 {
 	fx::ResourceManager::OnInitializeInstance.Connect([](fx::ResourceManager* manager)
 	{
-		nui::SetResourceLookupFunction([manager](const std::string& resourceName)
+		manager->OnTick.Connect([]()
 		{
-			auto resource = manager->GetResource(resourceName);
+			auto pop = []() -> std::function<void()>
+			{
+				std::unique_lock _(g_nuiCallbackMutex);
+				if (!g_nuiCallbackQueue.empty())
+				{
+					auto fn = std::move(g_nuiCallbackQueue.front());
+					g_nuiCallbackQueue.pop();
+
+					return std::move(fn);
+				}
+
+				return {};
+			};
+
+			while (auto fn = pop())
+			{
+				fn();
+			}
+		}, INT32_MAX);
+
+		nui::SetResourceLookupFunction([manager](const std::string& resourceName, const std::string& fileName) -> std::string
+		{
+			fwRefContainer<fx::Resource> resource;
+
+			fx::ResourceManager* resourceManager = Instance<fx::ResourceManager>::Get();
+			resourceManager->ForAllResources([&resourceName, &resource](const fwRefContainer<fx::Resource>& resourceRef)
+			{
+				if (_stricmp(resourceRef->GetName().c_str(), resourceName.c_str()) == 0)
+				{
+					resource = resourceRef;
+				}
+			});
 
 			if (resource.GetRef())
 			{
@@ -147,54 +248,96 @@ static InitFunction initFunction([] ()
 					path += "/";
 				}
 
-				return path;
+				// check if it's a client script of any sorts
+				std::stringstream normalFileName;
+				char lastC = '/';
+
+				for (size_t i = 0; i < fileName.length(); i++)
+				{
+					char c = fileName[i];
+
+					if (c != '/' || lastC != '/')
+					{
+						normalFileName << c;
+					}
+
+					lastC = c;
+				}
+
+				auto nfn = normalFileName.str();
+
+				auto mdComponent = resource->GetComponent<fx::ResourceMetaDataComponent>();
+				bool valid = false;
+
+				if (NameMatches(nfn, "__resource.lua") || NameMatches(nfn, "fxmanifest.lua"))
+				{
+					return "common:/data/gameconfig.xml";
+				}
+				
+				for (auto& entry : mdComponent->GlobEntriesVector("client_script"))
+				{
+					if (NameMatches(nfn, entry))
+					{
+						auto files = mdComponent->GlobEntriesVector("file");
+						bool isFile = false;
+
+						for (auto& fileEntry : files)
+						{
+							if (NameMatches(nfn, fileEntry))
+							{
+								isFile = true;
+								break;
+							}
+						}
+
+						if (!isFile)
+						{
+							return "common:/data/gameconfig.xml";
+						}
+					}
+				}
+
+				return path + fileName;
 			}
 
-			return fmt::sprintf("resources:/%s/", resourceName);
+			return fmt::sprintf("resources:/%s/%s", resourceName, fileName);
 		});
 	});
 
-	Resource::OnInitializeInstance.Connect([] (Resource* resource)
+	fx::Resource::OnInitializeInstance.Connect([] (Resource* resource)
 	{
 		// create the UI instance
 		fwRefContainer<ResourceUI> resourceUI(new ResourceUI(resource));
+		resource->SetComponent(resourceUI);
 
 		// start event
-		resource->OnCreate.Connect([=] ()
+		resource->OnCreate.Connect([resource]()
 		{
-			std::unique_lock<std::mutex> lock(g_resourceUIMutex);
-
-			resourceUI->Create();
-			g_resourceUIs[resource->GetName()] = resourceUI;
+			resource->GetComponent<ResourceUI>()->Create();
 		});
 
 		// stop event
-		resource->OnStop.Connect([=] ()
+		resource->OnStop.Connect([resource] ()
 		{
-			std::unique_lock<std::mutex> lock(g_resourceUIMutex);
-
-			if (g_resourceUIs.find(resource->GetName()) != g_resourceUIs.end())
-			{
-				resourceUI->Destroy();
-				g_resourceUIs.erase(resource->GetName());
-			}
+			resource->GetComponent<ResourceUI>()->Destroy();
 		});
 
-#ifdef GTA_FIVE
 		// pre-disconnect handling
-		resource->GetComponent<fx::ResourceGameLifetimeEvents>()->OnBeforeGameShutdown.Connect([=]()
+		resource->GetComponent<fx::ResourceGameLifetimeEvents>()->OnBeforeGameShutdown.Connect([resource]()
 		{
-			std::unique_lock<std::mutex> lock(g_resourceUIMutex);
-
-			if (g_resourceUIs.find(resource->GetName()) != g_resourceUIs.end())
-			{
-				resourceUI->Destroy();
-				g_resourceUIs.erase(resource->GetName());
-			}
+			resource->GetComponent<ResourceUI>()->Destroy();
 		});
-#endif
+	});
+});
 
-		// add component
-		resource->SetComponent(resourceUI);
+#include <CefOverlay.h>
+#include <HttpClient.h>
+
+static InitFunction httpInitFunction([]()
+{
+	nui::RequestNUIBlocklist.Connect([](std::function<void(bool, const char*, size_t)> cb)
+	{
+		auto httpClient = Instance<HttpClient>::Get();
+		httpClient->DoGetRequest("https://runtime.fivem.net/nui-blacklist.json", cb);
 	});
 });

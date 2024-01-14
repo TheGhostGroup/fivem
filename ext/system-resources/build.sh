@@ -2,21 +2,29 @@
 set -e
 
 apk add --no-cache nodejs npm
+npm install -g npm@7.19.1
 
-cd ../webadmin/server/
-dotnet publish -c Release
-cd ../../system-resources/
+mkdir -p data
 
+# txAdmin
 cd ../txAdmin/
-npm i
-./node_modules/.bin/webpack --config webpack.config.js --progress
+npm ci
+npm run build
 cd ../system-resources/
 
-mkdir -p data/webadmin/wwwroot/
-mkdir -p data/webadmin/server/bin/Release/netstandard2.0/publish/
-cp -a ../webadmin/fxmanifest.lua data/webadmin/
-
-cp -a ../webadmin/wwwroot/ data/webadmin/
-cp -a ../webadmin/server/bin/Release/netstandard2.0/publish/ data/webadmin/server/bin/Release/netstandard2.0/
-
 cp -a ../txAdmin/dist data/monitor
+
+# chat
+cd resources/chat/
+
+npm install yarn@1.22
+node_modules/.bin/yarn
+node_modules/.bin/webpack
+cd ../../
+
+rm -rf resources/chat/node_modules/
+cp -a resources/chat data/chat
+rm -rf data/chat/package.json data/chat/yarn.lock
+rm -rf data/chat/html/
+mkdir data/chat/html/
+cp -a resources/chat/html/vendor data/chat/html/vendor

@@ -21,6 +21,7 @@
 #include <CrossBuildRuntime.h>
 
 #include <GameInput.h>
+#include <InputHook.h>
 
 namespace rage
 {
@@ -121,7 +122,7 @@ uint32_t rage::ioMapper::Map(uint32_t mapperSource, uint32_t key, ioValue& value
 
 static hook::cdecl_stub<void(rage::ioMapper*, int, const rage::ioInputSource&, rage::ioValue&)> _ioMapper_UpdateMap([]()
 {
-	return hook::get_pattern("33 C0 4D  8B D0 44 8B D8 8B D8 48", -0x0D);
+	return hook::get_pattern("33 C0 4D 8B D0 44 8B D8 8B D8 48", -0x0D);
 });
 
 void rage::ioMapper::UpdateMap(int max_k, const rage::ioInputSource& info, rage::ioValue& value)
@@ -275,7 +276,9 @@ public:
 
 	~Binding();
 
-	void Update(rage::ioMapper* mapper);
+	bool PreUpdate(rage::ioMapper* mapper);
+
+	void Update();
 
 	void UpdateMap(rage::ioMapper* mapper)
 	{
@@ -290,6 +293,8 @@ public:
 	{
 		return m_value;
 	}
+
+	bool IsActive() const;
 
 	inline void SetBinding(std::tuple<int, int> binding)
 	{
@@ -319,6 +324,9 @@ public:
 	}
 
 private:
+	void Unmap();
+
+private:
 	rage::ioValue m_value;
 
 	bool m_wasDown;
@@ -340,18 +348,16 @@ Binding::Binding(const std::string& command)
 
 Binding::~Binding()
 {
-	for (rage::ioMapper* mapper : m_mappers)
-	{
-		mapper->RemoveDeviceMappings(m_value, -4);
-	}
+	Unmap();
 }
 
 static void* g_control;
 static uint32_t g_mapperOffset;
+static std::multiset<std::string, std::less<>> g_downSet;
 
 static hook::cdecl_stub<bool(int)> _isMenuActive([]
 {
-	return hook::get_call(hook::get_pattern("33 C9 E8 ? ? ? ? 84 C0 74 04 84 DB 75 21", 2));
+	return hook::get_call(hook::get_pattern("E8 ? ? ? ? 33 C9 E8 ? ? ? ? 0F 57 F6", 7));
 });
 
 static hook::cdecl_stub<bool()> _isTextInputBoxActive([]
@@ -359,18 +365,50 @@ static hook::cdecl_stub<bool()> _isTextInputBoxActive([]
 	return hook::get_call(hook::get_pattern("E8 ? ? ? ? 40 84 FF 74 15 E8", 10));
 });
 
+static hook::thiscall_stub<rage::ioInputSource*(void* control, rage::ioInputSource* outParam, int controlIdx, int unkN1, bool secondaryBinding, bool)> _control_getBinding([]()
+{
+	return hook::get_call(hook::get_pattern("40 88 6C 24 28 40 88 6C 24 20 E8 ? ? ? ? 41 8D", 10));
+});
+
 bool IsTagActive(const std::string& tag);
 
-void Binding::Update(rage::ioMapper* mapper)
+void Binding::Unmap()
 {
-	if (!IsTagActive(m_tag))
+	for (rage::ioMapper* mapper : m_mappers)
 	{
-		return;
+		mapper->RemoveDeviceMappings(m_value, -1);
+		mapper->RemoveDeviceMappings(m_value, -4);
+	}
+
+	m_mappers.clear();
+}
+
+bool Binding::IsActive() const
+{
+	return IsTagActive(m_tag);
+}
+
+bool Binding::PreUpdate(rage::ioMapper* mapper)
+{
+	if (!IsActive())
+	{
+		Unmap();
+		return false;
 	}
 
 	if (Instance<ICoreGameInit>::Get()->GetGameLoaded() && mapper == (rage::ioMapper*)((char*)g_control + g_mapperOffset) && !_isMenuActive(1))
 	{
 		UpdateMap(mapper);
+	}
+
+	return true;
+}
+
+void Binding::Update()
+{
+	if (!IsActive())
+	{
+		return;
 	}
 
 	bool down = m_value.IsDown(0.5f, rage::ioValue::NO_DEAD_ZONE);
@@ -388,7 +426,11 @@ void Binding::Update(rage::ioMapper* mapper)
 
 	if (isDownEvent || isUpEvent)
 	{
-		const auto& commandString = m_command;
+		std::string_view commandString = m_command;
+		if (commandString.find("~!") == 0)
+		{
+			commandString = commandString.substr(2);
+		}
 
 		// split the string by ';' (so button bindings get handled separately)
 		int i = 0;
@@ -403,29 +445,62 @@ void Binding::Update(rage::ioMapper* mapper)
 				std::string thisString = thisCmd.str();
 				thisCmd.str("");
 
-				// if this is a button binding
-				if (thisString[0] == '+')
+				// suppress any missing commands (requested via https://forum.cfx.re/t/1859314/3)
+				bool ignore = false;
+
+				if (!m_tag.empty())
 				{
-					if (isDownEvent)
+					auto parsed = console::Tokenize(thisString);
+
+					if (parsed.Count() > 0 && !console::GetDefaultContext()->GetCommandManager()->HasCommand(parsed[0]))
 					{
-						// TODO: add key code arguments
-						console::GetDefaultContext()->AddToBuffer(thisString + "\n");
+						ignore = true;
+					}
+				}
+
+				if (!ignore)
+				{
+					// if this is a button binding
+					if (thisString[0] == '+')
+					{
+						if (isDownEvent)
+						{
+							// if it wasn't pressed yet, submit the `+` ('down') command
+							if (g_downSet.find(thisString) == g_downSet.end())
+							{
+								// TODO: add key code arguments
+								console::GetDefaultContext()->AddToBuffer(thisString + "\n");
+							}
+							
+							// add a reference to the multiset
+							g_downSet.insert(thisString);
+						}
+						else
+						{
+							// remove *one* reference to the key
+							if (auto it = g_downSet.find(thisString); it != g_downSet.end())
+							{
+								g_downSet.erase(it);
+							}
+
+							// if this was the last reference, run the `-` ('up') command
+							if (g_downSet.find(thisString) == g_downSet.end())
+							{
+								// up event is -[button cmd]
+								// TODO: add key code arguments
+								console::GetDefaultContext()->AddToBuffer("-" + thisString.substr(1) + "\n");
+							}
+						}
+
+						hadButtonEvent = true;
 					}
 					else
 					{
-						// up event is -[button cmd]
-						// TODO: add key code arguments
-						console::GetDefaultContext()->AddToBuffer("-" + thisString.substr(1) + "\n");
-					}
-
-					hadButtonEvent = true;
-				}
-				else
-				{
-					// if not, just execute the command on down
-					if (isDownEvent || hadButtonEvent)
-					{
-						console::GetDefaultContext()->AddToBuffer(thisString + "\n");
+						// if not, just execute the command on down
+						if (isDownEvent || hadButtonEvent)
+						{
+							console::GetDefaultContext()->AddToBuffer(thisString + "\n");
+						}
 					}
 				}
 			}
@@ -550,6 +625,16 @@ void BindingManager::Initialize()
 			ioParameter = _ungetParameterIndex(ioSource, it->second);
 		}
 
+		for (const auto& binding : m_bindings)
+		{
+			if (binding.second->GetCommand() == commandString &&
+				binding.second->GetTag() == tag &&
+				binding.first == std::make_tuple(ioSource, ioParameter))
+			{
+				return;
+			}
+		}
+
 		auto binding = std::make_shared<Binding>(commandString);
 		binding->SetBinding({ ioSource, ioParameter });
 		binding->SetTag(tag);
@@ -613,16 +698,16 @@ void BindingManager::Initialize()
 
 std::shared_ptr<Binding> BindingManager::Bind(int ioSource, int ioParameter, const std::string& commandString)
 {
-	for (auto& binding : m_bindings)
+	for (auto it = m_bindings.begin(); it != m_bindings.end(); )
 	{
-		if (binding.second->GetCommand() == commandString && IsTagActive(binding.second->GetTag()))
+		if (it->second->GetCommand() == commandString && IsTagActive(it->second->GetTag()))
 		{
-			m_bindings.erase(binding.first);
-			break;
+			it = m_bindings.erase(it);
+			continue;
 		}
-	}
 
-	//m_bindings.erase({ ioSource, ioParameter });
+		it++;
+	}
 
 	auto binding = std::make_shared<Binding>(commandString);
 	binding->SetBinding({ ioSource, ioParameter });
@@ -636,14 +721,60 @@ std::shared_ptr<Binding> BindingManager::Bind(int ioSource, int ioParameter, con
 
 void BindingManager::Update(rage::ioMapper* mapper, uint32_t time)
 {
-	static uint8_t counter = 0;
-	counter++;
+	// since ioMapper has a limit of stored ioValue instances, we canonicalize duplicate bindings here with a multi-pass op
+	// Note: 'The order of the key-value pairs whose keys compare equivalent is the order of insertion and does not change.'
+	// -> we can ensure the first entry is the canonical entry
+	std::multimap<std::tuple<int, int>, std::shared_ptr<Binding>> bindings;
 
+	// gather: process and store canonical entry
 	for (auto& bindingPair : m_bindings)
 	{
 		auto [source, binding] = bindingPair;
 
-		binding->Update(mapper);
+		if (auto it = bindings.find(source); it != bindings.end())
+		{
+			// if duplicate, just insert as non-canonical 'for later'
+			// we will only insert if active (see below, PreUpdate condition), so this doesn't need another IsActive check
+			bindings.insert(bindingPair);
+		}
+		else
+		{
+			if (binding->PreUpdate(mapper))
+			{
+				bindings.insert(bindingPair);
+			}
+		}
+	}
+
+	// copy values from canonical (mapped) to ours
+	{
+		std::tuple<int, int> lastSource{ -1, -1 };
+		rage::ioValue lastInitValue;
+
+		for (auto& bindingPair : bindings)
+		{
+			auto [source, binding] = bindingPair;
+
+			// first in a list?
+			if (lastSource != source)
+			{
+				lastSource = source;
+				lastInitValue = binding->GetValue();
+			}
+			else
+			{
+				// later entry: copy the value
+				binding->GetValue() = lastInitValue;
+			}
+		}
+	}
+
+	// we only stored canonicalized/active bindings in our list, so we can just process this one instead
+	for (auto& bindingPair : bindings)
+	{
+		auto [source, binding] = bindingPair;
+
+		binding->Update();
 	}
 
 	std::function<void()> func;
@@ -714,9 +845,13 @@ void BindingManager::CreateButtons()
 			auto button = std::make_unique<Button>(thisNameStr);
 			button->SetFromControl(g_control, field->index);
 
-			if (!Is2060())
+			if (!xbr::IsGameBuildOrGreater<2060>())
 			{
 				button->SetFromControl((char*)g_control + 0x21A98, field->index); // 1604
+			}
+			else
+			{
+				button->SetFromControl((char*)g_control + 0x21B78, field->index); // 2198
 			}
 
 			m_buttons.push_back(std::move(button));
@@ -745,6 +880,7 @@ bool IsTagActive(const std::string& tag)
 }
 
 static void(*ioMapper_Update)(void*, uint32_t, bool);
+void UpdateButtonPlumbing();
 
 static void ioMapper_UpdateStub(rage::ioMapper* mapper, uint32_t time, bool a3)
 {
@@ -753,6 +889,8 @@ static void ioMapper_UpdateStub(rage::ioMapper* mapper, uint32_t time, bool a3)
 	ioMapper_Update(mapper, time, a3);
 
 	bindingManager.UpdateButtons();
+
+	UpdateButtonPlumbing();
 }
 
 void ProfileSettingsInit();
@@ -796,7 +934,12 @@ namespace game
 
 	void RegisterBindingForTag(const std::string& tag, const std::string& command, const std::string& languageDesc, const std::string& ioms, const std::string& ioParam)
 	{
-		g_registeredBindings.insert({ command, { tag, languageDesc } });
+		// don't add a '~!' binding as a separate binding
+		// (see https://github.com/citizenfx/fivem/issues/2084#issuecomment-1618048798)
+		if (command.find("~!") != 0)
+		{
+			g_registeredBindings.insert({ command, { tag, languageDesc } });
+		}
 
 		if (!ioms.empty() && !ioParam.empty())
 		{
@@ -839,6 +982,27 @@ namespace game
 			bindingManager.Bind(ioSource, ioParameter, command)->SetTag(tag);
 		}
 	}
+
+	bool IsInputSourceDown(const rage::ioInputSource& controlData)
+	{
+		// mouse?
+		if (controlData.source == 7)
+		{
+			return InputHook::IsMouseButtonDown(controlData.parameter);
+		}
+
+		return InputHook::IsKeyDown(controlData.parameter);
+	}
+
+	bool IsControlKeyDown(int control)
+	{
+		rage::ioInputSource controlData;
+		rage::ioInputSource controlDataSecondary;
+		_control_getBinding(g_control, &controlData, control, -1, false, false);
+		_control_getBinding(g_control, &controlDataSecondary, control, -4, true, false);
+
+		return IsInputSourceDown(controlData) || IsInputSourceDown(controlDataSecondary);
+	}
 }
 
 static uint32_t HashBinding(const std::string& key)
@@ -876,7 +1040,14 @@ static void GetMappingCategoryInputs(uint32_t* categoryId, atArray<uint32_t>& co
 
 	if (*categoryId == HashString("PM_PANE_CFX"))
 	{
-		for (auto& binding : g_registeredBindings)
+		std::vector<std::pair<std::string, std::tuple<std::string, std::string>>> sortedBindings(g_registeredBindings.begin(), g_registeredBindings.end());
+		std::sort(sortedBindings.begin(), sortedBindings.end(), [](const auto& left, const auto& right)
+		{
+			// #TODO: Unicode-aware comparison
+			return std::get<1>(left.second) < std::get<1>(right.second);
+		});
+
+		for (auto& binding : sortedBindings)
 		{
 			controlIds.Set(controlIds.GetCount(), HashBinding(binding.first));
 		}
@@ -893,18 +1064,16 @@ static void* GetBindingForControl(void* control, rage::ioInputSource* outBinding
 		outBinding->source = -1;
 		outBinding->unk = -1;
 
-		if (subIdx == 0)
-		{
-			auto controlRef = GetRegisteredBindingByHash(controlId);
+		auto controlRef = GetRegisteredBindingByHash(controlId);
+		auto commandMatch = fmt::sprintf("%s%s", (subIdx == 0) ? "" : "~!", controlRef.first);
 
-			for (auto& bindingSet : bindingManager.GetBindings())
+		for (auto& bindingSet : bindingManager.GetBindings())
+		{
+			if (bindingSet.second->GetCommand() == commandMatch && IsTagActive(bindingSet.second->GetTag()))
 			{
-				if (bindingSet.second->GetCommand() == controlRef.first && IsTagActive(bindingSet.second->GetTag()))
-				{
-					bindingSet.second->GetBinding(*outBinding);
-					outBinding->unk = source;
-					break;
-				}
+				bindingSet.second->GetBinding(*outBinding);
+				outBinding->unk = source;
+				break;
 			}
 		}
 
@@ -925,8 +1094,16 @@ static const char* GetNameForControl(uint32_t controlId)
 		static std::string str;
 		str = fmt::sprintf("INPUT_%08X", HashString(pair.first.c_str()));
 
+		// #TODO: replace once GH-1111 is done
+		auto resourceName = std::get<0>(pair.second);
+
+		if (resourceName == "monitor")
+		{
+			resourceName = "txAdmin";
+		}
+
 		// lame hack
-		game::AddCustomText(HashString(str.c_str()), fmt::sprintf("%s (%s)", std::get<1>(pair.second), std::get<0>(pair.second)));
+		game::AddCustomText(HashString(str.c_str()), fmt::sprintf("~HC_3~(%s)~s~ %s", resourceName, std::get<1>(pair.second)));
 
 		return str.c_str();
 	}
@@ -970,9 +1147,9 @@ static void MapControlInternal(void* control, uint32_t controlId, int sourceIdx,
 			auto ioSource = input->source;
 			auto ioParameter = input->parameter;
 
-			bindingManager.QueueOnFrame([ioSource, ioParameter, pair]()
+			bindingManager.QueueOnFrame([ioSource, ioParameter, pair, subIdx]()
 			{
-				auto binding = bindingManager.Bind(ioSource, ioParameter, pair.first);
+				auto binding = bindingManager.Bind(ioSource, ioParameter, fmt::sprintf("%s%s", (subIdx == 0) ? "" : "~!", pair.first));
 
 				if (binding)
 				{
@@ -1009,6 +1186,28 @@ static void MapFuncHook(void* a1, uint32_t controlIdx, void* a3, void* a4)
 	{
 		g_origMapFunc(a1, controlIdx, a3, a4);
 	}
+}
+
+void UpdateButtonPlumbing()
+{
+	rage::ioInputSource controlDatas[2];
+	_control_getBinding(g_control, &controlDatas[0], 249 /* INPUT_PUSH_TO_TALK */, -1, false, false);
+	_control_getBinding(g_control, &controlDatas[1], 249 /* INPUT_PUSH_TO_TALK */, -1, true, false);
+
+	auto mapBypass = [](rage::ioInputSource& controlData)
+	{
+		InputHook::ControlBypass bypass = { 0 };
+
+		if (controlData.source == 0 /* IOMS_KEYBOARD */ || controlData.source == 7 /* IOMS_MOUSE_BUTTON */)
+		{
+			bypass.isMouse = controlData.source == 7;
+			bypass.ctrlIdx = controlData.parameter;
+		}
+
+		return bypass;
+	};
+
+	InputHook::SetControlBypasses('B', { mapBypass(controlDatas[0]), mapBypass(controlDatas[1]) });
 }
 
 #include <boost/algorithm/string.hpp>
@@ -1097,7 +1296,7 @@ static HookFunction hookFunction([]()
 	MH_CreateHook(hook::get_pattern("74 2A 48 63 CB 8D 56 10 48", -0x23), GetMappingCategories, (void**)&g_origGetMappingCategories);
 	MH_CreateHook(hook::get_pattern("45 33 ED 4C 8B E2 41 8B C5 45 85 C0 0F 84", -0x24), GetMappingCategoryInputs, (void**)&g_origGetMappingCategoryInputs);
 	MH_CreateHook(hook::get_call(hook::get_pattern("41 B9 FE FF FF FF C6 44 24 28 01 44 88 64 24 20 E8", 16)), GetBindingForControl, (void**)&g_origGetBindingForControl);
-	MH_CreateHook(hook::get_call(hook::get_pattern("48 8B F9 45 8A E1 8B CE 45 8B F8 E8", 11)), GetNameForControl, (void**)&g_origGetNameForControl);
+	MH_CreateHook(hook::get_call(hook::get_pattern("48 8B F9 45 8A ? 8B CE 45 8B ? E8", 11)), GetNameForControl, (void**)&g_origGetNameForControl);
 	MH_CreateHook(hook::get_pattern("4D 8B F9 45 8B E0 48 8B F9 83 FE FF 0F", -0x22), MapControlInternal, (void**)&g_origMapControlInternal);
 	MH_CreateHook(hook::get_call(hook::get_pattern("48 8B DA E8 ? ? ? ? 83 F8 FF 74 27", 3)), GetControlForName, (void**)&g_origGetControlForName);
 	MH_CreateHook(hook::get_pattern("33 DB 4C 8B D1 48 89 5E 50", -0x27), HandleMappingConflicts, (void**)&g_origHandleMappingConflicts);
@@ -1107,8 +1306,8 @@ static HookFunction hookFunction([]()
 
 	// hacks for unknown array
 	{
-		auto location = hook::get_pattern<char>("44 38 34 08 0F 84");
-		hook::nop(location, 4 + 6);
+		auto location = hook::get_pattern<char>("48 8D 0D ? ? ? ? 44 38 34 08", 7);
+		hook::nop(location, 4 + (xbr::IsGameBuildOrGreater<2372>() ? 2 : 6));
 	}
 
 	{
@@ -1118,7 +1317,7 @@ static HookFunction hookFunction([]()
 	}
 
 	{
-		auto location = hook::get_pattern<char>("42 80 3C 08 00 74");
+		auto location = hook::get_pattern<char>("42 80 3C 08 00 74 ? 80");
 		hook::put<uint8_t>(location - 12, 0xEB);
 		hook::nop(location, 7);
 		//hook::put<uint8_t>(location + 5, 0xEB);
@@ -1147,6 +1346,27 @@ static HookFunction hookFunction([]()
 		auto location = hook::get_pattern("48 C1 FA 02 48 8B C2 48 C1 E8 3F 48 03 D0 E8", 14);
 		hook::set_call(&g_origMapFunc, location);
 		hook::call(location, MapFuncHook);
+	}
+
+	// GetControlInstructionalButton
+	{
+		// limit check
+		auto location = hook::get_pattern<char>("81 FA ? ? 00 00 77 4F 48", -6);
+		hook::nop(location + 12, 2);
+
+		// return array index (force to 0)
+		hook::put<uint32_t>(location + 0x24, 0x90DB3148);
+	}
+
+	// rage::ioMapper::Scan missing pad 0
+	hook::put<uint8_t>(hook::get_pattern("75 E9 41 8D 78 03", 5), 2);
+
+	// pad ignoring for control binds
+	{
+		auto location = hook::get_pattern<char>("83 F8 FD 75 49", 3);
+		hook::nop(location, 2);
+		hook::nop(location + 13, 2);
+		hook::nop(location + 69, 6);
 	}
 
 	// control

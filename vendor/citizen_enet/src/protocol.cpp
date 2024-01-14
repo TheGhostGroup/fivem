@@ -52,11 +52,11 @@ enet_protocol_dispatch_state (ENetHost * host, ENetPeer * peer, ENetPeerState st
 {
     enet_protocol_change_state (host, peer, state);
 
-    if (! peer -> needsDispatch)
+    if (! (peer -> flags & ENET_PEER_FLAG_NEEDS_DISPATCH))
     {
        enet_list_insert (enet_list_end (& host -> dispatchQueue), & peer -> dispatchList);
 
-       peer -> needsDispatch = 1;
+       peer -> flags |= ENET_PEER_FLAG_NEEDS_DISPATCH;
     }
 }
 
@@ -67,7 +67,7 @@ enet_protocol_dispatch_incoming_commands (ENetHost * host, ENetEvent * event)
     {
        ENetPeer * peer = (ENetPeer *) enet_list_remove (enet_list_begin (& host -> dispatchQueue));
 
-       peer -> needsDispatch = 0;
+       peer -> flags &= ~ ENET_PEER_FLAG_NEEDS_DISPATCH;
 
        switch (peer -> state)
        {
@@ -105,7 +105,7 @@ enet_protocol_dispatch_incoming_commands (ENetHost * host, ENetEvent * event)
 
            if (! enet_list_empty (& peer -> dispatchedCommands))
            {
-              peer -> needsDispatch = 1;
+              peer -> flags |= ENET_PEER_FLAG_NEEDS_DISPATCH;
          
               enet_list_insert (enet_list_end (& host -> dispatchQueue), & peer -> dispatchList);
            }
@@ -167,7 +167,10 @@ enet_protocol_remove_sent_unreliable_commands (ENetPeer * peer)
 {
     ENetOutgoingCommand * outgoingCommand;
 
-    while (! enet_list_empty (& peer -> sentUnreliableCommands))
+    if (enet_list_empty (& peer -> sentUnreliableCommands))
+      return;
+
+    do
     {
         outgoingCommand = (ENetOutgoingCommand *) enet_list_front (& peer -> sentUnreliableCommands);
         
@@ -186,7 +189,13 @@ enet_protocol_remove_sent_unreliable_commands (ENetPeer * peer)
         }
 
 		fx::generic_object_pool<ENetOutgoingCommand>::destruct(outgoingCommand);
-    }
+    } while (! enet_list_empty (& peer -> sentUnreliableCommands));
+
+    if (peer -> state == ENET_PEER_STATE_DISCONNECT_LATER &&
+        enet_list_empty (& peer -> outgoingReliableCommands) &&
+        enet_list_empty (& peer -> outgoingUnreliableCommands) &&
+        enet_list_empty (& peer -> sentReliableCommands))
+      enet_peer_disconnect (peer, peer -> eventData);
 }
 
 static ENetProtocolCommand
@@ -314,6 +323,9 @@ enet_protocol_handle_connect (ENetHost * host, ENetProtocolHeader * header, ENet
 
     if (peer == NULL || duplicatePeers >= host -> duplicatePeers)
       return NULL;
+
+    if (host -> validateDataCb && !host -> validateDataCb (host, &host->receivedAddress, ENET_NET_TO_HOST_32(command->connect.data)))
+        return NULL;
 
     if (channelCount > host -> channelLimit)
       channelCount = host -> channelLimit;
@@ -618,7 +630,7 @@ enet_protocol_handle_send_fragment (ENetHost * host, ENetPeer * peer, const ENet
                fragmentLength);
 
         if (startCommand -> fragmentsRemaining <= 0)
-          enet_peer_dispatch_incoming_reliable_commands (peer, channel);
+          enet_peer_dispatch_incoming_reliable_commands (peer, channel, NULL);
     }
 
     return 0;
@@ -736,7 +748,7 @@ enet_protocol_handle_send_unreliable_fragment (ENetHost * host, ENetPeer * peer,
                fragmentLength);
 
         if (startCommand -> fragmentsRemaining <= 0)
-          enet_peer_dispatch_incoming_unreliable_commands (peer, channel);
+          enet_peer_dispatch_incoming_unreliable_commands (peer, channel, NULL);
     }
 
     return 0;
@@ -846,24 +858,29 @@ enet_protocol_handle_acknowledge (ENetHost * host, ENetEvent * event, ENetPeer *
     if (ENET_TIME_LESS (host -> serviceTime, receivedSentTime))
       return 0;
 
-    peer -> lastReceiveTime = host -> serviceTime;
-    peer -> earliestTimeout = 0;
-
     roundTripTime = ENET_TIME_DIFFERENCE (host -> serviceTime, receivedSentTime);
+    roundTripTime = ENET_MAX (roundTripTime, 1);
 
-    enet_peer_throttle (peer, roundTripTime);
-
-    peer -> roundTripTimeVariance -= peer -> roundTripTimeVariance / 4;
-
-    if (roundTripTime >= peer -> roundTripTime)
+    if (peer -> lastReceiveTime > 0)
     {
-       peer -> roundTripTime += (roundTripTime - peer -> roundTripTime) / 8;
-       peer -> roundTripTimeVariance += (roundTripTime - peer -> roundTripTime) / 4;
+       enet_uint32 accumRoundTripTime = (peer -> roundTripTime << 8) + peer -> roundTripTimeRemainder;
+       enet_uint32 accumRoundTripTimeVariance = (peer -> roundTripTimeVariance << 8) + peer -> roundTripTimeVarianceRemainder;
+
+       enet_peer_throttle (peer, roundTripTime);
+
+       roundTripTime <<= 8;
+       accumRoundTripTimeVariance = (accumRoundTripTimeVariance * 3 + ENET_DIFFERENCE (roundTripTime, accumRoundTripTime)) / 4;
+       accumRoundTripTime = (accumRoundTripTime * 7 + roundTripTime) / 8;
+
+       peer -> roundTripTime = accumRoundTripTime >> 8;
+       peer -> roundTripTimeRemainder = accumRoundTripTime & 0xFF;
+       peer -> roundTripTimeVariance = accumRoundTripTimeVariance >> 8;
+       peer -> roundTripTimeVarianceRemainder = accumRoundTripTimeVariance & 0xFF;
     }
     else
     {
-       peer -> roundTripTime -= (peer -> roundTripTime - roundTripTime) / 8;
-       peer -> roundTripTimeVariance += (peer -> roundTripTime - roundTripTime) / 4;
+       peer -> roundTripTime = roundTripTime;
+       peer -> roundTripTimeVariance = (roundTripTime + 1) / 2;
     }
 
     if (peer -> roundTripTime < peer -> lowestRoundTripTime)
@@ -876,11 +893,14 @@ enet_protocol_handle_acknowledge (ENetHost * host, ENetEvent * event, ENetPeer *
         ENET_TIME_DIFFERENCE (host -> serviceTime, peer -> packetThrottleEpoch) >= peer -> packetThrottleInterval)
     {
         peer -> lastRoundTripTime = peer -> lowestRoundTripTime;
-        peer -> lastRoundTripTimeVariance = peer -> highestRoundTripTimeVariance;
+        peer -> lastRoundTripTimeVariance = ENET_MAX (peer -> highestRoundTripTimeVariance, 2);
         peer -> lowestRoundTripTime = peer -> roundTripTime;
         peer -> highestRoundTripTimeVariance = peer -> roundTripTimeVariance;
         peer -> packetThrottleEpoch = host -> serviceTime;
     }
+
+    peer -> lastReceiveTime = ENET_MAX (host -> serviceTime, 1);
+    peer -> earliestTimeout = 0;
 
     receivedReliableSequenceNumber = ENET_NET_TO_HOST_16 (command -> acknowledge.receivedReliableSequenceNumber);
 
@@ -1200,7 +1220,9 @@ static int
 enet_protocol_receive_incoming_commands (ENetHost * host, ENetEvent * event)
 {
     int packets;
+    auto end_time = enet_time_get() + 10;
 
+read:
     for (packets = 0; packets < 256; ++ packets)
     {
        int receivedLength;
@@ -1257,7 +1279,12 @@ enet_protocol_receive_incoming_commands (ENetHost * host, ENetEvent * event)
        }
     }
 
-    return -1;
+    if (enet_time_get() < end_time)
+    {
+        goto read;
+    }
+
+    return 0;
 }
 
 static void
@@ -1410,7 +1437,8 @@ enet_protocol_send_unreliable_outgoing_commands (ENetHost * host, ENetPeer * pee
     if (peer -> state == ENET_PEER_STATE_DISCONNECT_LATER && 
         enet_list_empty (& peer -> outgoingReliableCommands) &&
         enet_list_empty (& peer -> outgoingUnreliableCommands) && 
-        enet_list_empty (& peer -> sentReliableCommands))
+        enet_list_empty (& peer -> sentReliableCommands) &&
+        enet_list_empty (& peer -> sentUnreliableCommands))
       enet_peer_disconnect (peer, peer -> eventData);
 }
 
@@ -1441,6 +1469,11 @@ enet_protocol_check_timeouts (ENetHost * host, ENetPeer * peer, ENetEvent * even
                (outgoingCommand -> roundTripTimeout >= outgoingCommand -> roundTripTimeoutLimit &&
                  ENET_TIME_DIFFERENCE (host -> serviceTime, peer -> earliestTimeout) >= peer -> timeoutMinimum)))
        {
+          if (host -> peerTimeoutCb)
+          {
+              host -> peerTimeoutCb (host, peer);
+          }
+
           enet_protocol_notify_disconnect (host, peer, event);
 
           return 1;
@@ -1547,7 +1580,9 @@ enet_protocol_send_reliable_outgoing_commands (ENetHost * host, ENetPeer * peer)
  
        if (outgoingCommand -> roundTripTimeout == 0)
        {
-          outgoingCommand -> roundTripTimeout = peer -> roundTripTime + 4 * peer -> roundTripTimeVariance;
+          // #CFXCHANGE: clamp the round trip timeout to 35ms minimum (server network tick rate can be ~40 FPS worst case,
+          // also accounting for 30 FPS client-side anomalies)
+          outgoingCommand -> roundTripTimeout = ENET_MAX( peer -> roundTripTime + 4 * peer -> roundTripTimeVariance, 35 );
           outgoingCommand -> roundTripTimeoutLimit = peer -> timeoutLimit * outgoingCommand -> roundTripTimeout;
        }
 
@@ -1658,19 +1693,9 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
 #ifdef ENET_DEBUG
            printf ("peer %u: %f%%+-%f%% packet loss, %u+-%u ms round trip time, %f%% throttle, %u/%u outgoing, %u/%u incoming\n", currentPeer -> incomingPeerID, currentPeer -> packetLoss / (float) ENET_PEER_PACKET_LOSS_SCALE, currentPeer -> packetLossVariance / (float) ENET_PEER_PACKET_LOSS_SCALE, currentPeer -> roundTripTime, currentPeer -> roundTripTimeVariance, currentPeer -> packetThrottle / (float) ENET_PEER_PACKET_THROTTLE_SCALE, enet_list_size (& currentPeer -> outgoingReliableCommands), enet_list_size (& currentPeer -> outgoingUnreliableCommands), currentPeer -> channels != NULL ? enet_list_size (& currentPeer -> channels -> incomingReliableCommands) : 0, currentPeer -> channels != NULL ? enet_list_size (& currentPeer -> channels -> incomingUnreliableCommands) : 0);
 #endif
-          
-           currentPeer -> packetLossVariance -= currentPeer -> packetLossVariance / 4;
 
-           if (packetLoss >= currentPeer -> packetLoss)
-           {
-              currentPeer -> packetLoss += (packetLoss - currentPeer -> packetLoss) / 8;
-              currentPeer -> packetLossVariance += (packetLoss - currentPeer -> packetLoss) / 4;
-           }
-           else
-           {
-              currentPeer -> packetLoss -= (currentPeer -> packetLoss - packetLoss) / 8;
-              currentPeer -> packetLossVariance += (currentPeer -> packetLoss - packetLoss) / 4;
-           }
+           currentPeer -> packetLossVariance = (currentPeer -> packetLossVariance * 3 + ENET_DIFFERENCE (packetLoss, currentPeer -> packetLoss)) / 4;
+           currentPeer -> packetLoss = (currentPeer -> packetLoss * 7 + packetLoss) / 8;
 
            currentPeer -> packetLossEpoch = host -> serviceTime;
            currentPeer -> packetsSent = 0;

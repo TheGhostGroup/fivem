@@ -6,6 +6,8 @@
  */
 
 #include <StdInc.h>
+
+#include <jitasm.h>
 #include <Hooking.h>
 
 #include <Error.h>
@@ -13,6 +15,7 @@
 #include <ICoreGameInit.h>
 #include <gameSkeleton.h>
 
+#include <CoreConsole.h>
 #include <LaunchMode.h>
 #include <CrossBuildRuntime.h>
 
@@ -104,15 +107,17 @@ std::string GetType(void* d)
 {
 	VirtualBase* self = (VirtualBase*)d;
 
-	std::string typeName = fmt::sprintf("unknown (vtable %p)", *(void**)self);
+	std::string typeName = fmt::sprintf("unknown (vtable %p)", (void*)hook::get_unadjusted(*(void**)self));
 
-	try
+	if (!xbr::IsGameBuildOrGreater<2802>())
 	{
-		typeName = typeid(*self).name();
-	}
-	catch (std::__non_rtti_object&)
-	{
-
+		try
+		{
+			typeName = typeid(*self).name();
+		}
+		catch (std::__non_rtti_object&)
+		{
+		}
 	}
 
 	return typeName;
@@ -155,6 +160,20 @@ static bool VehicleEntryPointValidate(VehicleLayoutInfo* info)
 
 static int ReturnFalse()
 {
+	return 0;
+}
+
+static int ReturnClassification()
+{
+	// ENBSeries requires this for its heuristic to get the depth buffer, so we will force it on if there's a d3d11.dll in the
+	// game directory, ignoring the Intel GPU check as well
+	static bool hasD3D11 = GetFileAttributesW(MakeRelativeGamePath(L"d3d11.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
+
+	if (hasD3D11)
+	{
+		return 1;
+	}
+
 	return 0;
 }
 
@@ -479,10 +498,145 @@ static float sysPerformanceTimer__GetElapsedTimeMS(sysPerformanceTimer* self)
 	return (curTime.QuadPart - self->startTime.QuadPart) * *rage__sysTimerConsts__TicksToMilliseconds;
 }
 
+struct EnumContext
+{
+	void* outPtr;
+	uint32_t max;
+	uint32_t cur;
+};
+
+static BOOL (*g_origDSoundEnumCallback)(void* a1, void* a2, void* a3, EnumContext* cxt);
+
+static BOOL DSoundEnumCallback(void* a1, void* a2, void* a3, EnumContext* cxt)
+{
+	if (cxt->cur >= cxt->max)
+	{
+		return FALSE;
+	}
+
+	return g_origDSoundEnumCallback(a1, a2, a3, cxt);
+}
+
+struct CWeaponInfoBlob
+{
+	char pad[0xF8];
+};
+
+static uint16_t* g_weaponInfoArrayCount;
+
+static void (*g_origShiftWeaponInfoBlobsDown)(CWeaponInfoBlob* pArray[], uint16_t startIndex);
+
+void ShiftWeaponInfoBlobsDown(CWeaponInfoBlob* pArray[], uint16_t startIndex)
+{
+	uint16_t lastItemIndex = *g_weaponInfoArrayCount - 1;
+
+	g_origShiftWeaponInfoBlobsDown(pArray, startIndex);
+
+	// Only clear if a shift occured
+	if (startIndex < lastItemIndex)
+	{
+		// Copy the next empty weapon info into this unused one to reset it
+		(*pArray)[lastItemIndex] = (*pArray)[lastItemIndex + 1];
+	}
+}
+
+static const uint64_t* (*origMILookup)(void* archetype);
+
+static const uint64_t* SafeMILookup(void* archetype)
+{
+	auto mi = origMILookup(archetype);
+
+	if (!mi)
+	{
+		static const uint64_t noArchetype = 0xFFFFFFFFFFFFFFFF;
+		mi = &noArchetype;
+	}
+
+	return mi;
+}
+
+struct clockInfo
+{
+	char pad[12];
+	int year;
+};
+
+static int (*g_origCalculateLeap)(clockInfo* clock);
+
+static int _calculateLeapFix(clockInfo* clock)
+{
+	if (clock->year > 2025)
+	{
+		clock->year = 2025;
+	}
+
+	return g_origCalculateLeap(clock);
+}
+
+static int (*g_origGetCacheLineSize)();
+
+static int GetCacheLineSizeHook()
+{
+	auto rv = g_origGetCacheLineSize();
+
+	if (rv == 0)
+	{
+		return 64;
+	}
+
+	return rv;
+}
+
+static bool (*g_origRTTI_IsTypeOf_pgBase)(void*);
+
+static bool RTTI_IsTypeOf_pgBase(void* self)
+{
+	if (!self)
+	{
+		return true;
+	}
+
+	return g_origRTTI_IsTypeOf_pgBase(self);
+}
+
+static bool (*g_origFwClipset_GetClipItem_Caller)(void*, unsigned int);
+static bool fwClipset_GetClipItem_Caller(void* moveTask, unsigned int a2 /*'2'*/)
+{
+	if (!moveTask)
+	{
+		return false;
+	}
+	return g_origFwClipset_GetClipItem_Caller(moveTask, a2);
+}
+
 static HookFunction hookFunction{[] ()
 {
+	// CModelInfoStreamingModule LookupModelId null return
+	{
+		auto location = hook::get_pattern("48 85 C0 74 2D 48 8B C8 E8 ? ? ? ? 8B 00", 8);
+		hook::set_call(&origMILookup, location);
+		hook::call(location, SafeMILookup);
+	}
+
+	// Clear out unused CWeaponInfoBlob when the array is shifted. This leads to a crash when another blob inserts in to the unused position
+	{
+		auto location = hook::get_pattern<char>("E8 ? ? ? ? FF CD 0F B7 05 ? ? ? ?");
+
+		hook::set_call(&g_origShiftWeaponInfoBlobsDown, location);
+		hook::call(location, ShiftWeaponInfoBlobsDown);
+
+		g_weaponInfoArrayCount = hook::get_address<uint16_t*>(location + 0xA);
+	}
+
+	// audio device count fix for dsound
+	{
+		MH_Initialize();
+		MH_CreateHook(hook::get_address<void*>(hook::get_pattern("C6 45 F0 01 E8 ? ? ? ? 40 F6 C7 02", -4)), DSoundEnumCallback, (void**)&g_origDSoundEnumCallback);
+		MH_EnableHook(MH_ALL_HOOKS);
+	}
+
 	// TEMP DBG for investigation: don't crash blindly (but error cleanly) on odd object spawn
-	if (!Is2060())
+	if (!xbr::IsGameBuildOrGreater<2060>())
 	{
 		auto location = hook::get_pattern("48 85 C0 74 43 48 8B CE E8 ? ? ? ? 48 8B", 8);
 		hook::set_call(&g_origInitAnim, location);
@@ -531,7 +685,8 @@ static HookFunction hookFunction{[] ()
 
 	// block *any* CGameWeatherEvent
 	// (hotfix)
-	if (!CfxIsSinglePlayer())
+	// CGameWeatherEvent was removed from the game in 2372 build.
+	if (!CfxIsSinglePlayer() && !xbr::IsGameBuildOrGreater<2372>())
 	{
 		hook::return_function(hook::get_pattern("45 33 C9 41 B0 01 41 8B D3 E9", -10));
 	}
@@ -584,9 +739,8 @@ static HookFunction hookFunction{[] ()
 			test(rcx, rcx);
 			jz("justReturn");
 
-			// 505-specific offset
-			// valid for 1032 as well
-			movzx(ebx, word_ptr[rcx + 0x668]);
+			// validated for 1604-2802
+			movzx(ebx, word_ptr[rcx + 0x690]);
 			ret();
 
 			L("justReturn");
@@ -610,9 +764,8 @@ static HookFunction hookFunction{[] ()
 			test(rax, rax);
 			jz("justReturn");
 
-			// 505-specific offset
-			// valid for 1103 as well
-			cmp(qword_ptr[rax + 0x670], 0);
+			// validated for 1604-2802
+			cmp(qword_ptr[rax + 0x698], 0);
 
 			L("justReturn");
 			ret();
@@ -910,6 +1063,7 @@ static HookFunction hookFunction{[] ()
 		}
 	} clothFixStub1;
 
+	if (!xbr::IsGameBuildOrGreater<3095>()) // seems to be fixed as of 3095.0
 	{
 		auto location = hook::get_pattern("74 66 48 39 88 E0 01 00 00 74 5D", 2);
 		hook::nop(location, 7);
@@ -941,14 +1095,22 @@ static HookFunction hookFunction{[] ()
 
 	// fix STAT_SET_INT saving for unknown-typed stats directly using stack garbage as int64
 	// #TODO1737: around 0x140D376DD
-	if (!Is2060())
+	if (!xbr::IsGameBuildOrGreater<2060>())
 	{
 		hook::put<uint16_t>(hook::get_pattern("FF C8 0F 84 85 00 00 00 83 E8 12 75 6A", 13), 0x7EEB);
+	}
+	else
+	{
+		// #TODO2545
+		if (!xbr::IsGameBuildOrGreater<2545>())
+		{
+			hook::put<uint16_t>(hook::get_pattern("83 E8 12 75 6A 48 8B 03 48 8B CB", 5), 0x76EB);
+		}
 	}
 
 	// vehicles.meta explosionInfo field invalidity
 	MH_Initialize();
-	MH_CreateHook(hook::get_pattern("4C 8B F2 4C 8B F9 FF 50 08 4C 8D 05", -0x28), CVehicleModelInfo__init, (void**)&g_origCVehicleModelInfo__init);
+	MH_CreateHook(hook::get_pattern("4C 8B F2 4C 8B F9 FF 50 ? 4C 8D 05", -0x28), CVehicleModelInfo__init, (void**)&g_origCVehicleModelInfo__init);
 	MH_EnableHook(MH_ALL_HOOKS);
 
 	// disable TXD script resource unloading to work around a crash
@@ -964,7 +1126,7 @@ static HookFunction hookFunction{[] ()
 	}
 	
 	// test: disable 'classification' compute shader users by claiming it is unsupported
-	hook::jump(hook::get_pattern("84 C3 74 0D 83 C9 FF E8", -0x14), ReturnFalse);
+	hook::jump(hook::get_pattern("84 C3 74 0D 83 C9 FF E8", -0x14), ReturnClassification);
 
 	// test: disable ERR_GEN_MAPSTORE_X error asserts (RDR3 seems to not have any assertion around these at all, so this ought to be safe)
 	{
@@ -985,7 +1147,7 @@ static HookFunction hookFunction{[] ()
 	// 1604 signature: magnesium-september-wisconsin (FIVEM-CLIENT-1604-34)
 	//                 massachusetts-skylark-black   (FIVEM-CLIENT-1604-3D) <- CPedFactory::ms_playerPed being NULL with same call stack in CPortalTracker
 	{
-		auto location = hook::get_pattern("48 8D 0D ? ? ? ? E8 ? ? ? ? 84 DB 74 0C 48 8D 0D", 23);
+		auto location = hook::get_pattern("E8 ? ? ? ? 48 8D 0D ? ? ? ? E8 ? ? ? ? 84 DB 74 0C 48 8D 0D", 28);
 		hook::set_call(&g_origReinitRenderPhase, location);
 		hook::call(location, ReinitRenderPhaseWrap);
 
@@ -1052,6 +1214,9 @@ static HookFunction hookFunction{[] ()
 	// hook to pretend any such slot is loaded
 	MH_CreateHook(hook::get_pattern("75 0D F6 84 08 ? ? 00 00", -0xB), CText__IsSlotLoadedHook, (void**)&g_origCText__IsSlotLoaded);
 
+	// cache line size can't be 0, breaks Nickel XTA
+	MH_CreateHook(hook::get_pattern("B8 01 00 00 00 0F A2 C1 EB 08", -0x11), GetCacheLineSizeHook, (void**)&g_origGetCacheLineSize);
+
 	// and to prevent unloading
 	if (!Is372())
 	{
@@ -1065,13 +1230,169 @@ static HookFunction hookFunction{[] ()
 		hook::call(location, PoolInitX<3>);
 	}
 
+	// unloading crash: CConditionalAnimManager::ShutdownSession double-free
+	hook::nop(hook::get_pattern("74 08 41 8B D6 E8 ? ? ? ? 44 8B 07 EB 15", 5), 5);
+
 	// validate dlDrawListMgr cloth entries on flush
-	MH_CreateHook(hook::get_pattern("66 44 3B A9 50 06 00 00 0F 83", -0x25), CDrawListMgr_ClothCleanup, (void**)&g_origDrawListMgr_ClothFlush);
+	MH_CreateHook(hook::get_pattern("66 44 3B ? 50 06 00 00 0F 83", (xbr::IsGameBuildOrGreater<2699>() ? -0x26 : -0x25)), CDrawListMgr_ClothCleanup, (void**)&g_origDrawListMgr_ClothFlush);
 
 	g_clothCritSec = hook::get_address<LPCRITICAL_SECTION>(hook::get_pattern("48 8B F8 48 89 58 10 33 C0 8D 50 10", -0x21));
 
 	// very hacky patch to not unload base game data from 'vehiclelayouts' CVehicleMetadataMgr
 	VehicleMetadataUnloadMagic();
 
+	// mitigate crazy year corruption causing slowdown in render/timecycle leap year computation
+	MH_CreateHook(hook::get_pattern("BB 6C 07 00 00 33 FF 48", -15), _calculateLeapFix, (void**)&g_origCalculateLeap);
+
 	MH_EnableHook(MH_ALL_HOOKS);
-} };
+
+	// don't fastfail from game CRT code
+	{
+		// 5 hits on 2944, but skipping 2 last
+		auto pattern = hook::pattern("B9 ? ? ? ? CD 29").count_hint(3);
+
+		for (size_t i = 0; i < pattern.size(); i++)
+		{
+			// replace with a `ud2` instruction
+			hook::put<uint16_t>(pattern.get(i).get<void>(5), 0x0B0F);
+		}
+	}
+
+	// fix crash caused by lack of nullptr check for CWeaponInfo, introduced as a R* bug in 2545.0, fixed in 2628.2
+	if (xbr::IsGameBuildOrGreater<2545>() && !xbr::IsGameBuildOrGreater<2628>())
+	{
+		auto location = hook::get_pattern("41 81 7F 10 F3 9C CD 45");
+
+		static struct : jitasm::Frontend
+		{
+			intptr_t location;
+			intptr_t retSuccess;
+			intptr_t retFail;
+
+			void Init(intptr_t location)
+			{
+				this->location = location;
+				this->retSuccess = location + 8;
+				this->retFail = location + 0x37;
+			}
+
+			void InternalMain() override
+			{
+				test(r15, r15); // CWeaponInfo or nullptr, missing in original code
+				jz("fail"); 
+
+				cmp(dword_ptr[r15 + 0x10], 0x45CD9CF3); // original check of weapon_stungun_mp
+				jnz("fail"); 
+
+				mov(rax, retSuccess);
+				jmp(rax);
+
+				L("fail");
+				mov(rax, retFail);
+				jmp(rax);
+			}
+		} patchStub;
+
+		patchStub.Init(reinterpret_cast<intptr_t>(location));
+		hook::nop(location, 8);
+		hook::jump(location, patchStub.GetCode());
+	}
+
+	//
+	// Null pointer dereferencing crash fix in rage::strRequestMgr::RemoveObject. The function
+	// that is getting patched used to ensure that first argument is a type of rage::pgBase.
+	// However it also return false if a nullptr has been passed, this is why the crash is happening.
+	// The code inside if-check does expect variable to be a valid pointer. We're patching this
+	// specific RTTI type checking function call to return "true" when first argument is nullptr.
+	// This is also clear that first argument may be a nullptr given the other related code in this function.
+	//
+	if (xbr::IsGameBuildOrGreater<2802>())
+	{
+		auto location = hook::get_pattern("B9 D4 A7 C6 36 E8", -19);
+		hook::set_call(&g_origRTTI_IsTypeOf_pgBase, location);
+		hook::call(location, RTTI_IsTypeOf_pgBase);
+	}
+
+	// netBlender::addOrientationFrame()
+	// Sometime before 1604, Extra logic related to vehicles was added.
+	// This seems to cause a crash in some cases where the object is already destructed
+	if (xbr::IsGameBuildOrGreater<1604>())
+	{
+		auto location = hook::get_pattern("48 8D 54 24 30 89 81 ? 01 00 00");
+		// NOP loading Vector3 Ref into RDX for the below function
+		hook::nop(location, 5);
+		// NOP the function call that was added
+		hook::nop((char*)location + 21, 6);
+		// NOP the extra comparisons added to the if()
+		hook::nop((char*)location + 0x69, 45);
+		// Change the opcode to an unconditional JMP
+		hook::put((char*)location + 0x96, (uint8_t)0xEB);
+	}
+
+	// Caller to rage::fwClipset::GetClipItem()
+	// GetClipItem() will immediately deref a1+50
+	// This can be NULL in some cases, and in other places the game is seen checking if it's NULL
+	{
+		// Sig to start of function [1604-2944]
+		MH_Initialize();
+		MH_CreateHook(hook::get_pattern("48 8B C4 48 89 58 10 48 89 68 18 48 89 70 20 57 48 83 EC 20 8B EA"), fwClipset_GetClipItem_Caller, (void**)&g_origFwClipset_GetClipItem_Caller);
+		MH_EnableHook(MH_ALL_HOOKS);
+	}
+
+	// CNetObjAutomobile::sub_1410FC878() [2699]
+	// in the 2nd half of the function, there is some code that deals with the vehicle intelligence tasktree
+	// however, the VehicleIntelligence (CVehicle+0xBD0) seems to be NULL in some cases -- it is deref'd CVehicle->Intelligence->tasktree without checking
+	{
+		// 48 8B 4E 50      mov     rcx, [rsi+50h]
+		// 48 85 C9         test    rcx, rcx
+		// 74 76            jz      short loc_1410FC94C
+		void* location = hook::get_pattern("48 8B 4E 50 48 85 C9 74 ? 48 8B 81 ? ? 00 00");
+
+		uint8_t jzToFailBytes = *(uint8_t*)((uintptr_t)location + 8);
+		void* jzFailLocation = (void*)((uintptr_t)location + 9 + jzToFailBytes);
+
+		int offsetToIntel = *(int*)((uintptr_t)location + 12);
+
+		static struct : jitasm::Frontend
+		{
+			intptr_t location;
+			intptr_t retSuccess;
+			intptr_t retFail;
+			int offsetToIntelligence;
+
+			void Init(intptr_t location, intptr_t failLocation, int offsetToIntel)
+			{
+				this->location = location;
+				this->retSuccess = location + 9;
+				this->retFail = failLocation;
+				this->offsetToIntelligence = offsetToIntel;
+			}
+
+			void InternalMain() override
+			{
+				// original code
+				// Get gameObj from CNetObj
+				mov(rcx, qword_ptr[rsi + 0x50]);
+				test(rcx, rcx);
+				jz("fail");
+				
+				// also test for gameObj->Intelligence
+				mov(rax, qword_ptr[rcx + offsetToIntelligence]);
+				test(rax, rax);
+				jz("fail");
+
+				mov(rax, retSuccess);
+				jmp(rax);
+
+				L("fail");
+				mov(rax, retFail);
+				jmp(rax);
+			}
+		} intelCheckStub;
+
+		intelCheckStub.Init(reinterpret_cast<intptr_t>(location), reinterpret_cast<intptr_t>(jzFailLocation), offsetToIntel);
+		hook::nop(location, 9);
+		intelCheckStub.Assemble();
+		hook::jump(location, intelCheckStub.GetCode());
+	}
+}};

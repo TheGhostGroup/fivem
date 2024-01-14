@@ -17,6 +17,17 @@
 
 namespace rage
 {
+	struct GFXSPEC_EXPORT dlDrawCommandBuffer
+	{
+		void AddDrawCommand(int type);
+
+		void AlignBuffer(uint32_t alignment);
+
+		static void* AllocateDrawCommand(size_t size);
+
+		static dlDrawCommandBuffer* GetInstance();
+	};
+
 	class grmShaderParameter
 	{
 	public:
@@ -75,7 +86,6 @@ namespace rage
 
 		void PopTechnique();
 
-#if 0
 		inline int GetParameter(const char* name)
 		{
 			return m_shader->GetParameter(name);
@@ -95,7 +105,6 @@ namespace rage
 		{
 			return m_shader->SetParameter(this, index, data, size, count);
 		}
-#endif
 	};
 
 	class GFXSPEC_EXPORT_VMT grmShaderFactory
@@ -103,7 +112,7 @@ namespace rage
 	public:
 		virtual ~grmShaderFactory() = default;
 
-		virtual grmShaderFx* GetShader() = 0;
+		virtual grmShaderFx* Create() = 0;
 
 		static grmShaderFactory* GetInstance();
 	};
@@ -121,6 +130,16 @@ bool GFXSPEC_EXPORT IsOnRenderThread();
 
 namespace rage
 {
+	enum grcDrawMode
+	{
+		grcPointList = 0,
+		grcLineList,
+		grcLineStrip,
+		grcTriangleList,
+		grcTriangleStrip,
+		// some more unknowns follow (lighting, etc.)
+	};
+
 	void GFXSPEC_EXPORT grcBegin(int drawMode, int count);
 	void GFXSPEC_EXPORT grcVertex(float x, float y, float z, float nX, float nY, float nZ, uint32_t color, float u, float v);
 	void GFXSPEC_EXPORT grcEnd();

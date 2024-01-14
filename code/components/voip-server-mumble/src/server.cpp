@@ -293,16 +293,70 @@ int Client_send_udp(client_t *client, uint8_t *data, int len);
 static std::mutex mumblePairsMutex;
 static std::map<net::PeerAddress, bool> mumblePairs;
 
+static std::mutex retryPairsMutex;
+static std::map<net::PeerAddress, int> retryPairs;
+
+static std::map<std::string, int> clientsPerIP;
+
 extern std::recursive_mutex g_mumbleClientMutex;
+
+void Server_onFree(client_t* client)
+{
+	std::lock_guard _(mumblePairsMutex);
+	mumblePairs.erase(client->remote_udp);
+}
+
+void CleanupMumblePairs()
+{
+	{
+		std::lock_guard _(mumblePairsMutex);
+		for (auto it = mumblePairs.begin(); it != mumblePairs.end(); )
+		{
+			if (!it->second)
+			{
+				it = mumblePairs.erase(it);
+			}
+			else
+			{
+				++it;
+			}
+		}
+	}
+
+	{
+		std::lock_guard _(retryPairsMutex);
+		retryPairs.clear();
+	}
+}
+
+static bool mumbleServerInitialized;
+
+static void EnsureServerInitialized()
+{
+	if (!mumbleServerInitialized)
+	{
+		Chan_init();
+		Client_init();
+		// Ban_init();
+		mumbleServerInitialized = true;
+	}
+}
+
+std::shared_ptr<ConVar<bool>> mumble_disableServer;
+std::shared_ptr<ConVar<int>> mumble_maxClientsPerIP;
 
 static InitFunction initFunction([]()
 {
-	Chan_init();
-	Client_init();
-//	Ban_init();
+	mumble_disableServer = std::make_shared<ConVar<bool>>("mumble_disableServer", ConVar_None, false);
+	mumble_maxClientsPerIP = std::make_shared<ConVar<int>>("mumble_maxClientsPerIP", ConVar_None, 32);
 
 	OnCreateTlsMultiplex.Connect([=](fwRefContainer<net::MultiplexTcpServer> multiplex)
 	{
+		if (mumble_disableServer->GetValue())
+			return;
+
+		EnsureServerInitialized();
+
 		auto server = multiplex->CreateServer([](const std::vector<uint8_t>& bytes)
 		{
 			if (bytes.size() > 6)
@@ -333,6 +387,24 @@ static InitFunction initFunction([]()
 
 			{
 				std::unique_lock<std::recursive_mutex> lock(g_mumbleClientMutex);
+
+				auto hostIP = stream->GetPeerAddress().GetHost();
+				auto mapEntry = clientsPerIP.find(hostIP);
+				if (mapEntry != clientsPerIP.end())
+				{
+					auto maxClientCount = mumble_maxClientsPerIP->GetValue();
+					if (mapEntry->second >= maxClientCount)
+					{
+						trace("IP %s already has %d Mumble connections active, rejecting client. This limit can be changed using the mumble_maxClientsPerIP ConVar.\n",
+						hostIP.c_str(), maxClientCount);
+						return;
+					}
+					mapEntry->second++;
+				}
+				else
+				{
+					clientsPerIP.insert({ hostIP, 1 });
+				}
 
 				Client_add(stream, &client);
 			}
@@ -378,7 +450,7 @@ static InitFunction initFunction([]()
 				readQueue.resize(origSize + data.size());
 
 				// close the stream if the length is too big
-				if (readQueue.size() > (1024 * 1024 * 5))
+				if (readQueue.size() > (1024 * 1024 * 25))
 				{
 					stream->Close();
 					return;
@@ -440,6 +512,11 @@ static InitFunction initFunction([]()
 			stream->SetCloseCallback([=]()
 			{
 				std::unique_lock<std::recursive_mutex> lock(g_mumbleClientMutex);
+				auto mapEntry = clientsPerIP.find(client->remote_tcp.GetHost());
+				if (mapEntry->second == 1)
+					clientsPerIP.erase(mapEntry);
+				else
+					mapEntry->second--;
 				Client_free(client);
 			});
 		});
@@ -449,17 +526,33 @@ static InitFunction initFunction([]()
 			using namespace std::chrono_literals;
 			SetThreadName(-1, "[Mumble] Worker thread");
 
+			size_t i = 0;
+
 			while (true)
 			{
 				std::this_thread::sleep_for(1000ms);
 
 				Client_janitor();
+
+				++i;
+
+				// clean up pairs every ~20 seconds
+				if (i > 20)
+				{
+					CleanupMumblePairs();
+					i = 0;
+				}
 			}
 		}).detach();
 	});
 
 	fx::ServerInstanceBase::OnServerCreate.Connect([](fx::ServerInstanceBase* instance)
 	{
+		if (mumble_disableServer->GetValue())
+			return;
+
+		EnsureServerInitialized();
+
 		auto interceptor = instance->GetComponent<fx::UdpInterceptor>();
 
 		interceptor->OnIntercept.Connect([interceptor](const net::PeerAddress& address, const uint8_t* data, size_t len, bool* intercepted)
@@ -500,7 +593,7 @@ static InitFunction initFunction([]()
 				return;
 			}
 
-			auto fromAddress = address.GetHost();
+			auto fromAddress = address.GetHostBytes();
 
 			// Mumble clients are expected to be connected to TCP already - if this is not a known Mumble TCP pair, mark and drop
 			client_t* client = nullptr;
@@ -509,20 +602,33 @@ static InitFunction initFunction([]()
 
 			if (!known)
 			{
+				// try finding a client for whom the packet will decrypt correctly
 				client_t* itr = nullptr;
+				bool found = false;
 
 				while (Client_iterate(&itr) != nullptr)
 				{
 					if (itr->remote_udp == net::PeerAddress{} &&
-						(itr->remote_tcp.GetHost() == fromAddress ||
-						 fromAddress == fmt::sprintf("[::ffff:%s]", itr->remote_tcp.GetHost())))
+						(itr->remote_tcp.GetHostBytes() == fromAddress ||
+						 itr->remote_tcp.GetHostBytesV6() == fromAddress))
 					{
 						known = true;
-						break;
+
+						// try decrypting the packet, maybe it'll be mumble
+						if (checkDecrypt(itr, data, buffer, std::min(len, sizeof(buffer))))
+						{
+							// it's mumble!
+							std::lock_guard _(retryPairsMutex);
+							retryPairs[address] = 0;
+
+							found = true;
+
+							break;
+						}
 					}
 				}
 
-				// still not known? don't intercept
+				// if no client matched even on IP, mark this pair as dead
 				if (!known)
 				{
 					std::lock_guard<std::mutex> lock(mumblePairsMutex);
@@ -531,26 +637,28 @@ static InitFunction initFunction([]()
 					return;
 				}
 
-				// try decrypting the packet, maybe it'll be mumble
-				if (!checkDecrypt(itr, data, buffer, std::min(len, sizeof(buffer))))
+				// wasn't mumble, note down a failure and return
+				if (!found)
 				{
+					std::unique_lock _(retryPairsMutex);
+
 					// quite certainly not mumble
-					if (itr->numFailedCrypt > 10)
+					if (retryPairs[address] > 5)
 					{
+						// unlock so we don't incorrectly nest
+						_.unlock();
+
+						// permanently note down this pair as not-mumble
 						std::lock_guard<std::mutex> lock(mumblePairsMutex);
 						mumblePairs.insert({ address, false });
-
-						itr->numFailedCrypt = 0;
 
 						return;
 					}
 
-					itr->numFailedCrypt++;
-
+					// note this client has been mumble
+					retryPairs[address]++;
 					return;
 				}
-
-				itr->numFailedCrypt = 0;
 
 				// mumble! let's mark it
 				std::lock_guard<std::mutex> lock(mumblePairsMutex);

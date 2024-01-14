@@ -17,10 +17,28 @@
 
 #include <Error.h>
 
+#include <CrossBuildRuntime.h>
+
 static CGameScriptHandlerMgr* g_scriptHandlerMgr;
 
 static std::map<uint32_t, rage::scrThread*> g_customThreads;
 static std::map<uint32_t, std::string> g_customThreadsToNames;
+
+static bool* CTheScripts__ms_bUpdatingScriptThreads;
+
+UpdatingScriptThreadsScope::UpdatingScriptThreadsScope(bool newState)
+{
+	m_lastProcessTick = *CTheScripts__ms_bUpdatingScriptThreads;
+	*CTheScripts__ms_bUpdatingScriptThreads = newState;
+}
+
+UpdatingScriptThreadsScope::~UpdatingScriptThreadsScope()
+{
+	if (m_lastProcessTick)
+	{
+		*CTheScripts__ms_bUpdatingScriptThreads = *m_lastProcessTick;
+	}
+}
 
 static rage::scrThread* (*g_origGetThreadById)(uint32_t hash);
 
@@ -61,6 +79,17 @@ static HookFunction hookFunction([]()
 		g_customThreads.erase(thread->GetContext()->ThreadId);
 		g_customThreadsToNames.erase(thread->GetContext()->ThreadId);
 	});
+
+	// remove assertion for duplicate scripts (R* prod debug)
+	if (xbr::IsGameBuildOrGreater<1355>())
+	{
+		auto pattern = hook::pattern("FF 50 ? 84 C0 74 ? BA ? ? ? ? 41").count(3);
+
+		for (int i = 0; i < pattern.size(); i++)
+		{
+			hook::put<uint8_t>(pattern.get(i).get<void>(5), 0xEB);
+		}
+	}
 });
 
 // functions
@@ -166,4 +195,6 @@ static HookFunction hookFunctionVtbl([]()
 		g_origDetachScript = ((decltype(g_origDetachScript))vtable[11]);
 		vtable[11] = (uintptr_t)WrapDetachScript;
 	}
+
+	CTheScripts__ms_bUpdatingScriptThreads = hook::get_address<bool*>(hook::get_pattern("48 8B C2 48 8B D9 75 09 83 C8 FF", -5)) + 1;
 });

@@ -1,16 +1,18 @@
 #pragma once
 
 #include <d3d11.h>
+#include <CrossBuildRuntime.h>
+#include <XBRVirtual.h>
 
 #define _HAS_GRCTEXTURE_MAP 1
 
 #ifdef COMPILING_RAGE_GRAPHICS_FIVE
-#define GAMESPEC_EXPORT_VMT __declspec(dllexport) __declspec(novtable)
-#define GAMESPEC_EXPORT __declspec(dllexport)
+#define GFX_EXPORT_VMT __declspec(dllexport) __declspec(novtable)
+#define GFX_EXPORT __declspec(dllexport)
 #else
 // no dllimport for importing a vtable as it will be translated to a local vtable
-#define GAMESPEC_EXPORT_VMT __declspec(novtable)
-#define GAMESPEC_EXPORT __declspec(dllimport)
+#define GFX_EXPORT_VMT __declspec(novtable)
+#define GFX_EXPORT __declspec(dllimport)
 #endif
 
 namespace rage
@@ -38,66 +40,66 @@ enum class grcLockFlags : int
 
 DEFINE_ENUM_FLAG_OPERATORS(grcLockFlags);
 
-class grcTexture
+class grcTexture : XBR_VIRTUAL_BASE_2802(0)
 {
 public:
-	virtual ~grcTexture() = 0;
+	XBR_VIRTUAL_DTOR(grcTexture)
 
-	virtual bool m_4() = 0;
+	XBR_VIRTUAL_METHOD(bool, m_4, ())
 
-	virtual int m_8() = 0;
+	XBR_VIRTUAL_METHOD(int, m_8, ())
 
-	virtual void m_C() = 0;
+	XBR_VIRTUAL_METHOD(void, m_C, ())
 
-	virtual int m_10() = 0;
+	XBR_VIRTUAL_METHOD(int, m_10, ())
 
-	virtual uint16_t GetWidth() = 0;
+	XBR_VIRTUAL_METHOD(uint16_t, GetWidth, ())
 
-	virtual uint16_t GetHeight() = 0;
+	XBR_VIRTUAL_METHOD(uint16_t, GetHeight, ())
 
-	virtual uint16_t GetDepth() = 0;
+	XBR_VIRTUAL_METHOD(uint16_t, GetDepth, ())
 
 	// unknown?
-	virtual uint8_t GetLevels() = 0;
+	XBR_VIRTUAL_METHOD(uint8_t, GetLevels, ())
 
-	virtual void m_24() = 0;
+	XBR_VIRTUAL_METHOD(void, m_24, ())
 
-	virtual bool m_28() = 0;
+	XBR_VIRTUAL_METHOD(bool, m_28, ())
 
-	virtual void m_2C(intptr_t) = 0;
+	XBR_VIRTUAL_METHOD(void, m_2C, (intptr_t))
 
-	virtual void m_30(void*) = 0;
+	XBR_VIRTUAL_METHOD(void, m_30, (void*))
 
-	virtual void m_34(void*) = 0;
+	XBR_VIRTUAL_METHOD(void, m_34, (void*))
 
-	virtual void m_unk() = 0;
+	XBR_VIRTUAL_METHOD(void, m_unk, ())
 
-	virtual rage::grcTexture* m_38() = 0;
+	XBR_VIRTUAL_METHOD(rage::grcTexture*, m_38, ())
 
-	virtual rage::grcTexture* m_3C() = 0;
+	XBR_VIRTUAL_METHOD(rage::grcTexture*, m_3C, ())
 
-	virtual bool m_40() = 0;
+	XBR_VIRTUAL_METHOD(bool, m_40, ())
 
-	virtual int m_44() = 0;
+	XBR_VIRTUAL_METHOD(int, m_44, ())
 
-	virtual int m_48() = 0;
+	XBR_VIRTUAL_METHOD(int, m_48, ())
 
-	virtual int m_4C() = 0;
+	XBR_VIRTUAL_METHOD(int, m_4C, ())
 
-	virtual int m_50() = 0;
+	XBR_VIRTUAL_METHOD(int, m_50, ())
 
-	virtual int m_54() = 0;
+	XBR_VIRTUAL_METHOD(int, m_54, ())
 
-	virtual int m_unk2() = 0;
+	XBR_VIRTUAL_METHOD(int, m_unk2, ())
 
-	virtual int m_unk3() = 0;
+	XBR_VIRTUAL_METHOD(int, m_unk3, ())
 
-	virtual bool Map(int numSubLevels, int subLevel, grcLockedTexture* lockedTexture, grcLockFlags flags) = 0;
+	XBR_VIRTUAL_METHOD(bool, Map, (int numSubLevels, int subLevel, grcLockedTexture* lockedTexture, grcLockFlags flags))
 
-	virtual void Unmap(grcLockedTexture* lockedTexture) = 0;
+	XBR_VIRTUAL_METHOD(void, Unmap, (grcLockedTexture * lockedTexture))
 
 public:
-	static bool GAMESPEC_EXPORT IsRenderSystemColorSwapped();
+	static bool GFX_EXPORT IsRenderSystemColorSwapped();
 
 	// D3D11 specific
 private:
@@ -111,6 +113,11 @@ private:
 
 public:
 	ID3D11ShaderResourceView* srv;
+};
+
+class grcRenderTarget : public grcTexture
+{
+
 };
 
 #define FORMAT_A8R8G8B8 40
@@ -139,8 +146,17 @@ public:
 
 struct grcManualTextureDef
 {
+	// bit flag:
+	// | 1 -> dynamic texture (no internal staging texture)
+	// | 2 -> unknown
 	int isStaging;
-	char pad[20];
+	int unk1;
+	// flag, sorta:
+	// == 0 -> immutable
+	// == 1 -> writable?
+	// == 2 -> other weird case
+	int usage;
+	char pad[12];
 	int isRenderTarget;
 	char pad2[8];
 	int arraySize;
@@ -154,7 +170,7 @@ public:
 
 	virtual grcTexture* unk_8() = 0;
 
-	virtual grcTexture* createManualTexture(short width, short height, int format, void* unknown, bool, const grcManualTextureDef* templ) = 0;
+	virtual grcTexture* createManualTexture(short width, short height, int format, const void* initialData, bool unused, const grcManualTextureDef* templ) = 0;
 
 	virtual grcTexture* createImage(grcTextureReference* texture, void* unkTemplate) = 0;
 
@@ -180,13 +196,19 @@ private:
 public:
 	virtual grcTexture* createFromNativeTexture(const char* name, ID3D11Resource* nativeResource, void* a3) = 0;
 
-public:
-	static GAMESPEC_EXPORT grcTexture* GetNoneTexture();
+	virtual void v12() = 0;
 
-	static GAMESPEC_EXPORT grcTextureFactory* getInstance();
+	virtual void PushRenderTarget(void* a2, grcRenderTarget* rt, void* a4, int a5, bool a6, int a7) = 0;
+
+	virtual void PopRenderTarget(void* a2, void* a3_clear) = 0;
+
+public:
+	static GFX_EXPORT grcTexture* GetNoneTexture();
+
+	static GFX_EXPORT grcTextureFactory* getInstance();
 };
 
-class GAMESPEC_EXPORT grcResourceCache
+class GFX_EXPORT grcResourceCache
 {
 public:
 	static grcResourceCache* GetInstance();
@@ -194,7 +216,14 @@ public:
 	void QueueDelete(void* graphicsResource);
 
 	void FlushQueue();
+
+	size_t GetUsedPhysicalMemory();
+
+	size_t GetTotalPhysicalMemory();
+
+	size_t _getAndUpdateAvailableMemory(bool virt, bool spare);
 };
 }
 
-void GAMESPEC_EXPORT ClearRenderTarget(bool a1, int value1, bool a2, float value2, bool a3, int value3);
+void GFX_EXPORT ClearRenderTarget(bool a1, int value1, bool a2, float value2, bool a3, int value3);
+GFX_EXPORT rage::grcRenderTarget* CreateRenderTarget(int idx, const char* name, int usage3, int width, int height, int format /* or bit count */, void* metadata, uint8_t a, rage::grcRenderTarget* last);

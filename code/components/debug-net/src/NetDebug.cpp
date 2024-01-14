@@ -57,16 +57,27 @@ private:
 	std::map<uint32_t, std::string_view> m_lookupList;
 };
 
+// rg -i '"msg' | grep -oP '"msg[A-Z].*?"' | sed 's/"$/",/g' | sort -u | clip
 static const char* g_knownPackets[]
 {
+	"msgArrayUpdate",
+	"msgCloneAcks",
+	"msgCloneRemove",
 	"msgConVars",
+	"msgConfirm",
 	"msgEnd",
 	"msgEntityCreate",
+	"msgFrame",
+	"msgHeHost",
+	"msgIHost",
+	"msgIQuit",
+	"msgNetEvent",
 	"msgNetGameEvent",
 	"msgObjectIds",
 	"msgPackedAcks",
 	"msgPackedClones",
 	"msgPaymentRequest",
+	"msgReassembledEvent",
 	"msgRequestObjectIds",
 	"msgResStart",
 	"msgResStop",
@@ -75,14 +86,15 @@ static const char* g_knownPackets[]
 	"msgRpcNative",
 	"msgServerCommand",
 	"msgServerEvent",
+	"msgStateBag",
 	"msgTimeSync",
 	"msgTimeSyncReq",
 	"msgWorldGrid",
-	"msgFrame",
-	"msgIHost",
+	"msgWorldGrid3",
+
+	// manual list that doesn't start with 'msg'
 	"gameStateAck",
-	"msgNetEvent",
-	"msgServerEvent",
+	"gameStateNAck",
 };
 
 static RageHashList g_hashes{ g_knownPackets };
@@ -242,14 +254,15 @@ NetOverlayMetricSink::NetOverlayMetricSink()
 			return;
 		}
 
-		auto& io = ImGui::GetIO();
+		int x, y;
+		GetGameResolution(x, y);
 
 		ImGui::SetNextWindowBgAlpha(0.0f);
-		ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x + g_netOverlayOffsetX, io.DisplaySize.y + g_netOverlayOffsetY), ImGuiCond_Once, ImVec2(1.0f, 1.0f));
+		ImGui::SetNextWindowPos(ImVec2(ImGui::GetMainViewport()->Pos.x + x + g_netOverlayOffsetX, ImGui::GetMainViewport()->Pos.y + y + g_netOverlayOffsetY), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
 		ImGui::SetNextWindowSize(ImVec2(g_netOverlayWidth, g_netOverlayHeight));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
 
-		if (ImGui::Begin("NetGraph", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize))
+		if (ImGui::Begin("NetGraph", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoScrollbar))
 		{
 			// draw the graph
 			DrawGraph();
@@ -268,7 +281,7 @@ NetOverlayMetricSink::NetOverlayMetricSink()
 		UpdateMetrics();
 	}, 50);
 
-	static ConVar<bool> commandVar("net_showCommands", ConVar_Archive, false, &m_enabledCommands);
+	static ConVar<bool> commandVar("net_showCommands", ConVar_Archive | ConVar_UserPref, false, &m_enabledCommands);
 
 	ConHost::OnShouldDrawGui.Connect([this](bool* should)
 	{
@@ -277,80 +290,81 @@ NetOverlayMetricSink::NetOverlayMetricSink()
 
 	ConHost::OnDrawGui.Connect([this]()
 	{
-		if (m_enabledCommands)
+		if (!m_enabledCommands)
 		{
-			if (ImGui::Begin("Network Metrics"))
+			return;
+		}
+
+		if (ImGui::Begin("Network Metrics", &m_enabledCommands))
+		{
+			std::unique_lock<std::mutex> lock(m_metricMutex);
+
+			static bool showIncoming = true;
+			static bool showOutgoing = true;
+			static bool showLog = true;
+
+			auto showList = [](const decltype(m_lastIncomingMetrics)& list, const decltype(m_incomingReliable)& reliable)
 			{
-				std::unique_lock<std::mutex> lock(m_metricMutex);
+				ImGui::Columns(3);
 
-				static bool showIncoming = true;
-				static bool showOutgoing = true;
-				static bool showLog = true;
-
-				auto showList = [](const decltype(m_lastIncomingMetrics)& list, const decltype(m_incomingReliable)& reliable)
+				for (auto& entry : list)
 				{
-					ImGui::Columns(3);
+					ImGui::Text("%s", (reliable.find(entry.first)->second ? "R" : "U"));
+					ImGui::NextColumn();
 
-					for (auto& entry : list)
-					{
-						ImGui::Text("%s", (reliable.find(entry.first)->second ? "R" : "U"));
-						ImGui::NextColumn();
+					ImGui::Text("%s", g_hashes.LookupHash(entry.first).c_str());
+					ImGui::NextColumn();
 
-						ImGui::Text("%s", g_hashes.LookupHash(entry.first));
-						ImGui::NextColumn();
-
-						ImGui::Text("%d B", entry.second);
-						ImGui::NextColumn();
-					}
-
-					ImGui::Columns(1);
-				};
-
-				if (ImGui::CollapsingHeader("Incoming", &showIncoming))
-				{
-					showList(m_lastIncomingMetrics, m_incomingReliable);
+					ImGui::Text("%d B", entry.second);
+					ImGui::NextColumn();
 				}
 
-				if (ImGui::CollapsingHeader("Outgoing", &showOutgoing))
-				{
-					showList(m_lastOutgoingMetrics, m_outgoingReliable);
-				}
+				ImGui::Columns(1);
+			};
 
-				if (ImGui::CollapsingHeader("Log", &showLog))
-				{
-					ImGui::Columns(2);
-
-					for (int i = 0; i < std::max(m_lastIncomingData.size(), m_lastOutgoingData.size()); i++)
-					{
-						if (i < m_lastIncomingData.size())
-						{
-							ImGui::Text("%d. %s (%d)", i + 1, g_hashes.LookupHash(std::get<0>(m_lastIncomingData[i])), std::get<1>(m_lastIncomingData[i]));
-						}
-						else
-						{
-							ImGui::Text("");
-						}
-
-						ImGui::NextColumn();
-
-						if (i < m_lastOutgoingData.size())
-						{
-							ImGui::Text("%d. %s (%d)", i + 1, g_hashes.LookupHash(std::get<0>(m_lastOutgoingData[i])), std::get<1>(m_lastOutgoingData[i]));
-						}
-						else
-						{
-							ImGui::Text("");
-						}
-
-						ImGui::NextColumn();
-					}
-
-					ImGui::Columns(1);
-				}
+			if (ImGui::CollapsingHeader("Incoming", &showIncoming))
+			{
+				showList(m_lastIncomingMetrics, m_incomingReliable);
 			}
 
-			ImGui::End();
+			if (ImGui::CollapsingHeader("Outgoing", &showOutgoing))
+			{
+				showList(m_lastOutgoingMetrics, m_outgoingReliable);
+			}
+
+			if (ImGui::CollapsingHeader("Log", &showLog))
+			{
+				ImGui::Columns(2);
+
+				for (int i = 0; i < std::max(m_lastIncomingData.size(), m_lastOutgoingData.size()); i++)
+				{
+					if (i < m_lastIncomingData.size())
+					{
+						ImGui::Text("%d. %s (%d)", i + 1, g_hashes.LookupHash(std::get<0>(m_lastIncomingData[i])).c_str(), std::get<1>(m_lastIncomingData[i]));
+					}
+					else
+					{
+						ImGui::Text("");
+					}
+
+					ImGui::NextColumn();
+
+					if (i < m_lastOutgoingData.size())
+					{
+						ImGui::Text("%d. %s (%d)", i + 1, g_hashes.LookupHash(std::get<0>(m_lastOutgoingData[i])).c_str(), std::get<1>(m_lastOutgoingData[i]));
+					}
+					else
+					{
+						ImGui::Text("");
+					}
+
+					ImGui::NextColumn();
+				}
+
+				ImGui::Columns(1);
+			}
 		}
+		ImGui::End();
 	});
 }
 
@@ -570,12 +584,18 @@ void NetOverlayMetricSink::DrawGraph()
 		&data3
 	};
 
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+	ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+
 	ImGui::PlotMultiLines("Net Bw", NET_PACKET_SUB_MAX, names, colors, [](const void* cxt, int idx) -> float
 	{
 		auto dataContext = (DataContext*)cxt;
 
 		return dataContext->metrics[idx].GetElementSize(dataContext->index);
 	}, datas, _countof(m_metrics) - 1, FLT_MAX, FLT_MAX, ImVec2(g_netOverlayWidth, g_netOverlayHeight - 100));
+
+	ImGui::PopStyleColor();
+	ImGui::PopStyleColor();
 }
 
 ImColor NetOverlayMetricSink::GetColorIndex(int index)
@@ -602,13 +622,6 @@ ImColor NetOverlayMetricSink::GetColorIndex(int index)
 
 void NetOverlayMetricSink::DrawBaseMetrics()
 {
-	// positioning
-	int x = GetOverlayLeft();
-	int y = GetOverlayTop() + (g_netOverlayHeight - 100) + 10;
-
-	CRGBA color(255, 255, 255);
-	CRect rect(x, y, x + (g_netOverlayWidth / 2), y + 100);
-
 	// collecting
 	int ping = m_ping;
 	int inPackets = m_lastInPackets;
@@ -624,9 +637,6 @@ void NetOverlayMetricSink::DrawBaseMetrics()
 	//
 	// second column
 	//
-
-	// positioning
-	rect.SetRect(rect.fX2, rect.fY1, rect.fX2 + (g_netOverlayWidth / 2), rect.fY2);
 
 	// collecting
 	int inBytes = m_lastInBytes;

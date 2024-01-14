@@ -33,6 +33,10 @@ DECLARE_OM_PARENT(5)
 DECLARE_OM_PARENT(6)
 DECLARE_OM_PARENT(7)
 DECLARE_OM_PARENT(8)
+DECLARE_OM_PARENT(9)
+DECLARE_OM_PARENT(10)
+DECLARE_OM_PARENT(11)
+DECLARE_OM_PARENT(12)
 
 template<class TClass, class... TInterface>
 class OMClass : public OMClassParent<TInterface...>
@@ -53,11 +57,6 @@ private:
 		{
 			return m_count;
 		}
-	};
-
-	struct pass
-	{
-		template<typename ...T> pass(T...) {}
 	};
 
 	RefCount m_refCount;
@@ -90,7 +89,7 @@ public:
 	{
 		result_t result = FX_E_NOINTERFACE;
 
-		pass{ ([&]
+		([&]
 		{
 			if (result == FX_E_NOINTERFACE)
 			{
@@ -102,7 +101,7 @@ public:
 					AddRef();
 				}
 			}
-		}(), 1)... };
+		}(), ...);
 
 		if (result == FX_E_NOINTERFACE)
 		{

@@ -93,6 +93,14 @@ interface IScriptTickRuntime : fxIBase
 	void Tick();
 };
 
+[ptr] native u64Ptr(uint64_t);
+
+[uuid(195FB3BD-1A64-4EBD-A1CC-8052ED7EB0BD)]
+interface IScriptTickRuntimeWithBookmarks : fxIBase
+{
+	void TickBookmarks(in u64Ptr bookmarks, in int32_t numBookmarks);
+};
+
 [uuid(637140DB-24E5-46BF-A8BD-08F2DBAC519A)]
 interface IScriptEventRuntime : fxIBase
 {
@@ -137,6 +145,20 @@ interface IScriptMemInfoRuntime : fxIBase
 	int64_t GetMemoryUsage();
 };
 
+[uuid(d72be411-5152-4474-917c-5361ac051181)]
+interface IScriptWarningRuntime : fxIBase
+{
+	void EmitWarning(in charPtr channel, in charPtr message);
+};
+
+[uuid(782A4496-2AE3-4C70-B54A-FAD8FD8AEEFD)]
+interface IScriptProfiler : fxIBase
+{
+	void SetupFxProfiler(in voidPtr obj, in int32_t resourceId);
+
+	void ShutdownFxProfiler();
+};
+
 [uuid(08E68541-A1C9-4F51-8737-3C77F8AB5B21)]
 interface IDebugEventListener : fxIBase
 {
@@ -151,6 +173,15 @@ interface IScriptDebugRuntime : fxIBase
 	void SetScriptIdentifier(in charPtr fileName, in int32_t scriptId);
 };
 
+[uuid(2A7E092D-6CE9-4B9D-AC4F-8DA818BD0DA4)]
+interface IScriptHostWithBookmarks : fxIBase
+{
+	void ScheduleBookmark(in IScriptTickRuntimeWithBookmarks runtime, in uint64_t bookmark, in int64_t deadline);
+
+	void RemoveBookmarks(in IScriptTickRuntimeWithBookmarks runtime);
+
+	void CreateBookmarks(in IScriptTickRuntimeWithBookmarks runtime);
+};
 
 %{C++
 #include "PushEnvironment.h"

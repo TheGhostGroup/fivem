@@ -16,6 +16,7 @@
 #include <optional>
 #include <sstream>
 
+#include "ErrorFormat.Win32.h"
 #include <Hooking.Aux.h>
 
 #include <MinHook.h>
@@ -117,6 +118,7 @@ HardErrorScope* HardErrorScope::ms_curErrScope;
 Component* DllGameComponent::CreateComponent()
 {
 	HardErrorScope scope;
+	DisableToolHelpScope thScope;
 
 	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
 	HMODULE hModule = LoadLibrary(MakeRelativeCitPath(m_path).c_str());
@@ -126,7 +128,7 @@ Component* DllGameComponent::CreateComponent()
 		DWORD errorCode = GetLastError();
 
 		// delete caches.xml so the game will be verified
-		_wunlink(MakeRelativeCitPath(L"caches.xml").c_str());
+		_wunlink(MakeRelativeCitPath(L"content_index.xml").c_str());
 
 		// sanity check
 		if (m_path == L"adhesive.dll" && errorCode == ERROR_PROC_NOT_FOUND)
@@ -151,7 +153,7 @@ Component* DllGameComponent::CreateComponent()
 			addtlInfo = fmt::sprintf("\n\nAdditional information:\n%s", errors);
 		}
 
-		FatalError("Could not load component %s - Windows error code %d.%s", converter.to_bytes(m_path).c_str(), errorCode, addtlInfo);
+		FatalError("Could not load component %s - Windows error code %d. %s%s", converter.to_bytes(m_path).c_str(), errorCode, win32::FormatMessage(errorCode), addtlInfo);
 
 		return nullptr;
 	}
@@ -164,7 +166,7 @@ Component* DllGameComponent::CreateComponent()
 
 		if (m_path.find(L"scripthookv") != std::string::npos)
 		{
-			additionalInfo = " You likely overwrote scripthookv.dll from Cfx with a non-Cfx version of it. Delete caches.xml to restore from this heinous act.";
+			additionalInfo = " You likely overwrote scripthookv.dll from Cfx with a non-Cfx version of it. Delete content_index.xml to restore from this heinous act.";
 		}
 
 		FatalError("Could not find entry point CreateComponent in component %s.%s", converter.to_bytes(m_path).c_str(), additionalInfo);
@@ -193,9 +195,9 @@ void DllGameComponent::ReadManifest()
 		DWORD errorCode = GetLastError();
 
 		// delete caches.xml so the game will be verified
-		_wunlink(MakeRelativeCitPath(L"caches.xml").c_str());
+		_wunlink(MakeRelativeCitPath(L"content_index.xml").c_str());
 
-		FatalError("Could not load component manifest %s - Windows error code %d.", converter.to_bytes(m_path).c_str(), errorCode);
+		FatalError("Could not load component manifest %s - Windows error code %d. %s", converter.to_bytes(m_path).c_str(), errorCode, win32::FormatMessage(errorCode));
 
 		return;
 	}
@@ -217,13 +219,13 @@ void DllGameComponent::ReadManifest()
 	else
 	{
 		// delete caches.xml so the game will be verified
-		_wunlink(MakeRelativeCitPath(L"caches.xml").c_str());
+		_wunlink(MakeRelativeCitPath(L"content_index.xml").c_str());
 
 		const char* additionalInfo = "";
 
 		if (m_path.find(L"scripthookv") != std::string::npos)
 		{
-			additionalInfo = " You likely overwrote scripthookv.dll from FiveM with a non-FiveM version of it. Delete caches.xml to restore from this heinous act.";
+			additionalInfo = " You likely overwrote scripthookv.dll from FiveM with a non-FiveM version of it. Delete content_index.xml to restore from this heinous act.";
 		}
 		FatalError("Component manifest mismatch in component %s.%s", converter.to_bytes(m_path).c_str(), additionalInfo);
 	}

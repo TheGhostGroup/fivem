@@ -1,9 +1,10 @@
 #include <StdInc.h>
 
-#ifdef GTA_FIVE
-#define CNL_ENDPOINT "https://lambda.fivem.net"
+#if defined(GTA_FIVE) || defined(IS_RDR3)
+#include "CnlEndpoint.h"
 
 #include <LegitimacyAPI.h>
+#include <CL2LaunchMode.h>
 
 #include <json.hpp>
 
@@ -66,25 +67,30 @@ static HookFunction initFunction([]()
 			switch (opCode)
 			{
 			case 1: // FRAME
-				if (data["evt"] == "READY")
+				if (data["evt"] == "READY" && data.find("data") != data.end() && data["data"].find("user") != data["data"].end())
 				{
 					userId = data["data"]["user"]["id"].get<std::string>();
 
+					if (userId == "0")
+					{
+						break;
+					}
+
 					// check with CnL if we have access
 					Instance<::HttpClient>::Get()->DoPostRequest(
-						CNL_ENDPOINT "/api/validate/discord",
+						CNL_ENDPOINT "api/validate/discord",
 						{
 							{ "entitlementId", ros::GetEntitlementSource() },
 							{ "userId", userId }
 						},
 						[writePipe, closeConnection](bool success, const char* data, size_t length)
 					{
-						if (!success && strstr(data, "HTTP 4") != nullptr)
+						if (!success && strstr(data, "HTTP 4") != nullptr && !launch::IsSDKGuest())
 						{
 							writePipe(1 /* FRAME */, json::object({
 								{ "cmd", "AUTHORIZE" },
 								{ "args", json::object({
-									{ "scopes", json::array({"identify"}) },
+									{ "scopes", json::array({"identify", "guilds.join"}) },
 									{ "client_id", "382624125287399424" },
 									{ "redirect_url", "https://cfx.re" },
 									{ "prompt", "none" },
@@ -113,11 +119,12 @@ static HookFunction initFunction([]()
 						if (!code.empty())
 						{
 							Instance<::HttpClient>::Get()->DoPostRequest(
-								CNL_ENDPOINT "/api/validate/discord",
+								CNL_ENDPOINT "api/validate/discord",
 								{
 									{ "entitlementId", ros::GetEntitlementSource() },
 									{ "authCode", code },
-									{ "userId", userId }
+									{ "userId", userId },
+									{ "v", "2" },
 								},
 								[](bool, const char*, size_t)
 							{

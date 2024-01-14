@@ -13,6 +13,8 @@
 #include <array>
 #include <filesystem>
 
+constexpr const size_t kFileSendSize = 128 * 1024;
+
 namespace fx
 {
 	struct Request
@@ -62,7 +64,7 @@ namespace fx
 	{
 		auto clientRegistry = instance->GetComponent<fx::ClientRegistry>();
 
-		auto sendFile = [=](const fwRefContainer<net::HttpRequest>& request, const fwRefContainer<net::HttpResponse>& response, const std::string& resourceName, const std::string& fileName, const fx::ClientSharedPtr& client)
+		auto sendFile = [=](const fwRefContainer<net::HttpRequest>& request, fwRefContainer<net::HttpResponse> response, const std::string& resourceName, const std::string& fileName, const fx::ClientSharedPtr& client)
 		{
 			// get resource manager and resource
 			auto resourceManager = instance->GetComponent<fx::ResourceManager>();
@@ -104,6 +106,17 @@ namespace fx
 				{
 					fn = sit->second.onDiskPath;
 				}
+			}
+
+			auto filter = filesComponent->CreateFilesFilter(fileName, request);
+
+			std::string reason;
+
+			if (filter && filter->ShouldTerminate(&reason))
+			{
+				response->SetStatusCode(403);
+				response->End(fmt::sprintf("Filter failed: %s.", reason));
+				return;
 			}
 
 			// get the TCP manager for a libuv loop
@@ -157,17 +170,6 @@ namespace fx
 
 					auto file = std::make_shared<UvFileHandle>(uvLoop, req->result);
 
-					auto filter = filesComponent->CreateFilesFilter(fileName, request);
-
-					std::string reason;
-
-					if (filter && filter->ShouldTerminate(&reason))
-					{
-						response->SetStatusCode(403);
-						response->End(fmt::sprintf("Filter failed: %s.", reason));
-						return;
-					}
-
 					// write header information and a 200 OK
 					response->SetHeader("content-length", std::to_string(size));
 					response->SetHeader("transfer-encoding", "identity");
@@ -176,17 +178,17 @@ namespace fx
 
 					// read buffer and file handle
 					auto buffer = std::make_shared<std::unique_ptr<char[]>>();
-					*buffer = std::unique_ptr<char[]>(new char[16384]);
+					*buffer = std::unique_ptr<char[]>(new char[kFileSendSize]);
 
 					auto uvBufRef = std::make_shared<uv_buf_t>();
-					*uvBufRef = uv_buf_init(buffer->get(), 16384);
+					*uvBufRef = uv_buf_init(buffer->get(), kFileSendSize);
 
 					// mutable read offset pointer
 					auto readOffset = std::make_shared<size_t>(0);
 
 					// to keep a reference to readCallback inside of itself
 					auto readCallback = std::make_shared<std::function<void(uv_fs_t*)>>();
-					*readCallback = [=](uv_fs_t* fsReq) mutable
+					*readCallback = [=](uv_fs_t* fsReq)
 					{
 						// read failed? report back
 						if (fsReq->result < 0)
@@ -210,7 +212,7 @@ namespace fx
 						}
 
 						// write to response
-						response->Write(std::move(*buffer), fsReq->result, [=](bool result) mutable
+						response->Write(std::move(*buffer), fsReq->result, [=](bool result)
 						{
 							if (!*readCallback)
 							{
@@ -241,8 +243,8 @@ namespace fx
 							// if not, call another read
 							if (*readOffset != size)
 							{
-								*buffer = std::unique_ptr<char[]>(new char[16384]);
-								*uvBufRef = uv_buf_init(buffer->get(), 16384);
+								*buffer = std::unique_ptr<char[]>(new char[kFileSendSize]);
+								*uvBufRef = uv_buf_init(buffer->get(), kFileSendSize);
 
 								uv_fs_read(uvLoop, req.get(), file->get(), uvBufRef.get(), 1, *readOffset, UvCallbackWrap<uv_fs_t>(req.get(), *readCallback));
 							}
@@ -258,7 +260,7 @@ namespace fx
 					};
 
 					// on-close handler
-					request->SetCancelHandler([=]() mutable
+					request->SetCancelHandler([=]()
 					{
 						// if so, end response (closing should be done automatically)
 						response->End();
@@ -273,7 +275,7 @@ namespace fx
 			}));
 		};
 
-		return [=](const fwRefContainer<net::HttpRequest>& request, const fwRefContainer<net::HttpResponse>& response)
+		return [=](const fwRefContainer<net::HttpRequest>& request, fwRefContainer<net::HttpResponse> response)
 		{
 			if (request->GetRequestMethod() != "GET")
 			{

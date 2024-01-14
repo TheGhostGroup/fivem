@@ -157,8 +157,40 @@ namespace fx
 	public:
 		static boost::optional<TNativeHandler> GetNativeHandler(uint64_t nativeIdentifier);
 
+		// 
+		// fx::ScriptEngine uses an std::unordered_map under the hood, therefore we can safely use a ptr to its elements:
+		// http://eel.is/c++draft/unord.req#9: Rehashing invalidates iterators, changes ordering between elements, and changes which buckets elements appear in,
+		// but does not invalidate pointers or references to elements.
+		//
+		static TNativeHandler* GetNativeHandlerPtr(uint64_t nativeIdentifier);
+
 		static void RegisterNativeHandler(uint64_t nativeIdentifier, TNativeHandler function);
 
 		static void RegisterNativeHandler(const std::string& nativeName, TNativeHandler function);
 	};
 }
+
+// common helper
+class FxNativeInvoke
+{
+private:
+	static inline void Invoke(fx::ScriptContext& cxt, const boost::optional<fx::TNativeHandler>& handler)
+	{
+		(*handler)(cxt);
+	}
+
+public:
+	template<typename R, typename... Args>
+	static inline R Invoke(const boost::optional<fx::TNativeHandler>& handler, Args... args)
+	{
+		fx::ScriptContextBuffer cxt;
+		(cxt.Push(args), ...);
+
+		Invoke(cxt, handler);
+
+		if constexpr (!std::is_void_v<R>)
+		{
+			return cxt.GetResult<R>();
+		}
+	}
+};

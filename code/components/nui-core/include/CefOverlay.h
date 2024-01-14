@@ -9,11 +9,9 @@
 
 //#define USE_NUI_ROOTLESS
 
-#ifdef COMPILING_NUI_CORE
-#define OVERLAY_DECL __declspec(dllexport)
-#else
-#define OVERLAY_DECL __declspec(dllimport)
-#endif
+#include "ComponentExport.h"
+
+#define OVERLAY_DECL COMPONENT_EXPORT(NUI_CORE)
 
 #if defined(COMPILING_NUI_CORE) || defined(COMPILING_NUI_RESOURCES) || defined(COMPILING_GLUE)
 #define WANT_CEF_INTERNALS
@@ -101,6 +99,11 @@ namespace nui
 		virtual bool Map(int numSubLevels, int subLevel, GILockedTexture* lockedTexture, GILockFlags flags) = 0;
 
 		virtual void Unmap(GILockedTexture* lockedTexture) = 0;
+
+		virtual void WithHostTexture(std::function<void(void*)>&& callback)
+		{
+			callback(GetHostTexture());
+		}
 	};
 
 	enum class GITextureFormat
@@ -113,6 +116,38 @@ namespace nui
 		CRect rectangle;
 		CRGBA color;
 	};
+
+	///
+	// Represents the state of a setting.
+	///
+	/*--cef()--*/
+	typedef enum
+	{
+		///
+		// No permission
+		///
+		NUI_MEDIA_PERMISSION_NONE = 0,
+
+		///
+		// Audio capture permission
+		///
+		NUI_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE = 1 << 0,
+
+		///
+		// Video capture permission
+		///
+		NUI_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE = 1 << 1,
+
+		///
+		// Desktop audio capture permission
+		///
+		NUI_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE = 1 << 2,
+
+		///
+		// Desktop video capture permission
+		///
+		NUI_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE = 1 << 3,
+	} media_access_permission_types_t;
 
 	class OVERLAY_DECL GameInterface
 	{
@@ -148,6 +183,24 @@ namespace nui
 
 		virtual fwRefContainer<GITexture> CreateTextureFromD3D11Texture(ID3D11Texture2D* texture) = 0;
 
+		virtual bool RequestMediaAccess(const std::string& frameOrigin, const std::string& url, int permissions, const std::function<void(bool /* success */, int /* allowed mask */)>& onComplete)
+		{
+			return false;
+		}
+
+		virtual void SetHostCursorEnabled(bool enabled)
+		{
+		}
+
+		virtual void SetHostCursor(HCURSOR cursor)
+		{
+		}
+
+		virtual bool CanDrawHostCursor()
+		{
+			return false;
+		}
+
 		fwEvent<HWND, UINT, WPARAM, LPARAM, bool&, LRESULT&> OnWndProc;
 
 		fwEvent<std::vector<InputTarget*>&> QueryInputTarget;
@@ -159,6 +212,8 @@ namespace nui
 		fwEvent<> OnInitRenderer;
 
 		fwEvent<> OnRender;
+		
+		fwEvent<bool&> QueryShouldMute;
 	};
 
 	void OVERLAY_DECL Initialize(nui::GameInterface* gi);
@@ -299,16 +354,17 @@ namespace nui
 	//void EnterV8Context(const char* type);
 	//void LeaveV8Context(const char* type);
 	//void InvokeNUICallback(const char* type, const CefString& name, const CefV8ValueList& arguments);
-#ifndef USE_NUI_ROOTLESS
 	void OVERLAY_DECL ReloadNUI();
-#endif
 
-	void OVERLAY_DECL CreateFrame(fwString frameName, fwString frameURL);
-	void OVERLAY_DECL PrepareFrame(fwString frameName, fwString frameURL);
-	void OVERLAY_DECL DestroyFrame(fwString frameName);
+	void OVERLAY_DECL CreateFrame(const std::string& frameName, const std::string& frameURL);
+	void OVERLAY_DECL PrepareFrame(const std::string& frameName, const std::string& frameURL);
+	void OVERLAY_DECL DestroyFrame(const std::string& frameName);
 	bool OVERLAY_DECL HasFrame(const std::string& frameName);
 	void OVERLAY_DECL SignalPoll(fwString frameName);
 
+	bool OVERLAY_DECL HasCursor();
+	bool OVERLAY_DECL HasFocus();
+	bool OVERLAY_DECL HasFocusKeepInput();
 	void OVERLAY_DECL GiveFocus(const std::string& frameName, bool hasFocus, bool hasCursor = false);
 	void OVERLAY_DECL OverrideFocus(bool hasFocus);
 	void OVERLAY_DECL KeepInput(bool keepInput);
@@ -318,20 +374,16 @@ namespace nui
 
 	void ProcessInput();
 
-#ifndef USE_NUI_ROOTLESS
 	void OVERLAY_DECL ExecuteRootScript(const std::string& scriptBit);
-#endif
 
 	void OVERLAY_DECL PostFrameMessage(const std::string& frameName, const std::string& jsonData);
 
-#ifndef USE_NUI_ROOTLESS
 	void OVERLAY_DECL PostRootMessage(const std::string& jsonData);
-#endif
 
 #ifdef WANT_CEF_INTERNALS
-#ifndef USE_NUI_ROOTLESS
 	OVERLAY_DECL CefBrowser* GetBrowser();
-#endif
+
+	OVERLAY_DECL fwRefContainer<NUIWindow> GetWindow();
 
 	OVERLAY_DECL CefBrowser* GetFocusBrowser();
 
@@ -344,7 +396,13 @@ namespace nui
 	OVERLAY_DECL void ExecuteWindowScript(const std::string& windowName, const std::string& scriptBit);
 	OVERLAY_DECL void SetNUIWindowURL(fwString windowName, fwString url);
 
+	OVERLAY_DECL void SwitchContext(const std::string& contextId);
+
 #ifdef WANT_CEF_INTERNALS
+	OVERLAY_DECL void RegisterSchemeHandlerFactory(const CefString& scheme_name,
+	const CefString& domain_name,
+	CefRefPtr<CefSchemeHandlerFactory> factory);
+
 	OVERLAY_DECL fwRefContainer<GITexture> GetWindowTexture(fwString windowName);
 #endif
 
@@ -356,9 +414,15 @@ namespace nui
 		OVERLAY_DECL
 		fwEvent<bool> OnDrawBackground;
 
+	extern OVERLAY_DECL
+		fwEvent<std::function<void(bool, const char*, size_t)>>
+		RequestNUIBlocklist;
+
+	extern OVERLAY_DECL fwEvent<> OnInitialize;
+
 	OVERLAY_DECL void SetAudioSink(IAudioSink* sinkRef);
 
-	using TResourceLookupFn = std::function<std::string(const std::string&)>;
+	using TResourceLookupFn = std::function<std::string(const std::string&, const std::string&)>;
 
 	OVERLAY_DECL void SetResourceLookupFunction(const TResourceLookupFn& fn);
 }

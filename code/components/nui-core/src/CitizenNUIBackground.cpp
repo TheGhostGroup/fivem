@@ -37,13 +37,12 @@ struct DWMP_GET_COLORIZATION_PARAMETERS_DATA
 	uint32_t ColorizationOpaqueBlend;
 };
 
+static ComPtr<IWICImagingFactory> g_imagingFactory;
+
 class CitizenNUIBackground
 {
 private:
 	fwRefContainer<nui::GITexture> m_backdropTexture;
-	fwRefContainer<nui::GITexture> m_overlayTexture;
-
-	ComPtr<IWICImagingFactory> m_imagingFactory;
 
 	typedef void (WINAPI* DwmpGetColorizationParameters_t)(DWMP_GET_COLORIZATION_PARAMETERS_DATA*);
 
@@ -207,7 +206,7 @@ void CitizenNUIBackground::Initialize()
 	// COM stuff
 	CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
-	HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory1, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory), (void**)m_imagingFactory.GetAddressOf());
+	HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory1, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory), (void**)g_imagingFactory.GetAddressOf());
 
 	if (FAILED(hr))
 	{
@@ -220,9 +219,7 @@ void CitizenNUIBackground::Initialize()
 
 		if (isMainUI)
 		{
-#ifndef GTA_FIVE
 			DrawBackground(m_backdropTexture, CRGBA(255, 255, 255, 255), true);
-#endif
 		}
 	});
 }
@@ -273,17 +270,12 @@ void CitizenNUIBackground::EnsureTextures()
 {
 	if (!m_backdropTexture.GetRef())
 	{
-		m_backdropTexture = InitializeTextureFromFile("citizen:/ui/app/bg-night.bb1065920b7124650a88.jpg");
+		m_backdropTexture = InitializeTextureFromFile("citizen:/ui/app/static/media/32000f5a0b55eccb6d79bg2.jpg");
 
 		if (!m_backdropTexture.GetRef())
 		{
 			m_backdropTexture = InitializeTextureFromFile("citizen:/resources/background_main.jpg");
 		}
-	}
-
-	if (!m_overlayTexture.GetRef())
-	{
-		m_overlayTexture = InitializeTextureFromFile("citizen:/resources/base_color.png");
 	}
 
 	if (!g_cursorTexture.GetRef())
@@ -292,7 +284,7 @@ void CitizenNUIBackground::EnsureTextures()
 	}
 }
 
-fwRefContainer<nui::GITexture> CitizenNUIBackground::InitializeTextureFromFile(const std::string& filename)
+static std::vector<uint32_t> LoadFileBitmap(const std::string& filename, int* outWidth, int* outHeight, float dpiScale = 1.0f)
 {
 	ComPtr<IWICBitmapDecoder> decoder;
 	std::vector<uint8_t> v;
@@ -302,33 +294,64 @@ fwRefContainer<nui::GITexture> CitizenNUIBackground::InitializeTextureFromFile(c
 
 		if (!s.GetRef())
 		{
-			return nullptr;
+			return {};
 		}
 
 		v = s->ReadToEnd();
 	}
 
 	auto stream = vfs::CreateComStream(vfs::OpenRead(fmt::sprintf("memory:$%016llx,%d,0:%s", (uintptr_t)v.data(), v.size(), filename)));
-	HRESULT hr = m_imagingFactory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, decoder.GetAddressOf());
+	HRESULT hr = g_imagingFactory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, decoder.GetAddressOf());
 
 	if (SUCCEEDED(hr))
 	{
 		ComPtr<IWICBitmapFrameDecode> frame;
-		
+
 		hr = decoder->GetFrame(0, frame.GetAddressOf());
 
 		if (SUCCEEDED(hr))
 		{
-			ComPtr<IWICBitmapSource> source;
-			ComPtr<IWICBitmapSource> convertedSource;
-
 			UINT width = 0, height = 0;
+			ComPtr<IWICBitmapSource> source;
 
 			frame->GetSize(&width, &height);
-
-			// try to convert to a pixel format we like
 			frame.As(&source);
 
+			if (dpiScale > 1.0f)
+			{
+				ComPtr<IWICBitmapScaler> scaler;
+				if (SUCCEEDED(g_imagingFactory->CreateBitmapScaler(&scaler)))
+				{
+					auto targetWidth = static_cast<UINT>(width * dpiScale);
+					auto targetHeight = static_cast<UINT>(height * dpiScale);
+
+					if (SUCCEEDED(scaler->Initialize(
+						frame.Get(),
+						targetWidth,
+						targetHeight,
+						WICBitmapInterpolationModeFant)))
+					{
+						width = targetWidth;
+						height = targetHeight;
+
+						scaler.As(&source);
+					}
+				}
+			}
+
+			ComPtr<IWICBitmapSource> convertedSource;
+
+			if (outWidth)
+			{
+				*outWidth = width;
+			}
+
+			if (outHeight)
+			{
+				*outHeight = height;
+			}
+
+			// try to convert to a pixel format we like
 			hr = WICConvertBitmapSource(GUID_WICPixelFormat32bppBGRA, source.Get(), convertedSource.GetAddressOf());
 
 			if (SUCCEEDED(hr))
@@ -337,23 +360,125 @@ fwRefContainer<nui::GITexture> CitizenNUIBackground::InitializeTextureFromFile(c
 			}
 
 			// create a pixel data buffer
-			std::vector<uint32_t> pixelData(width * height);
+			std::vector<uint32_t> pixelData(static_cast<std::vector<uint32_t>::size_type>(width) * height);
 
 			hr = source->CopyPixels(nullptr, width * 4, width * height * 4, reinterpret_cast<BYTE*>(pixelData.data()));
 
 			if (SUCCEEDED(hr))
 			{
-				return g_nuiGi->CreateTexture(width, height, nui::GITextureFormat::ARGB, pixelData.data());
+				return pixelData;
 			}
 		}
+	}
+
+	return {};
+}
+
+fwRefContainer<nui::GITexture> CitizenNUIBackground::InitializeTextureFromFile(const std::string& filename)
+{
+	int width = 0;
+	int height = 0;
+	auto pixelData = LoadFileBitmap(filename, &width, &height);
+
+	if (!pixelData.empty())
+	{
+		return g_nuiGi->CreateTexture(width, height, nui::GITextureFormat::ARGB, pixelData.data());
 	}
 
 	return nullptr;
 }
 
-static CitizenNUIBackground g_nuiBackground;
+// adapted from 'dear imgui' impl_win32
+#include <shellscalingapi.h>
+
+static float GetDpiScaleForMonitor(void* monitor)
+{
+	UINT xdpi = 96, ydpi = 96;
+	static HINSTANCE shcore = LoadLibraryW(L"shcore.dll");
+	if (shcore)
+	{
+		static auto _GetDpiForMonitor = (decltype(&GetDpiForMonitor))GetProcAddress(shcore, "GetDpiForMonitor");
+		if (_GetDpiForMonitor)
+		{
+			_GetDpiForMonitor((HMONITOR)monitor, MDT_EFFECTIVE_DPI, &xdpi, &ydpi);
+			return xdpi / 96.0f;
+		}
+	}
+
+	return 1.0f;
+}
+
+static float GetDpiScaleForHwnd(void* hwnd)
+{
+	HMONITOR monitor = ::MonitorFromWindow((HWND)hwnd, MONITOR_DEFAULTTONEAREST);
+	return GetDpiScaleForMonitor(monitor);
+}
+
+HCURSOR InitDefaultCursor()
+{
+	auto hWnd = g_nuiGi->GetHWND();
+	auto dpiScale = GetDpiScaleForHwnd(hWnd);
+
+	int width = 0;
+	int height = 0;
+	auto pixelData = LoadFileBitmap("citizen:/resources/citizen_cursor.png", &width, &height, dpiScale);
+
+	if (!pixelData.empty())
+	{
+		BITMAPINFO bitmapInfo = { 0 };
+		bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+		bitmapInfo.bmiHeader.biWidth = width;
+		bitmapInfo.bmiHeader.biHeight = -height;
+		bitmapInfo.bmiHeader.biPlanes = 1;
+		bitmapInfo.bmiHeader.biBitCount = 32;
+		bitmapInfo.bmiHeader.biCompression = BI_RGB;
+		bitmapInfo.bmiHeader.biSizeImage = 0;
+		bitmapInfo.bmiHeader.biXPelsPerMeter = 1;
+		bitmapInfo.bmiHeader.biYPelsPerMeter = 1;
+		bitmapInfo.bmiHeader.biClrUsed = 0;
+		bitmapInfo.bmiHeader.biClrImportant = 0;
+
+		HDC workingDC;
+		HBITMAP bitmap;
+
+		{
+			auto dc = GetDC(hWnd);
+			workingDC = CreateCompatibleDC(dc);
+			bitmap = CreateDIBSection(dc, &bitmapInfo, DIB_RGB_COLORS, 0, 0, 0);
+
+			ReleaseDC(hWnd, dc);
+		}
+
+		SetDIBits(0, bitmap, 0, height, pixelData.data(), &bitmapInfo, DIB_RGB_COLORS);
+
+		// mask
+		HBITMAP oldBitmap = HBITMAP(SelectObject(workingDC, bitmap));
+		SetBkMode(workingDC, TRANSPARENT);
+		SelectObject(workingDC, oldBitmap);
+
+		HBITMAP mask = CreateBitmap(width, height, 1, 1, NULL);
+		ICONINFO ii = { 0 };
+		ii.fIcon = FALSE;
+		ii.xHotspot = 0;
+		ii.yHotspot = 0;
+		ii.hbmMask = mask;
+		ii.hbmColor = bitmap;
+
+		HICON icon = CreateIconIndirect(&ii);
+
+		DeleteDC(workingDC);
+		DeleteObject(mask);
+		DeleteObject(bitmap);
+
+		return icon;
+	}
+
+	return NULL;
+}
+
+static CitizenNUIBackground* g_nuiBackground = new CitizenNUIBackground();
 
 static HookFunction initFunction([] ()
 {
-	g_nuiBackground.Initialize();
+	g_nuiBackground->Initialize();
 });

@@ -64,7 +64,7 @@ struct VoiceTargetConfig
 		}
 	};
 
-	std::vector<Target> targets;
+	std::list<Target> targets;
 };
 
 class IMumbleClient : public fwRefCountable
@@ -95,13 +95,17 @@ public:
 
 	virtual std::wstring GetPlayerNameFromServerId(uint32_t serverId) = 0;
 
-	virtual uint32_t GetVoiceChannelFromServerId(uint32_t serverId) = 0;
+	virtual std::string GetVoiceChannelFromServerId(uint32_t serverId) = 0;
 
 	virtual void GetTalkers(std::vector<std::string>* names) = 0;
 
 	virtual void SetPositionHook(const TPositionHook& hook) = 0;
 
 	virtual void SetAudioDistance(float distance) = 0;
+
+	virtual void SetAudioInputDistance(float distance) = 0;
+
+	virtual void SetAudioOutputDistance(float distance) = 0;
 
 	virtual float GetAudioDistance() = 0;
 

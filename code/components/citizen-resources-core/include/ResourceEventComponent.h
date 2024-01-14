@@ -10,6 +10,7 @@
 #include <ComponentHolder.h>
 
 #include <tbb/concurrent_queue.h>
+#include <tbb/concurrent_unordered_map.h>
 
 #include <mutex>
 #include <queue>
@@ -33,20 +34,9 @@ class ResourceEventManagerComponent;
 class RESOURCES_CORE_EXPORT ResourceEventComponent : public fwRefCountable, public IAttached<Resource>
 {
 private:
-	Resource* m_resource;
+	Resource* m_resource = nullptr;
 
-	ResourceEventManagerComponent* m_managerComponent;
-
-private:
-	struct EventData
-	{
-		std::string eventName;
-		std::string eventSource;
-		std::string eventPayload;
-	};
-
-private:
-	tbb::concurrent_queue<EventData> m_eventQueue;
+	ResourceEventManagerComponent* m_managerComponent = nullptr;
 
 public:
 	ResourceEventComponent();
@@ -60,12 +50,6 @@ public:
 
 	void QueueEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource = std::string());
 
-private:
-	struct pass
-	{
-		template<typename ...T> pass(T...) {}
-	};
-
 public:
 	//
 	// Enqueues a formatted event on the resource.
@@ -78,7 +62,7 @@ public:
 
 		// pack the argument pack as array
 		packer.pack_array(sizeof...(args));
-		pass{ (packer.pack(args), 0)... };
+		(packer.pack(args), ...);
 
 		QueueEvent(std::string(eventName), std::string(buf.data(), buf.size()), std::string(targetSrc.value_or("")));
 	}
@@ -103,12 +87,15 @@ private:
 		std::string eventName;
 		std::string eventSource;
 		std::string eventPayload;
+		ResourceEventComponent* filter = nullptr;
 	};
 
 private:
 	ResourceManager* m_manager;
 
 	tbb::concurrent_queue<EventData> m_eventQueue;
+
+	tbb::concurrent_unordered_multimap<std::string, std::string> m_eventResources;
 
 private:
 	void Tick();
@@ -127,6 +114,11 @@ public:
 	void CancelEvent();
 
 	//
+	// Registers a resource as subscribing to a particular event.
+	//
+	void AddResourceHandledEvent(const std::string& resourceName, const std::string& eventName);
+
+	//
 	// An event to handle event execution externally.
 	// Arguments: eventName, eventPayload, eventSource, eventCanceled
 	//
@@ -141,18 +133,12 @@ public:
 	//
 	// Triggers an event immediately. Returns a value indicating whether the event was not canceled.
 	//
-	bool TriggerEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource = std::string());
+	bool TriggerEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource = std::string(), ResourceEventComponent* filter = nullptr);
 
 	//
 	// Enqueues an event for execution on the next resource manager tick.
 	//
-	void QueueEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource = std::string());
-
-private:
-	struct pass
-	{
-		template<typename ...T> pass(T...) {}
-	};
+	void QueueEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource = std::string(), ResourceEventComponent* filter = nullptr);
 
 public:
 	//
@@ -166,7 +152,7 @@ public:
 
 		// pack the argument pack as array
 		packer.pack_array(sizeof...(args));
-		pass{ (packer.pack(args), 0)... };
+		(packer.pack(args), ...);
 
 		return TriggerEvent(std::string(eventName), std::string(buf.data(), buf.size()), std::string(targetSrc.value_or("")));
 	}
@@ -182,7 +168,7 @@ public:
 
 		// pack the argument pack as array
 		packer.pack_array(sizeof...(args));
-		pass{ (packer.pack(args), 0)... };
+		(packer.pack(args), ...);
 
 		QueueEvent(std::string(eventName), std::string(buf.data(), buf.size()), std::string(targetSrc.value_or("")));
 	}

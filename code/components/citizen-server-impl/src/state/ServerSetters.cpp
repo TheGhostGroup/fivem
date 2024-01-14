@@ -1,6 +1,7 @@
 #include "StdInc.h"
-#include <state/SyncTrees_Five.h>
+#include <state/SyncTrees.h>
 
+#ifndef STATE_RDR3
 #include <state/ServerGameState.h>
 #include <ScriptEngine.h>
 
@@ -9,13 +10,18 @@
 #include <Resource.h>
 #include <fxScripting.h>
 
+#include <boost/mpl/at.hpp>
+#include <boost/function_types/parameter_types.hpp>
+
 namespace fx
 {
+#pragma region helpers
 template<typename TNode, typename TWrapper>
 void UnparseTo(TNode& node, TWrapper wrapper)
 {
 	rl::MessageBuffer mb(wrapper->data.size());
-	node.Unparse(mb);
+	sync::SyncUnparseState state{ mb };
+	node.Unparse(state);
 
 	memcpy(wrapper->data.data(), mb.GetBuffer().data(), mb.GetBuffer().size());
 
@@ -23,38 +29,25 @@ void UnparseTo(TNode& node, TWrapper wrapper)
 	wrapper->node = node;
 }
 
-std::shared_ptr<sync::SyncTreeBase> MakeAutomobile(uint32_t model, float posX, float posY, float posZ, uint32_t resourceHash)
+template<typename TTree, typename TFn>
+void SetupNode(const std::shared_ptr<TTree>& tree, TFn fn)
 {
-	auto tree = std::make_shared<sync::CAutomobileSyncTree>();
-	
-	{
-		auto n = tree->GetNode<sync::CVehicleCreationDataNode>();
-		auto& cdn = n->node;
-		cdn.m_model = model;
-		cdn.m_creationToken = msec().count();
-		cdn.m_needsToBeHotwired = false;
-		cdn.m_maxHealth = 1000;
-		cdn.m_popType = sync::POPTYPE_MISSION;
-		cdn.m_randomSeed = rand();
-		cdn.m_tyresDontBurst = false;
-		cdn.m_vehicleStatus = 0;
-		cdn.m_unk5 = false;
-		UnparseTo(cdn, n);
+	using TArgs = typename boost::function_types::parameter_types<decltype(&TFn::operator())>::type;
+	using TArg = typename boost::mpl::at_c<TArgs, 1>::type;
+	using TNode = std::remove_reference_t<TArg>;
 
-		n->frameIndex = 12;
-		n->timestamp = msec().count();
-	}
+	auto n = tree->template GetNode<TNode>();
+	fn(n->node);
 
-	{
-		auto n = tree->GetNode<sync::CAutomobileCreationDataNode>();
-		auto& cdn = n->node;
-		cdn.allDoorsClosed = true;
-		UnparseTo(cdn, n);
+	UnparseTo(n->node, n);
 
-		n->frameIndex = 12;
-		n->timestamp = msec().count();
-	}
+	n->frameIndex = 12;
+	n->timestamp = msec().count();
+}
 
+template<typename TSectorNode, typename TPositionNode, typename TTree>
+void SetupPosition(const std::shared_ptr<TTree>& tree, float posX, float posY, float posZ)
+{
 	int sectorX = int((posX / 54.0f) + 512.0f);
 	int sectorY = int((posY / 54.0f) + 512.0f);
 	int sectorZ = int((posZ + 1700.0f) / 69.0f);
@@ -63,40 +56,180 @@ std::shared_ptr<sync::SyncTreeBase> MakeAutomobile(uint32_t model, float posX, f
 	float sectorPosY = posY - ((sectorY - 512.0f) * 54.0f);
 	float sectorPosZ = posZ - ((sectorZ * 69.0f) - 1700.0f);
 
+	SetupNode(tree, [sectorX, sectorY, sectorZ](TSectorNode& cdn)
 	{
-		auto n = tree->GetNode<sync::CSectorDataNode>();
-		auto& cdn = n->node;
 		cdn.m_sectorX = sectorX;
 		cdn.m_sectorY = sectorY;
 		cdn.m_sectorZ = sectorZ;
-		UnparseTo(cdn, n);
+	});
 
-		n->frameIndex = 12;
-		n->timestamp = msec().count();
-	}
-
+	SetupNode(tree, [sectorPosX, sectorPosY, sectorPosZ](TPositionNode& cdn)
 	{
-		auto n = tree->GetNode<sync::CSectorPositionDataNode>();
-		auto& cdn = n->node;
 		cdn.m_posX = sectorPosX;
 		cdn.m_posY = sectorPosY;
 		cdn.m_posZ = sectorPosZ;
-		UnparseTo(cdn, n);
+	});
+}
 
-		n->frameIndex = 12;
-		n->timestamp = msec().count();
-	}
-
+template<typename TTree>
+void SetupHeading(const std::shared_ptr<TTree>& tree, float heading)
+{
+	SetupNode(tree, [heading](sync::CEntityOrientationDataNode& node)
 	{
-		auto n = tree->GetNode<sync::CEntityScriptInfoDataNode>();
-		auto& cdn = n->node;
+		glm::quat q = glm::quat(glm::vec3(0.0f, 0.0f, heading * 0.01745329252f));
+		node.data.quat.Load(q.x, q.y, q.z, q.w);
+	});
+}
+#pragma endregion
+
+std::shared_ptr<sync::SyncTreeBase> MakeAutomobile(uint32_t model, float posX, float posY, float posZ, uint32_t resourceHash, float heading = 0.0f)
+{
+	auto tree = std::make_shared<sync::CAutomobileSyncTree>();
+	
+	SetupNode(tree, [model](sync::CVehicleCreationDataNode& cdn)
+	{
+		cdn.m_model = model;
+		cdn.m_creationToken = msec().count();
+		cdn.m_needsToBeHotwired = false;
+		cdn.m_maxHealth = 1000;
+		cdn.m_popType = sync::POPTYPE_MISSION;
+		cdn.m_randomSeed = rand();
+		cdn.m_tyresDontBurst = false;
+		cdn.m_vehicleStatus = 2;
+		cdn.m_unk5 = false;
+	});
+
+	SetupNode(tree, [](sync::CAutomobileCreationDataNode& cdn)
+	{
+		cdn.allDoorsClosed = true;
+	});
+
+	SetupPosition<sync::CSectorDataNode, sync::CSectorPositionDataNode>(tree, posX, posY, posZ);
+	SetupHeading(tree, heading);
+
+	SetupNode(tree, [resourceHash](sync::CEntityScriptInfoDataNode& cdn)
+	{
 		cdn.m_scriptHash = resourceHash;
 		cdn.m_timestamp = msec().count();
-		UnparseTo(cdn, n);
+	});
 
-		n->frameIndex = 12;
-		n->timestamp = msec().count();
+	return tree;
+}
+
+template<typename TTree>
+std::shared_ptr<sync::SyncTreeBase> MakeVehicle(uint32_t model, float posX, float posY, float posZ, uint32_t resourceHash, float heading = 0.0f)
+{
+	auto tree = std::make_shared<TTree>();
+
+	SetupNode(tree, [model](sync::CVehicleCreationDataNode& cdn)
+	{
+		cdn.m_model = model;
+		cdn.m_creationToken = msec().count();
+		cdn.m_needsToBeHotwired = false;
+		cdn.m_maxHealth = 1000;
+		cdn.m_popType = sync::POPTYPE_MISSION;
+		cdn.m_randomSeed = rand();
+		cdn.m_tyresDontBurst = false;
+		cdn.m_vehicleStatus = 2;
+		cdn.m_unk5 = false;
+	});
+
+	if constexpr (std::is_same_v<TTree, sync::CAutomobileSyncTree> ||
+		std::is_same_v<TTree, sync::CTrailerSyncTree> ||
+		std::is_same_v<TTree, sync::CHeliSyncTree>)
+	{
+		SetupNode(tree, [](sync::CAutomobileCreationDataNode& cdn)
+		{
+			cdn.allDoorsClosed = true;
+		});
 	}
+
+	SetupPosition<sync::CSectorDataNode, sync::CSectorPositionDataNode>(tree, posX, posY, posZ);
+	SetupHeading(tree, heading);
+
+	SetupNode(tree, [resourceHash](sync::CEntityScriptInfoDataNode& cdn)
+	{
+		cdn.m_scriptHash = resourceHash;
+		cdn.m_timestamp = msec().count();
+	});
+
+	return tree;
+}
+
+std::shared_ptr<sync::SyncTreeBase> MakePed(uint32_t model, float posX, float posY, float posZ, uint32_t resourceHash, float heading = 0.0f)
+{
+	auto tree = std::make_shared<sync::CPedSyncTree>();
+
+	SetupNode(tree, [model](sync::CPedCreationDataNode& cdn)
+	{
+		cdn.m_model = model;
+		cdn.isRespawnObjectId = false;
+		cdn.respawnFlaggedForRemoval = false;
+		cdn.m_popType = sync::POPTYPE_MISSION;
+		cdn.randomSeed = rand();
+		cdn.vehicleId = 0;
+		cdn.vehicleSeat = 0;
+		cdn.prop = 0;
+		cdn.voiceHash = HashString("NO_VOICE");
+		cdn.isStanding = true;
+		cdn.attributeDamageToPlayer = -1;
+		cdn.maxHealth = 200;
+		cdn.unkBool = false;
+	});
+
+	SetupNode(tree, [resourceHash](sync::CPedSectorPosMapNode& cdn)
+	{
+		cdn.isStandingOn = false;
+		cdn.isNM = false;
+	});
+
+	SetupPosition<sync::CSectorDataNode, sync::CPedSectorPosMapNode>(tree, posX, posY, posZ);
+
+	SetupNode(tree, [heading](sync::CPedOrientationDataNode& node)
+	{
+		node.data.currentHeading = heading * 0.01745329252f;
+		node.data.desiredHeading = heading * 0.01745329252f;
+	});
+
+	SetupNode(tree, [resourceHash](sync::CEntityScriptInfoDataNode& cdn)
+	{
+		cdn.m_scriptHash = resourceHash;
+		cdn.m_timestamp = msec().count();
+	});
+
+	return tree;
+}
+
+std::shared_ptr<sync::SyncTreeBase> MakeObject(uint32_t model, float posX, float posY, float posZ, uint32_t resourceHash, bool dynamic, float heading = 0.0f)
+{
+	auto tree = std::make_shared<sync::CObjectSyncTree>();
+
+	SetupNode(tree, [model, dynamic](sync::CObjectCreationDataNode& cdn)
+	{
+		cdn.m_model = model;
+		cdn.m_hasInitPhysics = dynamic;
+	});
+
+	SetupNode(tree, [resourceHash](sync::CObjectSectorPosNode& cdn)
+	{
+		cdn.highRes = true;
+	});
+
+	SetupPosition<sync::CSectorDataNode, sync::CObjectSectorPosNode>(tree, posX, posY, posZ);
+	
+	SetupNode(tree, [heading](sync::CObjectOrientationDataNode& node)
+	{
+		node.data.highRes = false;
+
+		glm::quat q = glm::quat(glm::vec3(0.0f, 0.0f, heading * 0.01745329252f));
+		node.data.quat.Load(q.x, q.y, q.z, q.w);
+	});
+
+	SetupNode(tree, [resourceHash](sync::CEntityScriptInfoDataNode& cdn)
+	{
+		cdn.m_scriptHash = resourceHash;
+		cdn.m_timestamp = msec().count();
+	});
 
 	return tree;
 }
@@ -135,6 +268,9 @@ auto GetNode(sync::NetObjEntityType objectType, const std::shared_ptr<sync::Sync
 		case sync::NetObjEntityType::Train:
 			return std::static_pointer_cast<sync::CTrainSyncTree>(tree)->GetNode<TNode>();
 	}
+
+	assert(!"Invalid object type!");
+	return static_cast<sync::CAutomobileSyncTree*>(nullptr)->GetNode<TNode>();
 }
 
 void DisownEntityScript(const fx::sync::SyncEntityPtr& entity)
@@ -162,6 +298,11 @@ static InitFunction initFunction([]()
 {
 	fx::ServerInstanceBase::OnServerCreate.Connect([](fx::ServerInstanceBase* ref)
 	{
+		if (!IsStateGame())
+		{
+			return;
+		}
+
 		fx::ScriptEngine::RegisterNativeHandler("CREATE_AUTOMOBILE", [=](fx::ScriptContext& ctx) 
 		{
 			uint32_t resourceHash = 0;
@@ -178,13 +319,165 @@ static InitFunction initFunction([]()
 				}
 			}
 
-			auto tree = MakeAutomobile(ctx.GetArgument<uint32_t>(0), ctx.GetArgument<float>(1), ctx.GetArgument<float>(2), ctx.GetArgument<float>(3), resourceHash);
+			auto tree = MakeAutomobile(ctx.GetArgument<uint32_t>(0), ctx.GetArgument<float>(1), ctx.GetArgument<float>(2), ctx.GetArgument<float>(3), resourceHash, ctx.GetArgument<float>(4));
 
 			auto sgs = ref->GetComponent<fx::ServerGameState>();
 			auto entity = sgs->CreateEntityFromTree(sync::NetObjEntityType::Automobile, tree);
 
 			ctx.SetResult(sgs->MakeScriptHandle(entity));
 		});
+
+		fx::ScriptEngine::RegisterNativeHandler("CREATE_VEHICLE_SERVER_SETTER", [ref](fx::ScriptContext& ctx)
+		{
+			uint32_t modelHash = ctx.GetArgument<uint32_t>(0);
+			std::string_view type = ctx.CheckArgument<const char*>(1);
+			float x = ctx.GetArgument<float>(2);
+			float y = ctx.GetArgument<float>(3);
+			float z = ctx.GetArgument<float>(4);
+			float heading = ctx.GetArgument<float>(5);
+
+			uint32_t resourceHash = 0;
+			fx::OMPtr<IScriptRuntime> runtime;
+
+			if (FX_SUCCEEDED(fx::GetCurrentScriptRuntime(&runtime)))
+			{
+				fx::Resource* resource = reinterpret_cast<fx::Resource*>(runtime->GetParentObject());
+
+				if (resource)
+				{
+					resourceHash = HashString(resource->GetName().c_str());
+				}
+			}
+
+			std::shared_ptr<fx::sync::SyncTreeBase> tree;
+			auto typeId = (fx::sync::NetObjEntityType)-1;
+
+			if (type == "automobile")
+			{
+				typeId = sync::NetObjEntityType::Automobile;
+			}
+			else if (type == "bike")
+			{
+				typeId = sync::NetObjEntityType::Bike;
+			}
+			else if (type == "boat")
+			{
+				typeId = sync::NetObjEntityType::Boat;
+			}
+			else if (type == "heli")
+			{
+				typeId = sync::NetObjEntityType::Heli;
+			}
+			else if (type == "plane")
+			{
+				typeId = sync::NetObjEntityType::Plane;
+			}
+			else if (type == "submarine")
+			{
+				typeId = sync::NetObjEntityType::Submarine;
+			}
+			else if (type == "trailer")
+			{
+				typeId = sync::NetObjEntityType::Trailer;
+			}
+			else if (type == "train")
+			{
+				typeId = sync::NetObjEntityType::Train;
+			}
+			else
+			{
+				throw std::runtime_error(va("CREATE_VEHICLE_SERVER_SETTER: Invalid entity type %s", type));
+			}
+
+			switch (typeId)
+			{
+				case fx::sync::NetObjEntityType::Automobile:
+					tree = MakeVehicle<fx::sync::CAutomobileSyncTree>(modelHash, x, y, z, resourceHash, heading);
+					break;
+				case fx::sync::NetObjEntityType::Bike:
+					tree = MakeVehicle<fx::sync::CBikeSyncTree>(modelHash, x, y, z, resourceHash, heading);
+					break;
+				case fx::sync::NetObjEntityType::Boat:
+					tree = MakeVehicle<fx::sync::CBoatSyncTree>(modelHash, x, y, z, resourceHash, heading);
+					break;
+				case fx::sync::NetObjEntityType::Heli:
+					tree = MakeVehicle<fx::sync::CHeliSyncTree>(modelHash, x, y, z, resourceHash, heading);
+					break;
+				case fx::sync::NetObjEntityType::Plane:
+					tree = MakeVehicle<fx::sync::CPlaneSyncTree>(modelHash, x, y, z, resourceHash, heading);
+					break;
+				case fx::sync::NetObjEntityType::Submarine:
+					tree = MakeVehicle<fx::sync::CSubmarineSyncTree>(modelHash, x, y, z, resourceHash, heading);
+					break;
+				case fx::sync::NetObjEntityType::Trailer:
+					tree = MakeVehicle<fx::sync::CTrailerSyncTree>(modelHash, x, y, z, resourceHash, heading);
+					break;
+				case fx::sync::NetObjEntityType::Train:
+					tree = MakeVehicle<fx::sync::CTrainSyncTree>(modelHash, x, y, z, resourceHash, heading);
+					break;
+			}
+
+			auto sgs = ref->GetComponent<fx::ServerGameState>();
+			auto entity = sgs->CreateEntityFromTree(typeId, tree);
+
+			ctx.SetResult(sgs->MakeScriptHandle(entity));
+		});
+
+		fx::ScriptEngine::RegisterNativeHandler("CREATE_PED", [=](fx::ScriptContext& ctx)
+		{
+			uint32_t resourceHash = 0;
+
+			fx::OMPtr<IScriptRuntime> runtime;
+
+			if (FX_SUCCEEDED(fx::GetCurrentScriptRuntime(&runtime)))
+			{
+				fx::Resource* resource = reinterpret_cast<fx::Resource*>(runtime->GetParentObject());
+
+				if (resource)
+				{
+					resourceHash = HashString(resource->GetName().c_str());
+				}
+			}
+
+			auto tree = MakePed(ctx.GetArgument<uint32_t>(1), ctx.GetArgument<float>(2), ctx.GetArgument<float>(3), ctx.GetArgument<float>(4), resourceHash, ctx.GetArgument<float>(5));
+
+			auto sgs = ref->GetComponent<fx::ServerGameState>();
+			auto entity = sgs->CreateEntityFromTree(sync::NetObjEntityType::Ped, tree);
+
+			ctx.SetResult(sgs->MakeScriptHandle(entity));
+		});
+
+		fx::ScriptEngine::RegisterNativeHandler("CREATE_OBJECT_NO_OFFSET", [=](fx::ScriptContext& ctx)
+		{
+			uint32_t resourceHash = 0;
+
+			fx::OMPtr<IScriptRuntime> runtime;
+
+			if (FX_SUCCEEDED(fx::GetCurrentScriptRuntime(&runtime)))
+			{
+				fx::Resource* resource = reinterpret_cast<fx::Resource*>(runtime->GetParentObject());
+
+				if (resource)
+				{
+					resourceHash = HashString(resource->GetName().c_str());
+				}
+			}
+
+			auto tree = MakeObject(ctx.GetArgument<uint32_t>(0), ctx.GetArgument<float>(1), ctx.GetArgument<float>(2), ctx.GetArgument<float>(3), resourceHash, ctx.GetArgument<bool>(6));
+
+			auto sgs = ref->GetComponent<fx::ServerGameState>();
+			auto entity = sgs->CreateEntityFromTree(sync::NetObjEntityType::Object, tree);
+
+			ctx.SetResult(sgs->MakeScriptHandle(entity));
+		});
 	});
 });
 }
+#else
+namespace fx
+{
+void DisownEntityScript(const fx::sync::SyncEntityPtr& entity)
+{
+}
+}
+#endif

@@ -6,6 +6,11 @@
 #include <Streaming.h>
 #include <DrawCommands.h>
 
+#include <boost/bimap.hpp>
+
+#include <GameInit.h>
+#include <unordered_set>
+
 #define RAGE_FORMATS_GAME five
 #define RAGE_FORMATS_GAME_FIVE
 
@@ -64,6 +69,25 @@ rage::grcTexture* LookupTexture(const std::string& txd, const std::string& txn)
 	return nullptr;
 }
 
+static std::unordered_set<rage::grcTexture*> texturesToRemove;
+static boost::bimap<std::tuple<std::string, std::string>, std::tuple<std::string, std::string>> g_replaceTxdPairs;
+
+void TextureReplacement_OnTextureCreate(const std::string& txd, const std::string& txn)
+{
+	// TODO: this could be used (with some changes) when grcTexture gets placed as well
+	if (auto it = g_replaceTxdPairs.right.find(std::make_tuple(txd, txn)); it != g_replaceTxdPairs.right.end())
+	{
+		auto origTexture = LookupTexture(std::get<0>(it->get_left()), std::get<1>(it->get_left()));
+		auto newTexture = LookupTexture(std::get<0>(it->get_right()), std::get<1>(it->get_right()));
+
+		if (origTexture && newTexture)
+		{
+			texturesToRemove.insert(origTexture);
+			AddTextureOverride(origTexture, newTexture);
+		}
+	}
+}
+
 static InitFunction initFunction([]()
 {
 	fx::ScriptEngine::RegisterNativeHandler("ADD_REPLACE_TEXTURE", [](fx::ScriptContext& context)
@@ -76,12 +100,16 @@ static InitFunction initFunction([]()
 		auto origTexture = LookupTexture(origTxd, origTxn);
 		auto newTexture = LookupTexture(newTxd, newTxn);
 
+		// add to the pending TXD list
+		g_replaceTxdPairs.insert({ { origTxd, origTxn }, { newTxd, newTxn } });
+
+		// if either texture does not exist, skip
 		if (!origTexture || !newTexture)
 		{
-			context.SetResult<uint64_t>(false);
 			return;
 		}
 
+		texturesToRemove.insert(origTexture);
 		AddTextureOverride(origTexture, newTexture);
 	});
 
@@ -90,6 +118,10 @@ static InitFunction initFunction([]()
 		std::string origTxd = context.GetArgument<const char*>(0);
 		std::string origTxn = context.GetArgument<const char*>(1);
 
+		// remove the pending txd
+		g_replaceTxdPairs.left.erase(std::make_tuple(origTxd, origTxn));
+
+		// remove any txd overridden now
 		auto origTexture = LookupTexture(origTxd, origTxn);
 
 		if (!origTexture)
@@ -98,6 +130,18 @@ static InitFunction initFunction([]()
 			return;
 		}
 
+		texturesToRemove.erase(origTexture);
 		RemoveTextureOverride(origTexture);
+	});
+
+	OnKillNetworkDone.Connect([]()
+	{
+		for (auto texture : texturesToRemove)
+		{
+			RemoveTextureOverride(texture);
+		}
+
+		texturesToRemove.clear();
+		g_replaceTxdPairs.clear();
 	});
 });

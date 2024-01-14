@@ -98,7 +98,8 @@ const wchar_t* vva(std::wstring_view string, fmt::wprintf_args formatList)
 
 void DoNtRaiseException(EXCEPTION_RECORD* record)
 {
-	typedef NTSTATUS(*NtRaiseExceptionType)(PEXCEPTION_RECORD record, PCONTEXT context, BOOL firstChance);
+#ifdef _M_AMD64
+	typedef NTSTATUS(WINAPI* NtRaiseExceptionType)(PEXCEPTION_RECORD record, PCONTEXT context, BOOL firstChance);
 
 	bool threw = false;
 
@@ -117,6 +118,9 @@ void DoNtRaiseException(EXCEPTION_RECORD* record)
 		// force 'threw' to be stack-allocated by messing with it from here (where it won't execute)
 		OutputDebugStringA((char*)&threw);
 	}
+#else
+	RaiseException(record->ExceptionCode, record->ExceptionFlags, record->NumberParameters, record->ExceptionInformation);
+#endif
 }
 
 static void RaiseDebugException(const char* buffer, size_t length)
@@ -179,13 +183,7 @@ void TraceRealV(const char* channel, const char* func, const char* file, int lin
 	CoreTrace(channel, func, file, line, buffer.data());
 
 #ifdef _WIN32
-	static CRITICAL_SECTION dbgCritSec;
-
-	if (!dbgCritSec.DebugInfo)
-	{
-		InitializeCriticalSectionAndSpinCount(&dbgCritSec, 100);
-	}
-
+#if defined(_M_AMD64)
 	if (CoreIsDebuggerPresent())
 	{
 		// thanks to anti-debug workarounds (IsBeingDebugged == FALSE), we'll have to raise the exception to the debugger ourselves.
@@ -196,6 +194,7 @@ void TraceRealV(const char* channel, const char* func, const char* file, int lin
 		RaiseDebugException(buffer.c_str(), buffer.length());
 	}
 	else
+#endif
 	{
 		OutputDebugStringA(buffer.c_str());
 	}
@@ -232,7 +231,7 @@ fwString url_encode(const fwString &value)
 	return fwString(escaped.str().c_str());
 }
 
-bool UrlDecode(const std::string& in, std::string& out)
+bool UrlDecode(const std::string& in, std::string& out, bool replacePlus)
 {
 	out.clear();
 	out.reserve(in.size());
@@ -259,7 +258,7 @@ bool UrlDecode(const std::string& in, std::string& out)
 				return false;
 			}
 		}
-		else if (in[i] == '+')
+		else if (in[i] == '+' && replacePlus)
 		{
 			out += ' ';
 		}
@@ -271,27 +270,26 @@ bool UrlDecode(const std::string& in, std::string& out)
 	return true;
 }
 
-std::string ToNarrow(const std::wstring& wide)
+std::string ToNarrow(std::wstring_view wide)
 {
-	// TODO: replace with something faster if needed
-	std::vector<char> outVec;
+	std::string outVec;
 	outVec.reserve(wide.size());
 
 #ifdef _WIN32
-	utf8::utf16to8(wide.begin(), wide.end(), std::back_inserter(outVec));
+	utf8::unchecked::utf16to8(wide.begin(), wide.end(), std::back_inserter(outVec));
 #else
 	utf8::utf32to8(wide.begin(), wide.end(), std::back_inserter(outVec));
 #endif
 	
-	return std::string(outVec.begin(), outVec.end());
+	return std::move(outVec);
 }
 
-std::wstring ToWide(const std::string& narrow)
+std::wstring ToWide(std::string_view narrow)
 {
 	std::vector<uint8_t> cleanVec;
 	cleanVec.reserve(narrow.size());
 
-	std::vector<wchar_t> outVec;
+	std::wstring outVec;
 	outVec.reserve(cleanVec.size());
 
 	try
@@ -309,5 +307,5 @@ std::wstring ToWide(const std::string& narrow)
 
 	}
 
-	return std::wstring(outVec.begin(), outVec.end());
+	return std::move(outVec);
 }

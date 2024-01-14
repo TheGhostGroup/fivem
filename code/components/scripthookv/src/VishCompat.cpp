@@ -8,12 +8,15 @@
 #include "StdInc.h"
 #include <scrEngine.h>
 #include <ScriptHandlerMgr.h>
+#include <nutsnbolts.h>
+#include <DrawCommands.h>
 
 #include "ICoreGameInit.h"
 #include <InputHook.h>
 #include <IteratorView.h>
 
 #include <LaunchMode.h>
+#include <CrossBuildRuntime.h>
 
 #include <memory>
 
@@ -260,12 +263,35 @@ DLL_EXPORT uint64_t* getGlobalPtr(int)
 
 enum eGameVersion : int
 {
-	DummyVersion = 44 // VER_1_0_1493_1_NOSTEAM
+	VER_1_0_372_2_NOSTEAM = 5,
+	VER_1_0_1604_0_NOSTEAM = 47,
+	VER_1_0_2060_0_NOSTEAM = 60,
+	VER_1_0_2189_0_NOSTEAM = 64,
+	VER_1_0_2372_0_NOSTEAM = 70,
+	VER_1_0_2545_0_NOSTEAM = 72,
+	VER_1_0_2612_1_NOSTEAM = 74,
+	VER_1_0_2699_0_NOSTEAM = 78,
+	VER_1_0_2802_0_NOSTEAM = 80,
+	VER_1_0_2944_0_NOSTEAM = 83,
+	VER_1_0_3095_0_NOSTEAM = 85,
 };
 
+// ScriptHookV uses incremental numbers instead of build
 DLL_EXPORT eGameVersion getGameVersion()
 {
-	return DummyVersion;
+	if (xbr::IsGameBuildOrGreater<3095>()) return VER_1_0_3095_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2944>()) return VER_1_0_2944_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2802>()) return VER_1_0_2802_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2699>()) return VER_1_0_2699_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2612>()) return VER_1_0_2612_1_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2545>()) return VER_1_0_2545_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2372>()) return VER_1_0_2372_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2189>()) return VER_1_0_2189_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2060>()) return VER_1_0_2060_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<1604>()) return VER_1_0_1604_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<372>()) return VER_1_0_372_2_NOSTEAM;
+
+	return VER_1_0_1604_0_NOSTEAM; // Default build
 }
 
 class FishNativeContext : public NativeContext
@@ -403,6 +429,20 @@ int DLL_EXPORT worldGetAllPeds(int* array, int arraySize)
 int DLL_EXPORT worldGetAllObjects(int* array, int arraySize)
 {
 	return 0;
+}
+
+typedef void(*PresentCallback)(void*);
+
+static std::set<PresentCallback> g_presentCallbacks;
+
+void DLL_EXPORT presentCallbackRegister(PresentCallback cb)
+{
+	g_presentCallbacks.insert(cb);
+}
+
+void DLL_EXPORT presentCallbackUnregister(PresentCallback cb)
+{
+	g_presentCallbacks.erase(cb);
 }
 
 static InitFunction initFunction([]()

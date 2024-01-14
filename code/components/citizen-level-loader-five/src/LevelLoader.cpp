@@ -17,21 +17,35 @@
 #include <ResourceManager.h>
 #include <ResourceMetaDataComponent.h>
 
+#include <VFSManager.h>
+#include <boost/algorithm/string.hpp>
+
+#include "atArray.h"
+
+void DLL_IMPORT CfxCollection_AddStreamingFileByTag(const std::string& tag, const std::string& fileName, rage::ResourceFlags flags);
+
+namespace streaming
+{
+void AddDataFileToLoadList(const std::string& type, const std::string& path);
+}
+
 #include <skyr/url.hpp>
 
 #include "Hooking.h"
+#include "Hooking.Stubs.h"
 
 static std::string g_overrideNextLoadedLevel;
 static std::string g_nextLevelPath;
 
 static bool g_wasLastLevelCustom;
+static bool g_gameUnloaded = false;
 
 static void(*g_origLoadLevelByIndex)(int);
 static void(*g_loadLevel)(const char* levelPath);
 
 enum NativeIdentifiers : uint64_t
 {
-	GET_PLAYER_PED = 0x43A66C31C68491C0,
+	PLAYER_PED_ID = 0xD80958FC74E988A6,
 	SET_ENTITY_COORDS = 0x621873ECE1178967,
 	LOAD_SCENE = 0x4448EB75B4904BDB,
 	SHUTDOWN_LOADING_SCREEN = 0x078EBE9809CCD637,
@@ -45,29 +59,26 @@ private:
 
 public:
 	SpawnThread()
+		: m_doInityThings(false)
 	{
-		m_doInityThings = true;
 	}
 
-	virtual rage::eThreadState Reset(uint32_t scriptHash, void* pArgs, uint32_t argCount) override
+	void ResetInityThings()
 	{
 		m_doInityThings = true;
-
-		return GtaThread::Reset(scriptHash, pArgs, argCount);
 	}
 
 	virtual void DoRun() override
 	{
-		uint32_t playerPedId = NativeInvoke::Invoke<GET_PLAYER_PED, uint32_t>(-1);
-
 		if (m_doInityThings)
 		{
-			NativeInvoke::Invoke<LOAD_SCENE, int>(-426.858f, -957.54f, 3.621f);
+			uint32_t playerPedId = NativeInvoke::Invoke<PLAYER_PED_ID, uint32_t>();
 
 			NativeInvoke::Invoke<SHUTDOWN_LOADING_SCREEN, int>();
 			NativeInvoke::Invoke<DO_SCREEN_FADE_IN, int>(0);
 
-			NativeInvoke::Invoke<SET_ENTITY_COORDS, int>(playerPedId, -426.858f, -957.54f, 3.621f);
+			NativeInvoke::Invoke<SET_ENTITY_COORDS, int>(playerPedId, 293.089f, 180.466f, 104.301f);
+			NativeInvoke::Invoke<0x428CA6DBD1094446, int>(NativeInvoke::Invoke<0xD80958FC74E988A6, int>(), false);
 
 			if (Instance<ICoreGameInit>::Get()->HasVariable("editorMode"))
 			{
@@ -178,15 +189,42 @@ static bool DoesLevelHashMatch(void* evaluator, uint32_t* hash)
 	return (!g_wasLastLevelCustom);
 }
 
+struct CDataFileMgr__ContentChangeSet
+{
+	// technically, some atString?
+	atArray<char> changeSetName;
+	// ...
+};
+
+static void (*g_orig_CFileLoader__BuildContentChangeSetActionList)(const CDataFileMgr__ContentChangeSet& changeset, void* outArray, int a3, int a4, int a5);
+
+static void CFileLoader__BuildContentChangeSetActionList_Hook(const CDataFileMgr__ContentChangeSet& changeset, void* outArray, int a3, int a4, int a5)
+{
+	if (g_wasLastLevelCustom)
+	{
+		// CCS_PATCHDAY27_NG_STREAMING_MAP lacks a level condition and breaks custom levels
+		const char* str = (changeset.changeSetName.m_size > 0) ? changeset.changeSetName.m_offset : "";
+
+		if (HashString(str) == HashString("CCS_PATCHDAY27_NG_STREAMING_MAP"))
+		{
+			return;
+		}
+	}
+
+	return g_orig_CFileLoader__BuildContentChangeSetActionList(changeset, outArray, a3, a4, a5);
+}
+
 static HookFunction hookFunction([] ()
 {
-	char* levelCaller = Is2060() ? hook::pattern("33 D0 81 E2 FF 00 FF 00 33 D1 48").count(1).get(0).get<char>(0x33) : hook::pattern("0F 94 C2 C1 C1 10 33 CB 03 D3 89 0D").count(1).get(0).get<char>(46);
+	char* levelCaller = xbr::IsGameBuildOrGreater<2060>() ? hook::pattern("33 D0 81 E2 FF 00 FF 00 33 D1 48").count(1).get(0).get<char>(0x33) : hook::pattern("0F 94 C2 C1 C1 10 33 CB 03 D3 89 0D").count(1).get(0).get<char>(46);
 	char* levelByIndex = hook::get_call(levelCaller);
 
 	hook::set_call(&g_origLoadLevelByIndex, levelCaller);
 	hook::call(levelCaller, DoLoadLevel);
 
 	hook::set_call(&g_loadLevel, levelByIndex + 0x1F);
+
+	g_orig_CFileLoader__BuildContentChangeSetActionList = hook::trampoline(hook::get_pattern("E8 ? ? ? ? 44 8A A4 24 80 00 00 00 33 ED 8B F5 66", -0x30), CFileLoader__BuildContentChangeSetActionList_Hook);
 
 	// change set applicability
 	hook::jump(hook::pattern("40 8A EA 48 8B F9 B0 01 76 43 E8").count(1).get(0).get<void>(-0x19), IsLevelApplicable);
@@ -207,7 +245,7 @@ static concurrency::concurrent_queue<std::function<void()>> g_onShutdownQueue;
 
 static void LoadLevel(const char* levelName)
 {
-	ICoreGameInit* gameInit = Instance<ICoreGameInit>::Get();
+	static auto gameInit = Instance<ICoreGameInit>::Get();
 
 	gameInit->SetVariable("networkInited");
 
@@ -217,7 +255,7 @@ static void LoadLevel(const char* levelName)
 	{
 		if ((!gameInit->HasVariable("storyMode") && !gameInit->HasVariable("localMode")) || gameInit->HasVariable("editorMode"))
 		{
-			rage::scrEngine::CreateThread(&spawnThread);
+			spawnThread.ResetInityThings();
 		}
 
 		gameInit->LoadGameFirstLaunch([] ()
@@ -235,7 +273,7 @@ static void LoadLevel(const char* levelName)
 
 		gameInit->KillNetwork((wchar_t*)1);
 
-		g_onShutdownQueue.push([gameInit, sm, lm, em]()
+		auto fEvent = ([sm, lm, em]()
 		{
 			gameInit->ReloadGame();
 
@@ -251,12 +289,25 @@ static void LoadLevel(const char* levelName)
 
 			if (em)
 			{
+				gameInit->SetVariable("localMode"); // see editorModeCommand. 'ShouldSkipLoading' will return false otherwise.
 				gameInit->SetVariable("editorMode");
+				spawnThread.ResetInityThings();
 			}
 
 			gameInit->SetVariable("networkInited");
 			gameInit->ShAllowed = true;
 		});
+
+		if (g_gameUnloaded)
+		{
+			fEvent();
+
+			g_gameUnloaded = false;
+		}
+		else
+		{
+			g_onShutdownQueue.push(fEvent); // OnShutdownSession
+		}
 	}
 }
 
@@ -303,6 +354,15 @@ private:
 	fx::ResourceManager* m_manager;
 };
 
+#define VFS_GET_RAGE_PAGE_FLAGS 0x20001
+
+struct GetRagePageFlagsExtension
+{
+	const char* fileName; // in
+	int version;
+	rage::ResourceFlags flags; // out
+};
+
 static InitFunction initFunction([] ()
 {
 	rage::fiDevice::OnInitialMount.Connect([] ()
@@ -335,6 +395,7 @@ static InitFunction initFunction([] ()
 	static ConsoleCommand localGameCommand("localGame", [](const std::string& resourceDir)
 	{
 		Instance<ICoreGameInit>::Get()->SetVariable("localMode");
+		Instance<ICoreGameInit>::Get()->SetData("localResource", resourceDir);
 
 		fx::ResourceManager* resourceManager = Instance<fx::ResourceManager>::Get();
 		resourceManager->AddMounter(new SPResourceMounter(resourceManager));
@@ -349,10 +410,66 @@ static InitFunction initFunction([] ()
 		url.set_hash(resourceDir);
 
 		resourceManager->AddResource(url.href())
-			.then([](fwRefContainer<fx::Resource> resource)
+			.then([resourceDir, resourceRoot](fwRefContainer<fx::Resource> resource)
 		{
 			resource->Start();
 		});
+
+		// also tag with streaming files, wahoo!
+		// #TODO: make recursive!
+		// #TODO: maybe share this code once it does support recursion?
+		vfs::FindData findData;
+		auto mount = resourceRoot + "/stream/";
+		auto device = vfs::GetDevice(mount);
+
+		if (device.GetRef())
+		{
+			auto findHandle = device->FindFirst(mount, &findData);
+
+			if (findHandle != INVALID_DEVICE_HANDLE)
+			{
+				bool shouldUseCache = false;
+				bool shouldUseMapStore = false;
+
+				do
+				{
+					if (!(findData.attributes & FILE_ATTRIBUTE_DIRECTORY))
+					{
+						std::string tfn = mount + findData.name;
+
+						GetRagePageFlagsExtension data;
+						data.fileName = tfn.c_str();
+						device->ExtensionCtl(VFS_GET_RAGE_PAGE_FLAGS, &data, sizeof(data));
+
+						CfxCollection_AddStreamingFileByTag(resourceDir, tfn, data.flags);
+
+						if (boost::algorithm::ends_with(tfn, ".ymf"))
+						{
+							shouldUseCache = true;
+						}
+
+						if (boost::algorithm::ends_with(tfn, ".ybn") || boost::algorithm::ends_with(tfn, ".ymap"))
+						{
+							shouldUseMapStore = true;
+						}
+					}
+				} while (device->FindNext(findHandle, &findData));
+
+				device->FindClose(findHandle);
+
+				// in case of .#mf file
+				if (shouldUseCache)
+				{
+					streaming::AddDataFileToLoadList("CFX_PSEUDO_CACHE", resourceDir);
+				}
+
+				// in case of .#bn/.#map file
+				if (shouldUseMapStore)
+				{
+					streaming::AddDataFileToLoadList("CFX_PSEUDO_ENTRY", "RELOAD_MAP_STORE");
+				}
+			}
+		}
 
 		static ConsoleCommand localRestartCommand("localRestart", [resourceRoot, resourceDir, resourceManager]()
 		{
@@ -371,6 +488,16 @@ static InitFunction initFunction([] ()
 		LoadLevel(level.c_str());
 	});
 
+	rage::scrEngine::OnScriptInit.Connect([] ()
+	{
+		rage::scrEngine::CreateThread(&spawnThread);
+	}, INT32_MAX);
+
+	Instance<ICoreGameInit>::Get()->OnGameRequestLoad.Connect([]()
+	{
+		g_gameUnloaded = false;
+	});
+
 	Instance<ICoreGameInit>::Get()->OnShutdownSession.Connect([]()
 	{
 		std::function<void()> fn;
@@ -379,5 +506,7 @@ static InitFunction initFunction([] ()
 		{
 			fn();
 		}
+
+		g_gameUnloaded = true;
 	}, INT32_MAX);
 });

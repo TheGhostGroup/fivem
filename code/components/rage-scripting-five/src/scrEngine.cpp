@@ -21,6 +21,9 @@
 
 #include <unordered_set>
 
+extern void PointerArgumentSafety();
+extern bool storyMode;
+
 #if __has_include("scrEngineStubs.h")
 #include <scrEngineStubs.h>
 #else
@@ -222,16 +225,12 @@ pgPtrCollection<GtaThread>* scrEngine::GetThreadCollection()
 
 scrThread* scrEngine::GetActiveThread()
 {
-	char* moduleTls = *(char**)__readgsqword(88);
-
-	return *reinterpret_cast<scrThread**>(moduleTls + activeThreadTlsOffset);
+	return *reinterpret_cast<scrThread**>(hook::get_tls() + activeThreadTlsOffset);
 }
 
 void scrEngine::SetActiveThread(scrThread* thread)
 {
-	char* moduleTls = *(char**)__readgsqword(88);
-
-	*reinterpret_cast<scrThread**>(moduleTls + activeThreadTlsOffset) = thread;
+	*reinterpret_cast<scrThread**>(hook::get_tls() + activeThreadTlsOffset) = thread;
 }
 
 //static uint32_t& scrThreadId = *(uint32_t*)0x1849ADC;
@@ -411,13 +410,22 @@ static InitFunction initFunction([] ()
 {
 	scrEngine::OnScriptInit.Connect([] ()
 	{
-		for (auto& handler : g_nativeHandlers)
+		auto doReg = []()
 		{
-			RegisterNative(handler.first, handler.second);
-		}
+			for (auto& handler : g_nativeHandlers)
+			{
+				RegisterNative(handler.first, handler.second);
+			}
 
-		// to prevent double registration resulting in a game error
-		g_nativeHandlers.clear();
+			// to prevent double registration resulting in a game error
+			g_nativeHandlers.clear();
+		};
+
+		doReg();
+
+		PointerArgumentSafety();
+		g_fastPathMap.clear();
+		doReg();
 
 		for (auto& entry : g_onScriptInitQueue)
 		{
@@ -443,7 +451,12 @@ scrEngine::NativeHandler GetNativeHandlerDo(uint64_t origHash, uint64_t hash)
 				handler = (scrEngine::NativeHandler) /*DecodePointer(*/ table->handlers[i] /*)*/;
 				HandlerFilter(&handler);
 
-				g_fastPathMap.insert({ NativeHash{ origHash }, handler });
+				if (handler)
+				{
+					#include "BlockedNatives.h"
+				}
+
+				g_fastPathMap[NativeHash{ origHash }] = handler;
 
 				break;
 			}
@@ -460,70 +473,12 @@ scrEngine::NativeHandler GetNativeHandlerWrap(uint64_t origHash, uint64_t hash)
 
 scrEngine::NativeHandler scrEngine::GetNativeHandler(uint64_t hash)
 {
-	scrEngine::NativeHandler handler = nullptr;
-
-	auto it = g_fastPathMap.find(NativeHash{ hash });
-
-	if (it != g_fastPathMap.end())
+	if (auto it = g_fastPathMap.find(NativeHash{ hash }); it != g_fastPathMap.end() && it->second)
 	{
-		handler = it->second;
+		return it->second;
 	}
 
-	uint64_t origHash = hash;
-
-	if (!handler)
-	{
-		hash = MapNative(hash);
-
-		handler = GetNativeHandlerWrap(origHash, hash);
-	}
-
-	if (handler)
-	{
-		/*if (origHash == 0xD1110739EEADB592)
-		{
-			static scrEngine::NativeHandler hashHandler = handler;
-
-			return [] (rage::scrNativeCallContext* context)
-			{
-				hashHandler(context);
-
-				GtaThread* thread = static_cast<GtaThread*>(GetActiveThread());
-				void* handler = thread->GetScriptHandler();
-
-				if (handler)
-				{
-					for (auto& ownedThread : g_ownedThreads)
-					{
-						if (ownedThread != thread)
-						{
-							ownedThread->SetScriptHandler(handler);
-						}
-					}
-				}
-			};
-		}
-		// prop density lowering
-		else */if (origHash == 0x9BAE5AD2508DF078)
-		{
-			return [] (rage::scrNativeCallContext*)
-			{
-				// no-op
-			};
-		}
-		//StringToInt, ClearBit, SetBitsInRange, SetBit, CopyMemory
-		else if (origHash == 0x5A5F40FE637EB584 || origHash == 0xE80492A9AC099A93 || origHash == 0x8EF07E15701D61ED || origHash == 0x933D6A9EEC1BACD0 || origHash == 0x213AEB2B90CBA7AC)
-		{
-			return [](rage::scrNativeCallContext*)
-			{
-				// no-op
-			};
-		}
-
-		return handler;
-	}
-
-	return nullptr;
+	return GetNativeHandlerWrap(hash, MapNative(hash));
 }
 }
 
@@ -544,14 +499,11 @@ static int ReturnTrueFromScript(void* a1, void* a2)
 	return true;
 }
 
-static void(*g_origResetOwnedThreads)();
+static void(*g_CTheScripts__Shutdown)(void);
 
-static void ResetOwnedThreads()
+static void CTheScripts__Shutdown()
 {
-	if (Instance<ICoreGameInit>::Get()->HasVariable("storyMode"))
-	{
-		return g_origResetOwnedThreads();
-	}
+	g_CTheScripts__Shutdown();
 
 	for (auto& thread : g_ownedThreads)
 	{
@@ -591,9 +543,31 @@ static void StartupScriptWrap()
 	origStartupScript();
 }
 
+static InitFunction initFunction([]
+{
+	if (xbr::IsGameBuildOrGreater<2612>())
+	{
+		// IS_BIT_SET is missing in b2612+, re-adding for compatibility
+		rage::scrEngine::RegisterNativeHandler(0xE2D0C323A1AE5D85 /* 2545 hash */, [](rage::scrNativeCallContext* ctx)
+		{
+			bool result = false;
+
+			auto value = ctx->GetArgument<uint32_t>(0);
+			auto offset = ctx->GetArgument<int>(1);
+
+			if (offset < 32)
+			{
+				result = (value & (1 << offset)) != 0;
+			}
+
+			ctx->SetResult<int>(0, result);
+		});
+	}
+});
+
 static HookFunction hookFunction([] ()
 {
-	char* location = hook::pattern("48 8B C8 EB 03 48 8B CB 48 8B 05").count(1).get(0).get<char>(11);
+	char* location = xbr::IsGameBuildOrGreater<2545>() ? hook::pattern("48 8B C8 EB 03 49 8B CD 48 8B 05").count(1).get(0).get<char>(11) : hook::pattern("48 8B C8 EB 03 48 8B CB 48 8B 05").count(1).get(0).get<char>(11);
 
 	scrThreadCollection = reinterpret_cast<decltype(scrThreadCollection)>(location + *(int32_t*)location + 4);
 
@@ -610,10 +584,25 @@ static HookFunction hookFunction([] ()
 	}
 	else
 	{
-		// memory layout dependent
-		scrThreadId = hook::get_address<uint32_t*>(hook::get_pattern("33 FF 48 85 C0 74 08 48 8B C8 E8", -9)) - 2;
+		if (xbr::IsGameBuildOrGreater<2612>())
+		{
+			scrThreadId = hook::get_address<uint32_t*>(hook::get_pattern("8B 15 ? ? ? ? 48 8B 05 ? ? ? ? FF C2 89 15 ? ? ? ? 48 8B 0C D8", 2));
+		}
+		else if (xbr::IsGameBuildOrGreater<2545>())
+		{
+			scrThreadId = hook::get_address<uint32_t*>(hook::get_pattern("8B 15 ? ? ? ? 48 8B 05 ? ? ? ? FF C2 89 15 ? ? ? ? E9", 2));
+		}
+		else if (xbr::IsGameBuildOrGreater<2372>())
+		{
+			scrThreadId = hook::get_address<uint32_t*>(hook::get_pattern("8B 15 ? ? ? ? 48 8B 05 ? ? ? ? FF C2 89", 2));
+		}
+		else
+		{
+			// memory layout dependent
+			scrThreadId = hook::get_address<uint32_t*>(hook::get_pattern("33 FF 48 85 C0 74 08 48 8B C8 E8", -9)) - 2;
+		}
 
-		location = hook::get_pattern<char>("FF 0D ? ? ? ? 48 8B F9", 2);
+		location = xbr::IsGameBuildOrGreater<2545>() ? hook::get_pattern<char>("FF 0D ? ? ? ? 48 8B D9 75", 2) : hook::get_pattern<char>("FF 0D ? ? ? ? 48 8B F9", 2);
 
 		scrThreadCount = reinterpret_cast<decltype(scrThreadCount)>(location + *(int32_t*)location + 4);
 	}
@@ -648,16 +637,31 @@ static HookFunction hookFunction([] ()
 
 		// temp: kill stock scripts
 		// NOTE: before removing make sure scrObfuscation in fivem-private can handle opcode 0x2C (NATIVE)
-		//hook::jump(hook::pattern("48 83 EC 20 80 B9 46 01  00 00 00 8B FA").count(1).get(0).get<void>(-0xB), JustNoScript);
-		MH_CreateHook(hook::pattern("48 83 EC 20 80 B9 46 01 00 00 00 8B FA").count(1).get(0).get<void>(-0xB), JustNoScript, (void**)&g_origNoScript);
+		//hook::jump(hook::pattern("48 83 EC 20 80 B9 ? 01 00 00 00 8B FA").count(1).get(0).get<void>(-0xB), JustNoScript);
+		MH_CreateHook(hook::pattern("48 83 EC 20 80 B9 ? 01 00 00 00 8B FA").count(1).get(0).get<void>(-0xB), JustNoScript, (void**)&g_origNoScript);
 
 		// make all CGameScriptId instances return 'true' in matching function (mainly used for 'is script allowed to use this object' checks)
 		//hook::jump(hook::pattern("74 3C 48 8B 01 FF 50 10 84 C0").count(1).get(0).get<void>(-0x1A), ReturnTrue);
-		MH_CreateHook(hook::pattern("74 3C 48 8B 01 FF 50 10 84 C0").count(1).get(0).get<void>(-0x1A), ReturnTrueFromScript, (void**)&g_origReturnTrue);
+		if (xbr::IsGameBuildOrGreater<2802>())
+		{
+			MH_CreateHook(hook::pattern("74 41 48 8B 01 FF 50 10 84 C0").count(1).get(0).get<void>(-0x1A), ReturnTrueFromScript, (void**)&g_origReturnTrue);
+		}
+		else
+		{
+			MH_CreateHook(hook::pattern("74 3C 48 8B 01 FF 50 10 84 C0").count(1).get(0).get<void>(-0x1A), ReturnTrueFromScript, (void**)&g_origReturnTrue);
+		}
 
 		// replace `startup` initialization with resetting all owned threads
 		//hook::jump(hook::get_pattern("48 63 18 83 FB FF 0F 84 D6", -0x34), ResetOwnedThreads);
-		MH_CreateHook(hook::get_pattern("48 63 18 83 FB FF 0F 84 D6", -0x34), ResetOwnedThreads, (void**)&g_origResetOwnedThreads);
+		//MH_CreateHook(hook::get_pattern("48 63 18 83 FB FF 0F 84 D6", -0x34), ResetOwnedThreads, (void**)&g_origResetOwnedThreads);
+		if (xbr::IsGameBuildOrGreater<2802>())
+		{
+			MH_CreateHook(hook::get_pattern("48 8B 01 FF 50 30 E8 ? ? ? ? E8", -0x61), CTheScripts__Shutdown, (void**)&g_CTheScripts__Shutdown);
+		}
+		else
+		{
+			MH_CreateHook(hook::get_pattern("48 8B 0D ? ? ? ? 33 D2 48 8B 01 FF 10", -0x58), CTheScripts__Shutdown, (void**)&g_CTheScripts__Shutdown);
+		}
 
 		MH_EnableHook(MH_ALL_HOOKS);
 	}

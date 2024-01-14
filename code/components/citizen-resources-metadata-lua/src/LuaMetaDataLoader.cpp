@@ -16,6 +16,29 @@ extern "C" {
 #include <lua_rapidjsonlib.h>
 }
 
+// luaL_openlibs version without io/os libs
+static const luaL_Reg lualibs[] = {
+	{ "_G", luaopen_base },
+	{ LUA_TABLIBNAME, luaopen_table },
+	{ LUA_STRLIBNAME, luaopen_string },
+	{ LUA_MATHLIBNAME, luaopen_math },
+	{ LUA_DBLIBNAME, luaopen_debug },
+	{ LUA_COLIBNAME, luaopen_coroutine },
+	{ LUA_UTF8LIBNAME, luaopen_utf8 },
+	{ "json", luaopen_rapidjson },
+	{ NULL, NULL }
+};
+
+LUALIB_API void safe_openlibs(lua_State* L)
+{
+	const luaL_Reg* lib = lualibs;
+	for (; lib->func; lib++)
+	{
+		luaL_requiref(L, lib->name, lib->func, 1);
+		lua_pop(L, 1);
+	}
+}
+
 class LuaMetaDataLoader : public fx::ResourceMetaDataLoader
 {
 private:
@@ -29,7 +52,7 @@ private:
 private:
 	lua_State* m_luaState;
 
-	boost::optional<std::string> m_error;
+	std::optional<std::string> m_error;
 
 	fx::ResourceMetaDataComponent* m_component;
 
@@ -46,7 +69,7 @@ public:
 		return m_component;
 	}
 
-	virtual boost::optional<std::string> LoadMetaData(fx::ResourceMetaDataComponent* component, const std::string& resourcePath) override;
+	virtual std::optional<std::string> LoadMetaData(fx::ResourceMetaDataComponent* component, const std::string& resourcePath) override;
 };
 
 auto LuaMetaDataLoader::LoadFile(const std::string& filename) -> LoadFileResult
@@ -56,7 +79,7 @@ auto LuaMetaDataLoader::LoadFile(const std::string& filename) -> LoadFileResult
 
 	if (!stream.GetRef())
 	{
-		m_error = "Could not open resource metadata file " + filename + ".";
+		m_error = "Could not open resource metadata file - no such file.";
 
 		return LoadFileResult::NoSuchFile;
 	}
@@ -68,7 +91,17 @@ auto LuaMetaDataLoader::LoadFile(const std::string& filename) -> LoadFileResult
 	std::string code(bytes.begin(), bytes.end());
 
 	// create the chunk name as well
-	std::string chunkName = "@" + filename;
+	std::string friendlyFileName = filename;
+
+	if (auto lastSlash = friendlyFileName.rfind('/'); lastSlash != std::string::npos && lastSlash > 0)
+	{
+		if (auto secondLastSlash = friendlyFileName.rfind('/', lastSlash - 1); secondLastSlash != std::string::npos)
+		{
+			friendlyFileName = friendlyFileName.substr(secondLastSlash + 1);
+		}
+	}
+
+	std::string chunkName = "@" + friendlyFileName;
 
 	// load the buffer
 	if (luaL_loadbuffer(m_luaState, code.c_str(), code.length(), chunkName.c_str()) != 0)
@@ -119,7 +152,7 @@ bool LuaMetaDataLoader::DoFile(const std::string& filename, int results)
 	return result;
 }
 
-boost::optional<std::string> LuaMetaDataLoader::LoadMetaData(fx::ResourceMetaDataComponent* component, const std::string& resourcePath)
+std::optional<std::string> LuaMetaDataLoader::LoadMetaData(fx::ResourceMetaDataComponent* component, const std::string& resourcePath)
 {
 	using namespace std::string_literals;
 
@@ -132,15 +165,11 @@ boost::optional<std::string> LuaMetaDataLoader::LoadMetaData(fx::ResourceMetaDat
 	// create the Lua state for the metadata loader
 	m_luaState = luaL_newstate();
 
-	// validate if the Lua state exists (with LuaJIT you apparently never know)
+	// validate if the Lua state exists
 	assert(m_luaState);
 
 	// openlibs as well
-	luaL_openlibs(m_luaState);
-
-	// open lua_rapidjson
-	luaL_requiref(m_luaState, "json", luaopen_rapidjson, 1);
-	lua_pop(m_luaState, 1);  /* remove lib */
+	safe_openlibs(m_luaState);
 
 	// register a metadata adder for ourselves
 	lua_pushlightuserdata(m_luaState, this);
@@ -155,7 +184,27 @@ boost::optional<std::string> LuaMetaDataLoader::LoadMetaData(fx::ResourceMetaDat
 		// don't load any key named "is_cfxv2" from user metadata
 		if (stricmp(key, "is_cfxv2") != 0)
 		{
-			loader->GetComponent()->AddMetaData(key, value);
+			fx::ResourceMetaDataComponent::Location location;
+
+			lua_Debug ar;
+			if (lua_getstack(L, 2, &ar))
+			{
+				if (lua_getinfo(L, "Sl", &ar))
+				{
+					if (ar.source && ar.source[0] == '@')
+					{
+						location.file = fmt::sprintf("%s/%s", loader->GetComponent()->GetResource()->GetPath(), &ar.source[1]);
+					}
+					else
+					{
+						location.file = ar.short_src;
+					}
+
+					location.line = ar.currentline;
+				}
+			}
+
+			loader->GetComponent()->AddMetaData(key, value, location);
 		}
 
 		return 0;
@@ -168,12 +217,10 @@ boost::optional<std::string> LuaMetaDataLoader::LoadMetaData(fx::ResourceMetaDat
 
 	// run global initialization code
 	bool result = true;
-	//result = result && DoFile("citizen:/scripting/lua/json.lua", 0);
-
 	result = result && DoFile("citizen:/scripting/resource_init.lua", 1);
 
 	// remove unsafe handlers from the Lua state
-	const char* unsafeGlobals[] = { "ffi", "require", "dofile", "load", "loadfile", "package", /*"AddMetaData", */"os", "io" };
+	const char* unsafeGlobals[] = { "dofile", "load", "loadfile" };
 
 	for (auto removeThat : unsafeGlobals)
 	{
@@ -241,7 +288,12 @@ boost::optional<std::string> LuaMetaDataLoader::LoadMetaData(fx::ResourceMetaDat
 	lua_close(m_luaState);
 	m_luaState = nullptr;
 
-	return (result) ? boost::optional<std::string>{} : m_error;
+	if (!result)
+	{
+		return m_error;
+	}
+
+	return {};
 }
 
 static LuaMetaDataLoader g_metaDataLoader;

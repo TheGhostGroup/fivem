@@ -16,6 +16,7 @@
 
 #ifndef IS_FXSERVER
 #include <CL2LaunchMode.h>
+#include <CfxState.h>
 #endif
 
 #ifdef _WIN32
@@ -46,17 +47,6 @@ void ComponentLoader::Initialize()
 
 	// parse and load additional components
 	fwPlatformString componentsName = _P("components.json");
-
-	if (CfxIsSinglePlayer())
-	{
-		componentsName = _P("components-sp.json");
-	}
-
-	if (Is372())
-	{
-		componentsName = _P("components-sp372.json");
-	}
-
 	FILE* componentCache = _pfopen(MakeRelativeCitPath(componentsName).c_str(), _P("rb"));
 	if (!componentCache)
 	{
@@ -106,17 +96,103 @@ void ComponentLoader::Initialize()
 		// don't load some useless stuff for ChromeBrowser
 		if (wcsstr(moduleName, L"ChromeBrowser"))
 		{
-			if (nameWide != L"nui-core" && nameWide != L"vfs-core" && nameWide != L"http-client")
+			if (nameWide != L"nui-core" && nameWide != L"vfs-core")
+			{
+				continue;
+			}
+		}
+
+#ifndef IS_FXSERVER
+		std::vector<std::wstring> neededComponentsList;
+
+#ifdef GTA_FIVE
+		if (wcsstr(moduleName, L"_ROS"))
+		{
+			neededComponentsList = {
+				L"ros-patches-five",
+				L"net-http-server",
+				L"net-tcp-server",
+				L"net-base",
+			};
+		}
+#endif
+
+		// don't load some useless stuff for FXNode as well
+		if (launch::IsFXNode())
+		{
+			neededComponentsList = {
+				L"citizen-scripting-v8node",
+				L"citizen-scripting-core",
+				L"citizen-resources-core",
+				L"scripting-gta",
+				L"rage-scripting-five",
+				L"rage-allocator-five",
+				L"http-client",
+				L"citizen-scripting-core",
+				L"conhost-v2",
+				L"vfs-core",
+				L"net-tcp-server",
+				L"net-base",
+			};
+		}
+
+		if (!neededComponentsList.empty())
+		{
+			bool wantThisComponent = false;
+
+			for (auto& componentName : neededComponentsList)
+			{
+				if (nameWide == componentName)
+				{
+					wantThisComponent = true;
+					break;
+				}
+			}
+
+			if (!wantThisComponent)
 			{
 				continue;
 			}
 		}
 #endif
+#endif
 
 #ifndef IS_FXSERVER
-		if (nameWide == L"adhesive" && (launch::IsSDK() || launch::IsSDKGuest()))
+		if (nameWide == L"adhesive")
 		{
-			continue;
+			if (launch::IsSDK() || launch::IsSDKGuest())
+			{
+				continue;
+			}
+
+			if (CfxIsWine() || GetModuleHandleW(L"xtajit64.dll") != nullptr)
+			{
+				auto cfxState = CfxState::Get();
+				if (cfxState->IsMasterProcess())
+				{
+					std::wstring environmentType;
+
+					if (CfxIsWine())
+					{
+						environmentType = L"Wine";
+					}
+					else if (GetModuleHandleW(L"xtajit64.dll") != nullptr)
+					{
+						environmentType = L"Windows on ARM";
+					}
+
+					MessageBoxW(NULL, 
+						va(
+							L"The game is running in insecure mode because %s is not supported by the anti-cheat components at this time.\n"
+							L"Most servers, as well as some authentication features will be unavailable.",
+							environmentType),
+						L"Cfx.re: Insecure mode", MB_OK | MB_ICONWARNING);
+				}
+
+				AddComponent(new DllGameComponent(va(PLATFORM_LIBRARY_STRING, L"sticky")));
+
+				continue;
+			}
 		}
 #endif
 
@@ -244,7 +320,15 @@ fwRefContainer<ComponentData> ComponentLoader::LoadComponent(const char* compone
 
 	if (!component.GetRef())
 	{
-		FatalError("Unknown component %s.", componentName);
+		if (strcmp(componentName, "adhesive") == 0)
+		{
+			component = m_knownComponents["sticky"];
+		}
+
+		if (!component.GetRef())
+		{
+			FatalError("Unknown component %s.", componentName);
+		}
 	}
 
 	if (component->IsLoaded())

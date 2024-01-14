@@ -15,6 +15,8 @@
 
 #include <concurrent_queue.h>
 
+#include <wrl.h>
+
 enum NUIPaintType
 {
 	NUIPaintTypeDummy,
@@ -39,9 +41,11 @@ private:
 	concurrency::concurrent_queue<std::function<void()>> m_onLoadQueue;
 
 public:
-	NUIWindow(bool primary, int width, int height);
+	NUIWindow(bool primary, int width, int height, const std::string& windowContext);
 
 private:
+	std::string m_windowContext;
+
 	bool m_rawBlit;
 	int m_width;
 	int m_height;
@@ -54,7 +58,7 @@ private:
 
 	unsigned long m_dirtyFlag;
 	RECT m_lastDirtyRect;
-	CRITICAL_SECTION m_renderBufferLock;
+	std::shared_mutex m_renderBufferLock;
 	char* m_renderBuffer;
 
 	std::queue<CefRect> m_dirtyRects;
@@ -71,11 +75,11 @@ private:
 
 	std::map<CefRenderHandler::PaintElementType, fwRefContainer<nui::GITexture>> m_parentTextures;
 
-	ID3D11Texture2D* m_swapTexture;
+	Microsoft::WRL::ComPtr<ID3D11Texture2D> m_swapTexture;
 
-	ID3D11RenderTargetView* m_swapRtv;
+	Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_swapRtv;
 
-	ID3D11ShaderResourceView* m_swapSrv;
+	Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_swapSrv;
 
 	std::map<CefRenderHandler::PaintElementType, HANDLE> m_lastParentHandle;
 
@@ -89,10 +93,17 @@ public:
 	inline int		GetWidth() { return m_width; }
 	inline int		GetHeight() { return m_height; }
 
+	inline auto GetRenderBufferLock()
+	{
+		return std::unique_lock{ m_renderBufferLock };
+	}
+
 	inline void*	GetRenderBuffer() { return m_renderBuffer; }
 	inline int		GetRoundedWidth() { return m_roundedWidth; }
 
 	void TouchMessage();
+
+	void InitializeRenderBacking();
 
 	inline const std::string& GetName()
 	{
@@ -133,19 +144,19 @@ public:
 	inline void		MarkRenderBufferDirty() { InterlockedIncrement(&m_dirtyFlag); }
 
 public:
-	static fwRefContainer<NUIWindow> Create(bool primary, int width, int height, CefString url, bool instant);
+	static fwRefContainer<NUIWindow> Create(bool primary, int width, int height, CefString url, bool instant, const std::string& context = {});
 
 	void DeferredCreate();
 
 private:
 	CefString m_initUrl;
 
+	bool m_isMuted = false;
+
 public:
 	~NUIWindow();
 
 	void UpdateFrame();
-
-	void SendBeginFrame();
 
 	void Invalidate();
 
@@ -194,12 +205,11 @@ public:
 		m_parentTextures[type] = texture;
 	}
 
-	inline const CefRect& GetPopupRect()
-	{
-		return m_popupRect;
-	}
+	CefRect GetPopupRect();
 
 	void SetPopupRect(const CefRect& rect);
 
 	void HandlePopupShow(bool show);
+
+	bool IsFixedSizeWindow() const;
 };

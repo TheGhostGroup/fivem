@@ -9,14 +9,14 @@
 
 #include <numeric>
 
-#include <pgBase.h>
-#include <pgContainers.h>
+#include "pgBase.h"
+#include "pgContainers.h"
 //#include <grcTexture.h>
 
 #include <DirectXMath.h>
 
 #define RAGE_FORMATS_FILE rmcDrawable
-#include <formats-header.h>
+#include "formats-header.h"
 
 #ifdef RAGE_FORMATS_OK
 #if defined(RAGE_FORMATS_GAME_NY)
@@ -36,6 +36,26 @@ inline void ValidateSize()
 {
 	static_assert(Size == ActualSize, "Invalid size.");
 }
+
+#if defined(RAGE_FORMATS_GAME_RDR3)
+// rage::sga::ShaderResourceView
+struct sgaShaderResourceView : public pgStreamableBase
+{
+	char stuff[64];
+
+	sgaShaderResourceView()
+	{
+		static unsigned char hexData[64] = {
+			0x80, 0x00, 0x91, 0x40, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+		};
+
+		memcpy(stuff, hexData, 64);
+	}
+};
+#endif
 
 enum sgaBufferFormat : uint8_t
 {
@@ -351,7 +371,7 @@ public:
 
 	inline size_t GetDataSize()
 	{
-		size_t levelSize = GetStride() * m_height;
+		size_t levelSize = static_cast<size_t>(GetStride()) * m_height;
 		size_t size = 0;
 
 		for (int i = 0; i < m_levels; i++)
@@ -508,6 +528,7 @@ static uint32_t GetHashMapCount(int nHashes)
 		return 65521;
 }
 
+#pragma pack(push, 1)
 template<typename TEntry>
 class pgHashMap
 {
@@ -557,7 +578,7 @@ public:
 			auto hentry = new (false) HashEntry();
 			hentry->hash = entry.first;
 			hentry->data = entry.second;
-			hentry->next = bucketList[bucketIdx];
+			hentry->next = *bucketList[bucketIdx];
 
 			bucketList[bucketIdx] = hentry;
 		}
@@ -566,6 +587,7 @@ public:
 		m_initialized = true;
 	}
 };
+#pragma pack(pop)
 
 enum crBoneFlags : uint16_t
 {
@@ -639,7 +661,7 @@ public:
 
 	inline void Init(const char* name, int16_t index, crBoneFlags flags, Vector4 rotation, Vector3 scale, Vector3 translation, int16_t parentIndex = -1, int16_t siblingIndex = -1)
 	{
-		m_name = name ? strdup(name) : strdup("Root");
+		m_name = name ? pgStreamManager::StringDup(name) : pgStreamManager::StringDup("Root");
 		m_tag = name ? atHash16(name) : 0;
 		m_index = index;
 		m_index2 = index;
@@ -695,6 +717,12 @@ class crBoneData
 	crBone m_bones[0];
 
 public:
+	crBone& GetStart()
+	{
+		return m_bones[0];
+	}
+
+
 	static inline crBoneData* Create(uint32_t boneCount, const crBone* bones)
 	{
 		auto dataRef = (crBoneData*)pgStreamManager::Allocate(sizeof(crBoneData) + sizeof(crBone) * boneCount, false, nullptr);
@@ -729,7 +757,7 @@ class crSkeletonData : public pgBase
 {
 #if defined(RAGE_FORMATS_GAME_FIVE)
 	pgHashMap<int> m_boneTags;
-	pgPtr<crBoneData> m_bones;
+	pgPtr<crBone> m_bones;
 	pgPtr<dMatrix3x4> m_inverseMats;
 	pgPtr<dMatrix3x4> m_mats;
 	pgPtr<uint16_t> m_parentIndices;
@@ -755,7 +783,7 @@ public:
 		m_unk_58 = 65978143;
 
 		m_pad = 0;
-		m_usageCount = 0;
+		m_usageCount = 1;
 		m_pad_62 = 0;
 		m_pad_64 = 0;
 		m_pad_68 = 0;
@@ -763,7 +791,8 @@ public:
 
 	inline void SetBones(uint32_t boneCount, const crBone* bones)
 	{
-		m_bones = crBoneData::Create(boneCount, bones);
+		auto boneData = crBoneData::Create(boneCount, bones);
+		m_bones = &boneData->GetStart();
 		m_boneCount = boneCount;
 
 		// create indices
@@ -988,7 +1017,7 @@ private:
 	uint8_t m_pad;
 	uint8_t m_type;
 	uint16_t m_pad2;
-#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
+#if defined(RAGE_FORMATS_GAME_FIVE)
 	uint32_t m_pad3;
 #endif
 #endif
@@ -1086,6 +1115,7 @@ public:
 #if defined(RAGE_FORMATS_GAME_RDR3)
 class sgaShaderParamName
 {
+public:
 	uint32_t hash;
 	
 	union
@@ -1163,7 +1193,9 @@ public:
 	pgPtr<sgaShaderParamData> m_parameterData;
 	uintptr_t m_pad2;
 	uintptr_t m_pad3;
-	uint8_t m_unk[4];
+	uint8_t m_unk;
+	uint8_t m_drawBucket;
+	uint16_t m_parameterDataSize;
 	uint32_t m_drawBucketMask;
 #endif
 
@@ -1545,9 +1577,9 @@ private:
 	pgObjectArray<int> _f38;
 	pgArray<uint32_t> m_vertexFormats;
 	pgArray<uint32_t> m_shaderIndices;
-#elif defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE)|| defined(RAGE_FORMATS_GAME_RDR3)
+#elif defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE) || defined(RAGE_FORMATS_GAME_RDR3)
 	pgObjectArray<int> _f20;
-	uint32_t _f30;
+	TPtr _f30;
 	TPtr _f38;
 #endif
 
@@ -1663,7 +1695,7 @@ public:
 	pgPtr<uint16_t, PHYSICAL_VERTICES> m_indexData;
 	uintptr_t m_pad;
 	uintptr_t m_pad2;
-	pgPtr<void> m_unkBuffer;
+	pgPtr<sgaShaderResourceView> m_srv;
 #endif
 
 public:
@@ -1893,7 +1925,7 @@ public:
 	pgPtr<void> m_vertexData;
 	uintptr_t m_pad;
 	uintptr_t m_pad2;
-	pgPtr<void> m_unkBuffer;
+	pgPtr<sgaShaderResourceView> m_srv;
 	pgPtr<sgaInputLayout> m_vertexFormat;
 #endif
 
@@ -1947,14 +1979,14 @@ public:
 		}
 		else
 		{
-			void* vertexDataBit = pgStreamManager::Allocate(vertexCount * vertexStride, PHYSICAL_VERTICES, nullptr);
+			void* vertexDataBit = pgStreamManager::Allocate(static_cast<size_t>(vertexCount) * vertexStride, PHYSICAL_VERTICES, nullptr);
 
 			m_vertexData = vertexDataBit;
 
 #ifdef RAGE_FORMATS_GAME_FIVE
 			m_lockedData = vertexDataBit;
 #endif
-			memcpy(*m_vertexData, vertexData, vertexCount * vertexStride);
+			memcpy(*m_vertexData, vertexData, static_cast<size_t>(vertexCount) * vertexStride);
 		}
 	}
 #else
@@ -1978,7 +2010,7 @@ public:
 
 			m_vertexData = vertexDataBit;
 
-			memcpy(*m_vertexData, vertexData, vertexCount * vertexStride);
+			memcpy(*m_vertexData, vertexData, static_cast<size_t>(vertexCount) * vertexStride);
 		}
 	}
 
@@ -2482,6 +2514,16 @@ public:
 		return m_models[idx]->Get(0);
 	}
 
+	inline auto GetLod(int idx)
+	{
+		if (idx < 0 || idx >= _countof(m_models))
+		{
+			abort();
+		}
+
+		return *m_models[idx];
+	}
+
 	inline pgObjectArray<grmModel>* GetPrimaryModel()
 	{
 		return *m_models[0];
@@ -2516,6 +2558,40 @@ public:
 		models[0] = model;
 
 		m_models[idx] = new(false) pgObjectArray<grmModel>(models, 1);
+	}
+
+	inline void SetLod(int idx, grmModel** inModels, size_t numModels)
+	{
+		if (idx < 0 || idx >= _countof(m_models))
+		{
+			abort();
+		}
+
+		if (inModels == nullptr)
+		{
+			m_models[idx] = nullptr;
+			return;
+		}
+
+		pgPtr<grmModel> models[64];
+		assert(numModels < std::size(models));
+
+		for (size_t i = 0; i < numModels; i++)
+		{
+			models[i] = inModels[i];
+		}
+
+		m_models[idx] = new (false) pgObjectArray<grmModel>(models, numModels);
+	}
+
+	inline int GetDrawBucketMask(int idx)
+	{
+		if (idx < 0 || idx >= _countof(m_models))
+		{
+			abort();
+		}
+
+		return m_drawBucketMask[idx];
 	}
 
 	inline void SetDrawBucketMask(int idx, int mask)
@@ -2606,4 +2682,4 @@ public:
 };
 #endif
 
-#include <formats-footer.h>
+#include "formats-footer.h"

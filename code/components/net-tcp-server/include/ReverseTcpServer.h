@@ -67,12 +67,14 @@ private:
 
 	void Reconnect();
 
-private:
-	TcpServerManager* m_manager;
+	void ReconnectWithPeer(const net::PeerAddress& peer);
 
+private:
 	std::shared_ptr<uvw::TimerHandle> m_reconnectTimer;
 
 	std::shared_ptr<uvw::TCPHandle> m_control;
+
+	std::shared_ptr<uvw::GetAddrInfoReq> m_addr;
 
 	std::shared_ptr<uvw::Loop> m_loop;
 

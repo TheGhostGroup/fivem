@@ -12,6 +12,35 @@
 
 static google_breakpad::ExceptionHandler* g_exceptionHandler;
 
+using namespace google_breakpad;
+
+namespace google_breakpad
+{
+class AutoExceptionHandler
+{
+public:
+	static LONG HandleException(EXCEPTION_POINTERS* exinfo)
+	{
+		if (!g_exceptionHandler)
+		{
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+
+		return ExceptionHandler::HandleException(exinfo);
+	}
+};
+}
+
+void InitializeMiniDumpOverride()
+{
+	auto CoreSetExceptionOverride = (void (*)(LONG(*)(EXCEPTION_POINTERS*)))GetProcAddress(GetModuleHandle(L"CoreRT.dll"), "CoreSetExceptionOverride");
+
+	if (CoreSetExceptionOverride)
+	{
+		CoreSetExceptionOverride(AutoExceptionHandler::HandleException);
+	}
+}
+
 static DWORD BeforeTerminateHandler(LPVOID arg)
 {
 	__try
@@ -42,8 +71,6 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 	static bool g_running = true;
 
 	HANDLE inheritedHandleBit = (HANDLE)inheritedHandle;
-	static HANDLE parentProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE | PROCESS_CREATE_THREAD | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | SYNCHRONIZE, FALSE, parentPid);
-
 	static std::wstring crashDirectory = MakeRelativeCitPath(L"crashes");
 
 	CrashGenerationServer::OnClientConnectedCallback connectCallback = [](void*, const ClientInfo* info)
@@ -124,18 +151,18 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 			std::string friendlyReason = "Server crashed.";
 
 			// try to send the clients a bit of a obituary notice
-			LPVOID memPtr = VirtualAllocEx(parentProcess, NULL, friendlyReason.size() + 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+			LPVOID memPtr = VirtualAllocEx(client->process_handle(), NULL, friendlyReason.size() + 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 
 			if (memPtr)
 			{
-				WriteProcessMemory(parentProcess, memPtr, friendlyReason.data(), friendlyReason.size() + 1, NULL);
+				WriteProcessMemory(client->process_handle(), memPtr, friendlyReason.data(), friendlyReason.size() + 1, NULL);
 			}
 
 			// we assume that (since unlike the game, we enable ASLR), as both processes are usually created around the same time, that we'll be the same binary
 			// and have the same ASLR location. this might need some better logic in the future if this turns out to not be the case.
 			//
 			// however, if it isn't - the target will just crash again.
-			HANDLE hThread = CreateRemoteThread(parentProcess, NULL, 0, BeforeTerminateHandler, memPtr, 0, NULL);
+			HANDLE hThread = CreateRemoteThread(client->process_handle(), NULL, 0, BeforeTerminateHandler, memPtr, 0, NULL);
 
 			if (hThread)
 			{
@@ -144,7 +171,7 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 			}
 		}
 
-		DebugActiveProcess(GetProcessId(parentProcess));
+		DebugActiveProcess(GetProcessId(client->process_handle()));
 
 		printf("\n\n=================================================================\n\x1b[31mFXServer crashed.\x1b[0m\nA dump can be found at %s.\n", ToNarrow(dumpPath).c_str());
 
@@ -166,9 +193,9 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 
 		printf("=================================================================\n");
 
-		DebugActiveProcessStop(GetProcessId(parentProcess));
+		DebugActiveProcessStop(GetProcessId(client->process_handle()));
 
-		TerminateProcess(parentProcess, -2);
+		TerminateProcess(client->process_handle(), -2);
 	};
 
 	CrashGenerationServer::OnClientExitedCallback exitCallback = [](void*, const ClientInfo* info)
@@ -181,6 +208,8 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 	};
 
 	std::wstring pipeName = L"\\\\.\\pipe\\CitizenFX_Server_Dump";
+
+	static HANDLE parentProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE | PROCESS_CREATE_THREAD | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | SYNCHRONIZE, FALSE, parentPid);
 
 	CrashGenerationServer server(pipeName, nullptr, connectCallback, nullptr, dumpCallback, nullptr, exitCallback, nullptr, uploadCallback, nullptr, false, &crashDirectory);
 	if (server.Start())
@@ -356,6 +385,11 @@ void InitializeDumpServer(int serverFd, int pipeFd)
 	}
 }
 
+#include <elf.h>
+#include <link.h>
+#include <sys/auxv.h>
+
+extern "C" int __ehdr_start;
 
 bool InitializeExceptionHandler(int argc, char* argv[])
 {
@@ -406,10 +440,11 @@ bool InitializeExceptionHandler(int argc, char* argv[])
 
 	if (access("/lib/ld-musl-x86_64.so.1", F_OK) != -1)
 	{
-		args.resize(argc + 3);
-		memcpy(args.data(), argv, argc * sizeof(char*));
-		args[argc] = strdup(va("-dumpserver:%d", server_fd));
-		args[argc + 1] = strdup(va("-parentppe:%d", fds[1]));
+		args.resize(3);
+		args[0] = strdup(MakeRelativeCitPath(L"FXServer").c_str());
+		args[1] = strdup(va("-dumpserver:%d", server_fd));
+		args[2] = strdup(va("-parentppe:%d", fds[1]));
+		args.push_back(nullptr);
 	}
 	else
 	{
@@ -417,6 +452,82 @@ bool InitializeExceptionHandler(int argc, char* argv[])
 		args.push_back(strdup(va("-dumpserver:%d", server_fd)));
 		args.push_back(strdup(va("-parentppe:%d", fds[1])));
 		args.push_back(nullptr);
+	}
+
+	// move our DT_DEBUG on top of the ldso's DT_DEBUG
+	ElfW(Phdr)* phdr = reinterpret_cast<ElfW(Phdr)*>(getauxval(AT_PHDR));
+	char* base;
+	int phnum = getauxval(AT_PHNUM);
+	if (phnum && phdr)
+	{
+		// Assume the program base is at the beginning of the same page as the PHDR
+		base = reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(phdr) & ~0xfff);
+		auto base_src = (char*)&__ehdr_start;
+
+		// Search for the program PT_DYNAMIC segment
+		ElfW(Addr) dyn_addr = 0;
+		for (; phnum >= 0; phnum--, phdr++)
+		{
+			// Adjust base address with the virtual address of the PT_LOAD segment
+			// corresponding to offset 0
+			if (phdr->p_type == PT_LOAD && phdr->p_offset == 0)
+				base -= phdr->p_vaddr;
+			if (phdr->p_type == PT_DYNAMIC)
+				dyn_addr = phdr->p_vaddr;
+		}
+
+		ElfW(Ehdr)* ehdr = (ElfW(Ehdr)*)base_src;
+
+		phdr = (ElfW(Phdr)*)(base_src + ehdr->e_phoff);
+		ElfW(Addr) dyn_addr_src = 0;
+		int e_phnum = ehdr->e_phnum;
+
+		for (; e_phnum >= 0; e_phnum--, phdr++)
+		{
+			// Adjust base address with the virtual address of the PT_LOAD segment
+			// corresponding to offset 0
+			if (phdr->p_type == PT_DYNAMIC)
+				dyn_addr_src = phdr->p_vaddr;
+		}
+
+		if (dyn_addr && dyn_addr_src)
+		{
+			ElfW(Dyn)* dynamic = reinterpret_cast<ElfW(Dyn)*>(dyn_addr + base);
+			ElfW(Dyn)* dynamic_src = reinterpret_cast<ElfW(Dyn)*>(dyn_addr_src + base_src);
+
+			ElfW(Dyn)* tgtDyn = NULL;
+
+			for (int i = 0;; i++)
+			{
+				if (dynamic[i].d_tag == DT_BIND_NOW)
+				{
+					tgtDyn = &dynamic[i];
+					continue;
+				}
+				else if (dynamic[i].d_tag == DT_NULL)
+				{
+					break;
+				}
+			}
+
+			for (int i = 0;; i++)
+			{
+				if (dynamic_src[i].d_tag == DT_DEBUG)
+				{
+					if (tgtDyn)
+					{
+						mprotect((void*)tgtDyn, sizeof(void*) * 2, PROT_READ | PROT_WRITE);
+						*tgtDyn = dynamic_src[i];
+					}
+
+					continue;
+				}
+				else if (dynamic_src[i].d_tag == DT_NULL)
+				{
+					break;
+				}
+			}
+		}
 	}
 
 	posix_spawn(nullptr, args[0], nullptr, nullptr, args.data(), nullptr);

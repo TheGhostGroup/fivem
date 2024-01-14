@@ -12,12 +12,18 @@
 #include "CefImeHandler.h"
 #include "NUIRenderHandler.h"
 
+#include <HostSharedData.h>
+#include <ReverseGameData.h>
+
 #include <windowsx.h>
+#include <console/Console.VariableHelpers.h>
+
+using nui::HasFocus;
 
 extern nui::GameInterface* g_nuiGi;
 
 static bool g_hasFocus = false;
-bool g_hasCursor = false;
+static bool g_hasCursor = false;
 bool g_keepInput = false;
 static bool g_hasOverriddenFocus = false;
 extern bool g_mainUIFlag;
@@ -28,37 +34,84 @@ bool isKeyDown(WPARAM wparam)
 	return (GetKeyState(wparam) & 0x8000) != 0;
 }
 
-bool HasFocus()
-{
-	return (g_hasFocus || g_hasOverriddenFocus);
-}
-
 #include <shared_mutex>
-
-#ifdef USE_NUI_ROOTLESS
-std::shared_mutex g_nuiFocusStackMutex;
-std::list<std::string> g_nuiFocusStack;
-#endif
 
 static CefRefPtr<CefBrowser> GetFocusBrowser()
 {
-#ifdef USE_NUI_ROOTLESS
-	std::shared_lock<std::shared_mutex> lock(g_nuiFocusStackMutex);
+	return nui::GetBrowser();
+}
 
-	for (const auto& entry : g_nuiFocusStack)
+static fwRefContainer<NUIWindow> GetFocusWindow()
+{
+	return nui::GetWindow();
+}
+
+struct ScaleInfo
+{
+	double outX = 0.0;
+	double outY = 0.0;
+
+	double offsetX = 0.0;
+	double offsetY = 0.0;
+};
+
+static ScaleInfo
+GetWindowScaleInfo(const fwRefContainer<NUIWindow>& window)
+{
+	int targetX, targetY;
+	g_nuiGi->GetGameResolution(&targetX, &targetY);
+
+	int sourceX = window->GetWidth();
+	int sourceY = window->GetHeight();
+
+	double targetAspect = (double)targetX / targetY;
+	double sourceAspect = (double)sourceX / sourceY;
+
+	double offsetX = 0.0, offsetY = 0.0;
+	double outX = targetX, outY = targetY;
+
+	if (targetAspect > sourceAspect)
 	{
-		auto browser = nui::GetNUIWindowBrowser(entry);
+		outX = targetY * sourceAspect;
+		outY = targetY;
 
-		if (browser)
-		{
-			return browser;
-		}
+		offsetX = (targetX - outX) / 2.0;
+	}
+	else if (targetAspect < sourceAspect)
+	{
+		outX = targetX;
+		outY = targetX / sourceAspect;
+
+		offsetY = (targetY - outY) / 2.0;
 	}
 
-	return {};
-#else
-	return nui::GetBrowser();
-#endif
+	return {
+		outX, outY, offsetX, offsetY
+	};
+}
+
+void TranslateWindowRect(const fwRefContainer<NUIWindow>& window, CRect* rect)
+{
+	auto scale = GetWindowScaleInfo(window);
+	*rect = CRect(scale.offsetX, scale.offsetY + scale.outY, scale.offsetX + scale.outX, scale.offsetY);
+}
+
+template<typename T>
+static bool TranslateMouseEvent(const fwRefContainer<NUIWindow>& window, T* x, T* y)
+{
+	if (window.GetRef() && window->IsFixedSizeWindow())
+	{
+		int sourceX = window->GetWidth();
+		int sourceY = window->GetHeight();
+
+		auto scale = GetWindowScaleInfo(window);
+		*x = (T)(((*x - scale.offsetX) / scale.outX) * sourceX);
+		*y = (T)(((*y - scale.offsetY) / scale.outY) * sourceY);
+
+		return true;
+	}
+
+	return false;
 }
 
 namespace nui
@@ -69,6 +122,21 @@ namespace nui
 	}
 
 	extern fwRefContainer<NUIWindow> FindNUIWindow(fwString windowName);
+
+	bool HasFocus()
+	{
+		return (g_hasFocus || g_hasOverriddenFocus);
+	}
+
+	bool HasCursor()
+	{
+		return HasMainUI() || g_hasCursor;
+	}
+
+	bool HasFocusKeepInput()
+	{
+		return g_keepInput;
+	}
 
 	void GiveFocus(const std::string& frameName, bool hasFocus, bool hasCursor)
 	{
@@ -83,82 +151,6 @@ namespace nui
 
 		g_hasFocus = hasFocus;
 		g_hasCursor = hasCursor;
-
-#ifdef USE_NUI_ROOTLESS
-		auto winName = fmt::sprintf("nui_%s", frameName);
-
-		auto browser = nui::GetNUIWindowBrowser(winName);
-		auto window = FindNUIWindow(winName);
-
-		if (hasFocus)
-		{
-			// deferred-create the window if it's given focus, too
-			if (window.GetRef())
-			{
-				if (!window->GetBrowser())
-				{
-					window->DeferredCreate();
-				}
-			}
-
-			static std::string oldDD;
-			std::unique_lock<std::shared_mutex> lock(g_nuiFocusStackMutex);
-
-			// remove from focus stack so it can be moved on top
-			for (auto it = g_nuiFocusStack.begin(); it != g_nuiFocusStack.end();)
-			{
-				if (*it == winName)
-				{
-					it = g_nuiFocusStack.erase(it);
-				}
-				else
-				{
-					++it;
-				}
-			}
-
-			g_nuiFocusStack.push_front(winName);
-
-			if (oldDD != g_nuiFocusStack.front())
-			{
-				if (browser)
-				{
-					auto rh = browser->GetHost()->GetClient()->GetRenderHandler();
-					NUIRenderHandler* nrh = (NUIRenderHandler*)rh.get();
-
-					RevokeDragDrop(g_nuiGi->GetHWND());
-					
-					HRESULT hr = RegisterDragDrop(g_nuiGi->GetHWND(), nrh->GetDropTarget());
-					if (FAILED(hr))
-					{
-						trace("registering drag/drop failed. hr: %08x\n", hr);
-					}
-				}
-			}
-		}
-		else
-		{
-			RevokeDragDrop(g_nuiGi->GetHWND());
-		}
-
-		if (browser)
-		{
-			browser->GetHost()->SetFocus(hasFocus);
-		}
-		else
-		{
-			if (window.GetRef())
-			{
-				window->PushLoadQueue([window, hasFocus]()
-				{
-					if (window->GetBrowser())
-					{
-						window->GetBrowser()->GetHost()->SetFocus(hasFocus);
-					}
-				});
-			}
-		}
-#endif
 	}
 
 	void OverrideFocus(bool hasFocus)
@@ -173,6 +165,13 @@ namespace nui
 		}
 
 		g_hasOverriddenFocus = hasFocus;
+
+		static ConVar<bool> uiLoadingCursor("ui_loadingCursor", ConVar_None, false);
+
+		if (uiLoadingCursor.GetValue())
+		{
+			g_hasCursor = hasFocus;
+		}
 	}
 
 	void KeepInput(bool keepInput)
@@ -364,19 +363,51 @@ static HookFunction initFunction([] ()
 	{
 		void KeyEvent(UINT vKey, UINT scanCode, bool down)
 		{
+			static HostSharedData<ReverseGameData> rgd("CfxReverseGameData");
+
+			auto browser = GetFocusBrowser();
+			if (!browser)
+			{
+				return;
+			}
+
 			CefKeyEvent keyEvent;
 
 			keyEvent.windows_key_code = vKey;
 			keyEvent.native_key_code = scanCode;
 			keyEvent.modifiers = GetCefKeyboardModifiers(vKey, scanCode);
-			keyEvent.type = (down) ? KEYEVENT_RAWKEYDOWN : KEYEVENT_KEYUP;
 
-			auto browser = GetFocusBrowser();
-
-			if (browser)
+			if (down)
 			{
-				browser->GetHost()->SendKeyEvent(keyEvent);
+				keyEvent.type = KEYEVENT_RAWKEYDOWN;
+
+				if (vKey == VK_RETURN && launch::IsSDKGuest())
+				{
+					keyEvent.character = '\r';
+					keyEvent.unmodified_character = '\r';
+					
+					browser->GetHost()->SendKeyEvent(keyEvent);
+
+					keyEvent.type = KEYEVENT_CHAR;
+				}
+
+				if (rgd->inputChar)
+				{
+					keyEvent.character = rgd->inputChar;
+					keyEvent.unmodified_character = rgd->inputChar;
+
+					browser->GetHost()->SendKeyEvent(keyEvent);
+
+					keyEvent.windows_key_code = rgd->inputChar;
+					keyEvent.type = KEYEVENT_CHAR;
+				}
 			}
+			else
+			{
+				keyEvent.type = KEYEVENT_KEYUP;
+			}
+
+			browser->GetHost()->SendKeyEvent(keyEvent);
 		}
 
 		void MouseEvent(int button, int x, int y, bool down)
@@ -390,6 +421,8 @@ static HookFunction initFunction([] ()
 
 			LONG currentTime = 0;
 			bool cancelPreviousClick = false;
+
+			TranslateMouseEvent(GetFocusWindow(), &x, &y);
 
 			lastX = x;
 			lastY = y;
@@ -493,14 +526,22 @@ static HookFunction initFunction([] ()
 
 		virtual void MouseWheel(int deltaY) override
 		{
+			MouseWheel(double(deltaY));
+		}
+
+		void MouseWheel(double deltaY)
+		{
 			auto browser = GetFocusBrowser();
 
 			if (browser) {
-				int delta = deltaY * 120;
+				int delta = int(deltaY * 120);
+
+				int x = lastX, y = lastY;
+				TranslateMouseEvent(GetFocusWindow(), &x, &y);
 
 				CefMouseEvent mouse_event;
-				mouse_event.x = lastX;
-				mouse_event.y = lastY;
+				mouse_event.x = x;
+				mouse_event.y = y;
 				mouse_event.modifiers = GetCefMouseModifiers();
 
 				browser->GetHost()->SendMouseWheelEvent(mouse_event,
@@ -527,7 +568,7 @@ static HookFunction initFunction([] ()
 		{
 			if (HasFocus() != g_lastFocus)
 			{
-				browser->GetHost()->SendFocusEvent(HasFocus());
+				browser->GetHost()->SetFocus(HasFocus());
 			}
 
 			g_lastFocus = HasFocus();
@@ -568,7 +609,7 @@ static HookFunction initFunction([] ()
 		{
 			if (HasFocus() != g_lastFocus)
 			{
-				browser->GetHost()->SendFocusEvent(HasFocus());
+				browser->GetHost()->SetFocus(HasFocus());
 			}
 
 			g_lastFocus = HasFocus();
@@ -583,8 +624,34 @@ static HookFunction initFunction([] ()
 
 			static bool mouseTracking;
 
+			auto suppressInput = [&lresult, &pass](LRESULT result = FALSE)
+			{
+				if (!g_keepInput)
+				{
+					lresult = result;
+					pass = false;
+				}
+			};
+
 			switch (msg)
 			{
+			case WM_XBUTTONUP: {
+				auto button = GET_XBUTTON_WPARAM(wParam);
+				auto browser = GetFocusBrowser();
+
+				// we have a MainUI check here so that behavior for *existing* code doesn't change
+				if (browser && nui::HasMainUI())
+				{
+					if (button == XBUTTON1 && browser->CanGoBack())
+					{
+						browser->GoBack();
+					}
+					else if (button == XBUTTON2 && browser->CanGoForward())
+					{
+						browser->GoForward();
+					}
+				}
+			} break;
 			case WM_LBUTTONDOWN:
 			case WM_RBUTTONDOWN:
 			case WM_MBUTTONDOWN:
@@ -599,11 +666,7 @@ static HookFunction initFunction([] ()
 				
 				inputTarget.MouseEvent(btnType, x, y, true);
 
-				if (!g_keepInput)
-				{
-					pass = false;
-					lresult = FALSE;
-				}
+				suppressInput();
 			} break;
 
 			case WM_LBUTTONUP:
@@ -617,11 +680,7 @@ static HookFunction initFunction([] ()
 
 				inputTarget.MouseEvent(btnType, x, y, false);
 
-				if (!g_keepInput)
-				{
-					pass = false;
-					lresult = FALSE;
-				}
+				suppressInput();
 
 				break;
 			}
@@ -641,11 +700,7 @@ static HookFunction initFunction([] ()
 
 				inputTarget.MouseEvent(-1, x, y, true);
 
-				if (!g_keepInput)
-				{
-					pass = false;
-					lresult = FALSE;
-				}
+				suppressInput();
 				break;
 			}
 
@@ -668,6 +723,8 @@ static HookFunction initFunction([] ()
 					::GetCursorPos(&p);
 					::ScreenToClient(hWnd, &p);
 
+					TranslateMouseEvent(GetFocusWindow(), &p.x, &p.y);
+
 					CefMouseEvent mouse_event;
 					mouse_event.x = p.x;
 					mouse_event.y = p.y;
@@ -675,36 +732,53 @@ static HookFunction initFunction([] ()
 					browser->GetHost()->SendMouseMoveEvent(mouse_event, true);
 				}
 
-				if (!g_keepInput)
-				{
-					pass = false;
-					lresult = FALSE;
-				}
+				suppressInput();
 			} break;
 
 			case WM_MOUSEWHEEL: {
-				inputTarget.MouseWheel(GET_WHEEL_DELTA_WPARAM(wParam) / 120);
+				int x = GET_X_LPARAM(lParam);
+				int y = GET_Y_LPARAM(lParam);
 
-				if (!g_keepInput)
+				POINT p = { x, y };
+				ScreenToClient(hWnd, &p);
+
+				if (TranslateMouseEvent(GetFocusWindow(), &p.x, &p.y))
 				{
-					pass = false;
-					lresult = FALSE;
+					ClientToScreen(hWnd, &p);
+
+					lParam &= ~((DWORD_PTR)0xFFFFFFFF);
+					lParam |= (DWORD)((p.x) | ((DWORD)p.y << 16));
 				}
+
+				MSG m = { hWnd,
+					msg,
+					wParam,
+					lParam,
+					static_cast<DWORD>(GetMessageTime()),
+					{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) } };
+
+				auto browser = GetFocusBrowser();
+
+				if (browser)
+				{
+					browser->GetHost()->SendMouseWheelEventNative(&m);
+				}
+
+				suppressInput();
 				break;
 			}
-			}
-
-			if (msg == WM_KEYUP || msg == WM_KEYDOWN)
+			case WM_KEYUP:
+			case WM_KEYDOWN:
+			case WM_SYSKEYUP: // needed for processing bare Alt presses
+			case WM_SYSKEYDOWN:
 			{
-				inputTarget.KeyEvent(wParam, lParam, (msg == WM_KEYDOWN));
+				inputTarget.KeyEvent(wParam, lParam, (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN));
 
-				if (!g_keepInput)
-				{
-					pass = false;
-					lresult = FALSE;
-				}
+				suppressInput();
+
+				break;
 			}
-			else if (msg == WM_CHAR)
+			case WM_CHAR:
 			{
 				CefKeyEvent keyEvent;
 
@@ -729,17 +803,20 @@ static HookFunction initFunction([] ()
 					browser->GetHost()->SendKeyEvent(keyEvent);
 				}
 
+				// #TODO: no g_keepInput check?
 				pass = false;
 				lresult = FALSE;
-				return;
+
+				break;
 			}
-			else if (msg == WM_INPUT && g_hasCursor && !g_keepInput)
-			{
-				pass = false;
-				lresult = TRUE;
-				return;
-			}
-			else if (msg == WM_IME_STARTCOMPOSITION)
+			case WM_INPUT:
+				if (g_hasCursor)
+				{
+					suppressInput(TRUE);
+				}
+
+				break;
+			case WM_IME_STARTCOMPOSITION:
 			{
 				if (g_imeHandler)
 				{
@@ -748,14 +825,11 @@ static HookFunction initFunction([] ()
 					g_imeHandler->ResetComposition();
 				}
 
-				if (!g_keepInput)
-				{
-					pass = false;
-					lresult = FALSE;
-				}
-				return;
+				suppressInput();
+
+				break;
 			}
-			else if (msg == WM_IME_SETCONTEXT)
+			case WM_IME_SETCONTEXT:
 			{
 				// We handle the IME Composition Window ourselves (but let the IME Candidates
 				// Window be handled by IME through DefWindowProc()), so clear the
@@ -764,30 +838,30 @@ static HookFunction initFunction([] ()
 				::DefWindowProc(hWnd, msg, wParam, lParam);
 
 				// Create Caret Window if required
-				if (g_imeHandler) {
+				if (g_imeHandler)
+				{
 					g_imeHandler->CreateImeWindow();
 					g_imeHandler->MoveImeWindow();
 				}
 
-				if (!g_keepInput)
-				{
-					pass = false;
-					lresult = FALSE;
-				}
-				return;
+				suppressInput();
+
+				break;
 			}
-			else if (msg == WM_IME_COMPOSITION)
+			case WM_IME_COMPOSITION:
 			{
 				auto browser = GetFocusBrowser();
 
-				if (browser && g_imeHandler) {
+				if (browser && g_imeHandler)
+				{
 					CefString cTextStr;
-					if (g_imeHandler->GetResult(lParam, cTextStr)) {
+					if (g_imeHandler->GetResult(lParam, cTextStr))
+					{
 						// Send the text to the browser. The |replacement_range| and
 						// |relative_cursor_pos| params are not used on Windows, so provide
 						// default invalid values.
 						browser->GetHost()->ImeCommitText(cTextStr,
-							CefRange(UINT32_MAX, UINT32_MAX), 0);
+						CefRange(UINT32_MAX, UINT32_MAX), 0);
 						g_imeHandler->ResetComposition();
 						// Continue reading the composition string - Japanese IMEs send both
 						// GCS_RESULTSTR and GCS_COMPSTR.
@@ -797,13 +871,14 @@ static HookFunction initFunction([] ()
 					int composition_start = 0;
 
 					if (g_imeHandler->GetComposition(lParam, cTextStr, underlines,
-						composition_start)) {
+						composition_start))
+					{
 						// Send the composition string to the browser. The |replacement_range|
 						// param is not used on Windows, so provide a default invalid value.
 						browser->GetHost()->ImeSetComposition(
-							cTextStr, underlines, CefRange(UINT32_MAX, UINT32_MAX),
-							CefRange(composition_start,
-								static_cast<int>(composition_start + cTextStr.length())));
+						cTextStr, underlines, CefRange(UINT32_MAX, UINT32_MAX),
+						CefRange(composition_start,
+						static_cast<int>(composition_start + cTextStr.length())));
 
 						// Update the Candidate Window position. The cursor is at the end so
 						// subtract 1. This is safe because IMM32 does not support non-zero-width
@@ -811,41 +886,33 @@ static HookFunction initFunction([] ()
 						// MoveImeWindow
 						g_imeHandler->UpdateCaretPosition(composition_start - 1);
 					}
-					else {
+					else
+					{
 						browser->GetHost()->ImeCancelComposition();
 						g_imeHandler->ResetComposition();
 						g_imeHandler->DestroyImeWindow();
 					}
 				}
 
-				if (!g_keepInput)
-				{
-					pass = false;
-					lresult = FALSE;
-				}
+				suppressInput();
 
-				return;
+				break;
 			}
-			else if (msg == WM_IME_ENDCOMPOSITION)
+			case WM_IME_ENDCOMPOSITION:
 			{
 				browser->GetHost()->ImeCancelComposition();
 				g_imeHandler->ResetComposition();
 				g_imeHandler->DestroyImeWindow();
 
-				if (!g_keepInput)
-				{
-					pass = false;
-					lresult = FALSE;
-				}
+				suppressInput();
 
-				return;
+				break;
 			}
-			else if ((msg == WM_IME_KEYLAST || msg == WM_IME_KEYDOWN || msg == WM_IME_KEYUP) && !g_keepInput)
-			{
-				pass = false;
-				lresult = false;
+			case WM_IME_KEYDOWN:
+			case WM_IME_KEYUP:
+				suppressInput();
 
-				return;
+				break;
 			}
 		}
 	});

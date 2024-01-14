@@ -5,35 +5,119 @@
 
 #include <CrossBuildRuntime.h>
 
+#include <openssl/sha.h>
+
+#if defined(GTA_FIVE) || defined(IS_RDR3)
+inline static uintptr_t GetLauncherTriggerEP()
+{
+	if (getenv("CitizenFX_ToolMode"))
+	{
+		if (wcsstr(GetCommandLineW(), L"launcher.exe"))
+		{
+			// launcher.exe with sha256 hash 0dbf58119cdd2d67e6ecee1e31be3f19827444df978f7df747064a870736bce4
+			return 0x14020b70c;
+		}
+	}
+
+	return 0;
+}
+#endif
+
 #ifdef GTA_FIVE
+inline uintptr_t GetTriggerEP()
+{
+	if (auto ep = GetLauncherTriggerEP(); ep != 0)
+	{
+		return ep;
+	}
+
+	if (Is372())
+	{
+		return 0x141623FC8;
+	}
+
+	if (xbr::IsGameBuild<3095>())
+	{
+		return 0x141821200;
+	}
+
+	if (xbr::IsGameBuild<2944>())
+	{
+		return 0x14180CCF4;
+	}
+
+	if (xbr::IsGameBuild<2802>())
+	{
+		return 0x1417E6648;
+	}
+
+	if (xbr::IsGameBuild<2699>())
+	{
+		return 0x1417D3600;
+	}
+
+	if (xbr::IsGameBuild<2612>())
+	{
+		return 0x1417DB78C;
+	}
+
+	if (xbr::IsGameBuild<2545>())
+	{
+		return 0x1417DB000;
+	}
+
+	if (xbr::IsGameBuild<2372>())
+	{
+		return 0x1417C9104;
+	}
+
+	if (xbr::IsGameBuild<2189>())
+	{
+		return 0x1417ACE74;
+	}
+
+	if (Is2060())
+	{
+		return 0x141796A34;
+	}
+
+	return 0x14175DE00;
+}
+
 // 1604
 // 1868 now...!
 // 2060 realities
-#define TRIGGER_EP (Is372() ? 0x141623FC8 : ((Is2060()) ? 0x141796A34 : 0x14175DE00))
+#define TRIGGER_EP (GetTriggerEP())
 #elif defined(IS_RDR3)
-// 1207.58
-//#define TRIGGER_EP 0x142D55C2C
+inline uintptr_t GetTriggerEP()
+{
+	if (auto ep = GetLauncherTriggerEP(); ep != 0)
+	{
+		return ep;
+	}
 
-// 1207.69
-//#define TRIGGER_EP 0x142D5B8FC
+	if (xbr::IsGameBuild<1355>())
+	{
+		return 0x142DE455C; // 1355.18
+	}
 
-// 1207.77
-//#define TRIGGER_EP 0x142D5F80C
+	if (xbr::IsGameBuild<1436>())
+	{
+		return 0x142E13DA4; // 1436.31
+	}
 
-// 1207.80
-//#define TRIGGER_EP 0x142D601AC
+	if (xbr::IsGameBuild<1491>())
+	{
+		return 0x142E31F84; // 1491.18
+	}
 
-// 1311.12
-//#define TRIGGER_EP 0x142E0E63C
+	return 0x142E0F92C; // 1311.20
+}
 
-// 1311.14
-//#define TRIGGER_EP 0x142E0F9BC
-
-// 1311.16
-#define TRIGGER_EP 0x142E0EF1C
-
-// 1311.20
-#define TRIGGER_EP 0x142E0F92C
+#define TRIGGER_EP (GetTriggerEP())
+#elif defined(GTA_NY)
+// .43
+#define TRIGGER_EP 0xDF8F2B
 #else
 #define TRIGGER_EP 0xDECEA5ED
 #endif
@@ -76,7 +160,13 @@ static void SetDebugBits(std::function<void(CONTEXT*)> cb, CONTEXT* curContext)
 template<typename T>
 static inline T* GetTargetRVA(uint32_t rva)
 {
-	return (T*)((uint8_t*)hook::get_adjusted(0x140000000 + rva));
+	return (T*)((uint8_t*)hook::get_adjusted(
+#ifdef _M_AMD64
+	0x140000000
+#else
+	0x400000
+#endif
+		+ rva));
 }
 
 static void UnapplyRelocations(bool a);
@@ -101,20 +191,35 @@ static LONG CALLBACK SnapshotVEH(PEXCEPTION_POINTERS pointers)
 		IMAGE_NT_HEADERS* ntHeader = GetTargetRVA<IMAGE_NT_HEADERS>(header->e_lfanew);
 		IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(ntHeader);
 
-		FILE* f = _wfopen(MakeRelativeCitPath(fmt::sprintf(L"cache\\game\\executable_snapshot_%x.bin", ntHeader->OptionalHeader.AddressOfEntryPoint)).c_str(), L"wb");
+		FILE* f = _wfopen(MakeRelativeCitPath(fmt::sprintf(L"data\\cache\\executable_snapshot_%x.bin", ntHeader->OptionalHeader.AddressOfEntryPoint)).c_str(), L"wb");
 
-		for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; i++)
+		SHA256_CTX sha;
+		SHA256_Init(&sha);
+
+		auto write = [&f, &sha](const void* data, size_t size)
 		{
 			if (f)
 			{
-				fwrite(GetTargetRVA<void>(section->VirtualAddress), 1, section->SizeOfRawData, f);
+				fwrite(data, 1, size, f);
 			}
+
+			SHA256_Update(&sha, data, size);
+		};
+
+		for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; i++)
+		{
+			write(GetTargetRVA<void>(section->VirtualAddress), section->SizeOfRawData);
 
 			++section;
 		}
 
 		if (f)
 		{
+			uint8_t endHash[256 / 8];
+			SHA256_Final(endHash, &sha);
+
+			fwrite(endHash, 1, sizeof(endHash), f);
+
 			fclose(f);
 		}
 
@@ -137,7 +242,7 @@ void DoCreateSnapshot()
 		context->Dr7 |= (1 << 6) | (0 << 28) | (0 << 30);
 
 		// set the address for bp 4
-		context->Dr3 = (DWORD64)hook::get_adjusted(TRIGGER_EP);
+		context->Dr3 = (DWORD_PTR)hook::get_adjusted(TRIGGER_EP);
 	}, nullptr);
 }
 
@@ -146,7 +251,15 @@ static std::wstring g_dumpFileName;
 
 static void UnapplyRelocations(bool a)
 {
-	IMAGE_DOS_HEADER* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(hook::get_adjusted(0x140000000));
+	constexpr uintptr_t base =
+#ifdef _M_AMD64
+	0x140000000
+#else
+	0x400000
+#endif
+	;
+
+	IMAGE_DOS_HEADER* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(hook::get_adjusted(base));
 
 	IMAGE_NT_HEADERS* ntHeader = GetTargetRVA<IMAGE_NT_HEADERS>(dosHeader->e_lfanew);
 
@@ -155,7 +268,7 @@ static void UnapplyRelocations(bool a)
 	IMAGE_BASE_RELOCATION* relocation = GetTargetRVA<IMAGE_BASE_RELOCATION>(relocationDirectory->VirtualAddress);
 	IMAGE_BASE_RELOCATION* endRelocation = reinterpret_cast<IMAGE_BASE_RELOCATION*>((char*)relocation + relocationDirectory->Size);
 
-	intptr_t relocOffset = static_cast<intptr_t>(hook::get_adjusted(0x140000000)) - 0x140000000;
+	intptr_t relocOffset = static_cast<intptr_t>(hook::get_adjusted(base)) - base;
 
 	if (relocOffset == 0)
 	{
@@ -315,44 +428,91 @@ void DoCreateDump(void* ep, const wchar_t* fileName)
 		context->Dr7 |= (1 << 6) | (0 << 28) | (0 << 30);
 
 		// set the address for bp 4
-		context->Dr3 = (DWORD64)ep;
+		context->Dr3 = (DWORD_PTR)ep;
 	}, nullptr);
 }
 
-void ExecutableLoader::LoadSnapshot(IMAGE_NT_HEADERS* ntHeader)
+struct FileDeleter
 {
-	std::wstring snapBaseName = MakeRelativeCitPath(fmt::sprintf(L"cache\\game\\executable_snapshot_%x.bin", ntHeader->OptionalHeader.AddressOfEntryPoint));
+	inline void operator()(FILE* f)
+	{
+		if (f)
+		{
+			fclose(f);
+		}
+	}
+};
+
+bool ExecutableLoader::LoadSnapshot(IMAGE_NT_HEADERS* ntHeader)
+{
+	std::wstring snapBaseName = MakeRelativeCitPath(fmt::sprintf(L"data\\cache\\executable_snapshot_%x.bin", ntHeader->OptionalHeader.AddressOfEntryPoint));
 
 	if (GetFileAttributesW(snapBaseName.c_str()) == INVALID_FILE_ATTRIBUTES)
 	{
 		DoCreateSnapshot();
-		return;
+		return false;
 	}
 
 	IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(ntHeader);
 
-	FILE* f = _wfopen(snapBaseName.c_str(), L"rb");
+	SHA256_CTX sha;
+	SHA256_Init(&sha);
+	uint8_t compareHash[256 / 8];
 
-	if (!f)
 	{
-		return;
+		auto f = std::unique_ptr<FILE, FileDeleter>(_wfopen(snapBaseName.c_str(), L"rb"));
+
+		if (!f)
+		{
+			DoCreateSnapshot();
+			return false;
+		}
+
+		for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; i++)
+		{
+			auto targetPtr = GetTargetRVA<void>(section->VirtualAddress);
+			auto targetSize = section->SizeOfRawData;
+
+			DWORD oldProtect;
+			VirtualProtect(targetPtr, targetSize, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+			if (fread(targetPtr, 1, targetSize, f.get()) != targetSize)
+			{
+				DoCreateSnapshot();
+				return false;
+			}
+
+			SHA256_Update(&sha, targetPtr, targetSize);
+			++section;
+		}
+
+		if (fread(compareHash, 1, sizeof(compareHash), f.get()) != sizeof(compareHash))
+		{
+			DoCreateSnapshot();
+			return false;
+		}
 	}
 
-	for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; i++)
+	uint8_t readHash[256 / 8];
+	SHA256_Final(readHash, &sha);
+
+	if (memcmp(readHash, compareHash, sizeof(compareHash)) != 0)
 	{
-		DWORD oldProtect;
-		VirtualProtect(GetTargetRVA<void>(section->VirtualAddress), section->SizeOfRawData, PAGE_EXECUTE_READWRITE, &oldProtect);
-
-		fread(GetTargetRVA<void>(section->VirtualAddress), 1, section->SizeOfRawData, f);
-
-		++section;
+		DoCreateSnapshot();
+		return false;
 	}
-
-	fclose(f);
 
 	DWORD oldProtect;
 	VirtualProtect(ntHeader, 0x1000, PAGE_READWRITE, &oldProtect);
 
 	// no-adjust
-	ntHeader->OptionalHeader.AddressOfEntryPoint = TRIGGER_EP - 0x140000000;
+	ntHeader->OptionalHeader.AddressOfEntryPoint = TRIGGER_EP - 
+#ifdef _M_AMD64
+		0x140000000
+#else
+		0x400000
+#endif
+		;
+
+	return true;
 }

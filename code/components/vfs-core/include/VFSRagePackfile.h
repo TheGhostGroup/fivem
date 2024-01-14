@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <shared_mutex>
 #include <VFSDevice.h>
 
 #ifdef COMPILING_VFS_CORE
@@ -42,15 +43,9 @@ namespace vfs
 
 		struct HandleData
 		{
-			bool valid;
-			Entry entry;
-			size_t curOffset;
-
-			inline HandleData()
-				: valid(false)
-			{
-
-			}
+			bool valid = false;
+			Entry entry = { 0 };
+			size_t curOffset = 0;
 		};
 
 	private:
@@ -58,13 +53,15 @@ namespace vfs
 
 		THandle m_parentHandle;
 
-		uint64_t m_parentPtr;
+		uint64_t m_parentPtr = 0;
 
 		std::string m_pathPrefix;
 
-		Header2 m_header;
+		Header2 m_header = { 0 };
 
-		HandleData m_handles[32];
+		std::vector<HandleData> m_handles;
+
+		std::shared_mutex m_handlesMutex;
 
 		std::vector<Entry> m_entries;
 
@@ -111,6 +108,8 @@ namespace vfs
 		virtual void FindClose(THandle handle) override;
 
 		virtual void SetPathPrefix(const std::string& pathPrefix) override;
+
+		virtual bool ExtensionCtl(int controlIdx, void* controlData, size_t controlSize) override;
 
 	public:
 		bool OpenArchive(const std::string& archivePath);

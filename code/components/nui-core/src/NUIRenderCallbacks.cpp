@@ -1,56 +1,54 @@
 #include "StdInc.h"
 #include "CefOverlay.h"
 #include "NUIWindowManager.h"
+#include <CL2LaunchMode.h>
+#include <HostSharedData.h>
+#include <ReverseGameData.h>
 
 extern nui::GameInterface* g_nuiGi;
 
 #include "memdbgon.h"
 
-extern bool g_hasCursor;
 extern bool g_shouldHideCursor;
 extern POINT g_cursorPos;
 
 extern bool g_isDragging;
 
 extern fwRefContainer<nui::GITexture> g_cursorTexture;
-extern fwEvent<std::chrono::microseconds, std::chrono::microseconds> OnVSync;
 
-#ifdef USE_NUI_ROOTLESS
-extern std::shared_mutex g_nuiFocusStackMutex;
-extern std::list<std::string> g_nuiFocusStack;
-#endif
+HCURSOR g_defaultCursor;
+extern HCURSOR InitDefaultCursor();
+
+extern void TranslateWindowRect(const fwRefContainer<NUIWindow>& window, CRect* rect);
 
 static HookFunction initFunction([] ()
 {
-#ifndef IS_RDR3
-	OnVSync.Connect([](std::chrono::microseconds, std::chrono::microseconds)
-	{
-		Instance<NUIWindowManager>::Get()->ForAllWindows([=](fwRefContainer<NUIWindow> window)
-		{
-			if (window->GetPaintType() != NUIPaintTypePostRender)
-			{
-				return;
-			}
-
-			window->SendBeginFrame();
-		});
-	});
-#endif
-
 	g_nuiGi->OnRender.Connect([]()
 	{
+		static auto initCursor = ([]()
+		{
+			g_defaultCursor = InitDefaultCursor();
+			g_nuiGi->SetHostCursor(g_defaultCursor);
+
+			return true;
+		})();
+
+		// if we're in the main UI, make sure it has focus
 		if (nui::HasMainUI())
 		{
 			nui::GiveFocus("mpMenu", true);
 		}
 
+		// draw background
 		nui::OnDrawBackground(nui::HasMainUI());
 
+		// update windows from a render context
 		Instance<NUIWindowManager>::Get()->ForAllWindows([](fwRefContainer<NUIWindow> window)
 		{
 			window->UpdateFrame();
 		});
 
+		// collect all post-render windows
 		std::map<std::string, fwRefContainer<NUIWindow>> renderWindows;
 
 		Instance<NUIWindowManager>::Get()->ForAllWindows([&renderWindows](fwRefContainer<NUIWindow> window)
@@ -64,14 +62,10 @@ static HookFunction initFunction([] ()
 		});
 
 		std::list<std::string> windowOrder =
-#ifndef USE_NUI_ROOTLESS
 		{
-			"root"
-		}
-#else
-		g_nuiFocusStack
-#endif
-		;
+			"nui_mpMenu",
+			"root",
+		};
 
 		// show on top = render last
 		std::reverse(windowOrder.begin(), windowOrder.end());
@@ -85,6 +79,7 @@ static HookFunction initFunction([] ()
 				continue;
 			}
 
+			// does the window have a full-screen surface? if so, draw it
 			if (window->GetTexture().GetRef())
 			{
 				g_nuiGi->SetTexture(window->GetTexture(), true);
@@ -94,23 +89,31 @@ static HookFunction initFunction([] ()
 
 				nui::ResultingRectangle rr;
 				rr.color = CRGBA(0xff, 0xff, 0xff, 0xff);
+
+				// the texture is usually upside down (GL->DX coord system), so we draw it as such
 				rr.rectangle = CRect(0, resY, resX, 0);
+
+				if (window->IsFixedSizeWindow())
+				{
+					TranslateWindowRect(window, &rr.rectangle);
+				}
 
 				g_nuiGi->DrawRectangles(1, &rr);
 
 				g_nuiGi->UnsetTexture();
 			}
 
+			// a popup (e.g. select dropdowns) has to be drawn separately
 			if (window->GetPopupTexture().GetRef())
 			{
 				g_nuiGi->SetTexture(window->GetPopupTexture(), true);
 
+				auto rect = window->GetPopupRect();
 
-				const CefRect& rect = window->GetPopupRect();
-
-				// we need to subtract 0.5f from each vertex coordinate (half a pixel after scaling) due to the usual half-pixel/texel issue
 				nui::ResultingRectangle rr;
 				rr.color = CRGBA(0xff, 0xff, 0xff, 0xff);
+
+				// also upside down here
 				rr.rectangle = CRect(rect.x, rect.y + rect.height, rect.x + rect.width, rect.y);
 
 				g_nuiGi->DrawRectangles(1, &rr);
@@ -119,23 +122,48 @@ static HookFunction initFunction([] ()
 			}
 		}
 
-		if ((nui::HasMainUI() || g_hasCursor) && !g_shouldHideCursor)
+		// are we in any situation where we need a cursor?
+		bool needsNuiCursor = (nui::HasCursor()) && !g_shouldHideCursor;
+		g_nuiGi->SetHostCursorEnabled(needsNuiCursor);
+
+		// we set the host cursor above unconditionally- this is for cases where the host cursor isn't sufficient
+		if (needsNuiCursor)
 		{
-			POINT cursorPos = g_cursorPos;
+			// do we need to draw a non-host cursor?
+			bool shouldDrawCursorTexture = false;
 
-			GetCursorPos(&cursorPos);
-			ScreenToClient(g_nuiGi->GetHWND(), &cursorPos);
-
-			if (g_cursorTexture.GetRef())
+			// if the game doesn't support a host cursor, draw the cursor texture
+			if (!g_nuiGi->CanDrawHostCursor())
 			{
-				g_nuiGi->SetTexture(g_cursorTexture);
+				shouldDrawCursorTexture = true;
+			}
+			// if we're SDK guest, also draw the cursor texture
+			else if (launch::IsSDKGuest())
+			{
+				shouldDrawCursorTexture = true;
+			}
 
-				uint32_t color = 0xFFFFFFFF;
+			// draw the cursor if we should, and if the texture exists
+			if (g_cursorTexture.GetRef() && shouldDrawCursorTexture)
+			{
+				POINT cursorPos = g_cursorPos;
 
-				if (g_isDragging)
+				// SDK wants to get cursor data from RGD
+				if (launch::IsSDKGuest())
 				{
-					color = 0xFFAAAAAA;
+					static HostSharedData<ReverseGameData> rgd("CfxReverseGameData");
+
+					cursorPos.x = rgd->mouseAbsX;
+					cursorPos.y = rgd->mouseAbsY;
 				}
+				else
+				{
+					// if not SDK, our cursor follows the host cursor
+					GetCursorPos(&cursorPos);
+					ScreenToClient(g_nuiGi->GetHWND(), &cursorPos);
+				}
+
+				g_nuiGi->SetTexture(g_cursorTexture);
 
 				nui::ResultingRectangle rr;
 				rr.color = (g_isDragging) ? CRGBA(0xaa, 0xaa, 0xaa, 0xff) : CRGBA(0xff, 0xff, 0xff, 0xff);

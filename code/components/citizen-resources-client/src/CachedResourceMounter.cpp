@@ -7,6 +7,8 @@
 
 #include "StdInc.h"
 #include <CachedResourceMounter.h>
+#include <CachedResourceMounterWrap.h>
+
 #include <ResourceCache.h>
 #include <ResourceCacheDevice.h>
 
@@ -31,7 +33,7 @@ using fx::CachedResourceMounter;
 std::unordered_multimap<std::string, std::pair<std::string, std::string>> g_referenceHashList;
 static std::mutex g_referenceHashListMutex;
 
-static std::map<std::string, std::function<void(int, int)>> g_statusCallbacks;
+static std::map<std::string, std::function<void(CachedResourceMounter::StatusType, int, int)>> g_statusCallbacks;
 static std::mutex g_statusCallbacksMutex;
 
 void MountResourceCacheDevice(std::shared_ptr<ResourceCache> cache);
@@ -58,7 +60,7 @@ CachedResourceMounter::CachedResourceMounter(fx::ResourceManager* manager)
 CachedResourceMounter::CachedResourceMounter(fx::ResourceManager* manager, const std::string& cachePath)
 	: m_manager(manager)
 {
-	m_resourceCache = std::make_shared<ResourceCache>(cachePath, ToNarrow(MakeRelativeCitPath(L"cache/")));
+	m_resourceCache = std::make_shared<ResourceCache>(cachePath, ToNarrow(MakeRelativeCitPath(L"data/server-cache/")));
 
 	MountResourceCacheDevice(m_resourceCache);
 }
@@ -90,6 +92,7 @@ fwRefContainer<fx::Resource> CachedResourceMounter::InitializeLoad(const std::st
 			{
 				// if there is one, start by creating a resource with a list component
 				fwRefContainer<fx::Resource> resource = m_manager->CreateResource(host, this);
+				resource->SetComponent(new CachedResourceMounterWrap(this));
 
 				fwRefContainer<ResourceCacheEntryList> entryList = resource->GetComponent<ResourceCacheEntryList>();
 
@@ -122,7 +125,7 @@ tl::expected<fwRefContainer<vfs::Device>, fx::ResourceManagerError> CachedResour
 	return tl::make_unexpected(ResourceManagerError{ fmt::sprintf("Failed to open packfile: %s", errorState) });
 }
 
-void CachedResourceMounter::AddStatusCallback(const std::string& resourceName, const std::function<void(int, int)>& callback)
+void CachedResourceMounter::AddStatusCallback(const std::string& resourceName, const std::function<void(StatusType, int, int)>& callback)
 {
 	auto path = FormatPath(resourceName, "resource.rpf");
 
@@ -149,6 +152,12 @@ pplx::task<tl::expected<fwRefContainer<fx::Resource>, fx::ResourceManagerError>>
 			// follow up by mounting resource.rpf (using the legacy mounter) from the resource on a background thread
 			return pplx::create_task([=]() -> tl::expected<fwRefContainer<fx::Resource>, fx::ResourceManagerError>
 			{
+				auto dropCallback = [this, resource]()
+				{
+					std::unique_lock<std::mutex> lock(g_statusCallbacksMutex);
+					g_statusCallbacks.erase(FormatPath(resource->GetName(), "resource.rpf"));
+				};
+
 				m_manager->MakeCurrent();
 
 				// copy the pointer in case we need to nullptr it
@@ -158,6 +167,7 @@ pplx::task<tl::expected<fwRefContainer<fx::Resource>, fx::ResourceManagerError>>
 				{
 					trace("Our resource - %s - disappeared right from under our nose?\n", resource->GetName());
 
+					dropCallback();
 					localResource = nullptr;
 
 					return localResource;
@@ -182,11 +192,17 @@ pplx::task<tl::expected<fwRefContainer<fx::Resource>, fx::ResourceManagerError>>
 							vfs::Unmount(resourceRoot);
 						});
 
+						dropCallback();
+
 						return localResource;
 					}
 
+					dropCallback();
+
 					return tl::make_unexpected(fx::ResourceManagerError{ fmt::sprintf("Couldn't load resource %s from %s: %s", resource->GetName(), resourceRoot, errorState) });
 				}
+
+				dropCallback();
 				
 				return tl::make_unexpected(packfileResult.error());
 			}, pplx::task_options(g_schedulerWrap));
@@ -196,10 +212,97 @@ pplx::task<tl::expected<fwRefContainer<fx::Resource>, fx::ResourceManagerError>>
 	return pplx::task_from_result(tl::expected<fwRefContainer<fx::Resource>, fx::ResourceManagerError>(tl::make_unexpected(ResourceManagerError{ "Couldn't parse URI." })));
 }
 
+bool CachedResourceMounter::MountOverlay(const std::string& resourceName, const std::string& overlayName, std::string* outError)
+{
+	std::string overlayFile = fmt::sprintf("%s.rpf", overlayName);
+	std::string overlayPath = FormatPath(resourceName, overlayFile);
+
+	auto taskIt = m_overlayMountTasks.find(overlayPath);
+
+	if (taskIt == m_overlayMountTasks.end())
+	{
+		auto resource = m_manager->GetResource(resourceName);
+
+		resource->OnRemove.Connect([this, overlayPath]()
+		{
+			m_overlayMountTasks.erase(overlayPath);
+		});
+
+		taskIt = m_overlayMountTasks.emplace(overlayPath, pplx::create_task([this, resource, overlayFile, overlayPath]() -> tl::expected<fwRefContainer<vfs::Device>, fx::ResourceManagerError>
+		{
+			if (!resource.GetRef())
+			{
+				return tl::make_unexpected(fx::ResourceManagerError{ "No such resource." });
+			}
+
+			auto entryList = resource->GetComponent<ResourceCacheEntryList>();
+
+			// verify if we even have an entry for such
+			if (entryList->GetEntry(overlayFile))
+			{
+				// open the packfile
+				auto openOverlayPackfile = [resource, overlayPath]() -> tl::expected<fwRefContainer<vfs::Device>, fx::ResourceManagerError>
+				{
+					fwRefContainer<vfs::RagePackfile> packfile = new vfs::RagePackfile();
+					std::string errorState;
+
+					if (packfile->OpenArchive(overlayPath, &errorState))
+					{
+						return packfile;
+					}
+
+					return tl::make_unexpected(ResourceManagerError{ fmt::sprintf("Failed to open packfile: %s", errorState) });
+				};
+
+				auto packfileResult = openOverlayPackfile();
+
+				if (packfileResult)
+				{
+					std::string resourceRoot = "resources:/" + resource->GetName() + "/";
+					vfs::Mount(packfileResult.value(), resourceRoot);
+
+					return packfileResult.value();
+				}
+
+				return tl::make_unexpected(packfileResult.error());
+			}
+
+			return tl::make_unexpected(fx::ResourceManagerError{ fmt::sprintf("No resource file set %s in resource %s", overlayFile, resource->GetName()) });
+		},
+		pplx::task_options(g_schedulerWrap))).first;
+	}
+
+	if (taskIt == m_overlayMountTasks.end())
+	{
+		return false;
+	}
+
+	bool success = false;
+
+	if (taskIt->second.is_done())
+	{
+		auto result = taskIt->second.get();
+		if (result)
+		{
+			success = true;
+		}
+		else
+		{
+			if (outError)
+			{
+				auto errorStr = result.error().Get();
+				*outError = (errorStr.empty()) ? "Failed to mount overlay." : errorStr;
+			}
+		}
+	}
+
+	return success;
+}
+
 void CachedResourceMounter::AddResourceEntry(const std::string& resourceName, const std::string& basename, const std::string& referenceHash, const std::string& remoteUrl, size_t size, const std::map<std::string, std::string>& extData)
 {
 	{
-		std::unique_lock<std::mutex> g_referenceHashListMutex;
+		std::unique_lock _(g_referenceHashListMutex);
 		g_referenceHashList.insert({ referenceHash, {resourceName, basename} });
 	}
 
@@ -217,7 +320,7 @@ void CachedResourceMounter::AddResourceEntry(const std::string& resourceName, co
 void CachedResourceMounter::RemoveResourceEntries(const std::string& resourceName)
 {
 	{
-		std::unique_lock<std::mutex> g_referenceHashListMutex;
+		std::unique_lock _(g_referenceHashListMutex);
 
 		auto bits = m_resourceEntries.equal_range(resourceName);
 
@@ -257,9 +360,28 @@ namespace fx
 	fwEvent<> OnUnlockStreaming;
 }
 
+namespace fx
+{
+CachedResourceMounterWrap::CachedResourceMounterWrap(CachedResourceMounter* mounter)
+	: m_mounter(mounter)
+{
+
+}
+
+void CachedResourceMounterWrap::AttachToObject(fx::Resource* resource)
+{
+	m_resource = resource;
+}
+
+bool CachedResourceMounterWrap::MountOverlay(const std::string& overlayName, std::string* outError)
+{
+	return m_mounter->MountOverlay(m_resource->GetName(), overlayName, outError);
+}
+}
+
 static InitFunction initFunction([]()
 {
-	fx::OnCacheDownloadStatus.Connect([](const std::string& fileName, size_t done, size_t total)
+	auto onStatus = [](fx::CachedResourceMounter::StatusType type, const std::string& fileName, size_t done, size_t total)
 	{
 		std::unique_lock<std::mutex> lock(g_statusCallbacksMutex);
 		auto it = g_statusCallbacks.find(fileName);
@@ -268,14 +390,18 @@ static InitFunction initFunction([]()
 		{
 			lock.unlock();
 
-			it->second(done, total);
-
-			if (done >= total)
-			{
-				lock.lock();
-				g_statusCallbacks.erase(fileName);
-			}
+			it->second(type, done, total);
 		}
+	};
+
+	fx::OnCacheDownloadStatus.Connect([onStatus](const std::string& fileName, size_t done, size_t total)
+	{
+		onStatus(fx::CachedResourceMounter::StatusType::Downloading, fileName, done, total);
+	});
+
+	fx::OnCacheVerifyStatus.Connect([onStatus](const std::string& fileName, size_t done, size_t total)
+	{
+		onStatus(fx::CachedResourceMounter::StatusType::Verifying, fileName, done, total);
 	});
 
 	fx::Resource::OnInitializeInstance.Connect([](fx::Resource* resource)

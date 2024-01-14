@@ -6,6 +6,7 @@
  */
 
 #include "StdInc.h"
+#include <jitasm.h>
 #include "Hooking.h"
 
 #include <CrossBuildRuntime.h>
@@ -13,7 +14,7 @@
 static HookFunction hookFunction([] ()
 {
 	// 1737: no longer needed
-	if (Is2060())
+	if (xbr::IsGameBuildOrGreater<1737>())
 	{
 		return;
 	}

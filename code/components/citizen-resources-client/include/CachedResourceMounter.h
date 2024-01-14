@@ -37,11 +37,16 @@ namespace fx
 	public:
 		CachedResourceMounter(ResourceManager* manager, const std::string& cachePath);
 
+		bool MountOverlay(const std::string& resourceName, const std::string& overlayName, std::string* outError);
+
 		virtual bool HandlesScheme(const std::string& scheme) override;
 
 		virtual pplx::task<fwRefContainer<fx::Resource>> LoadResource(const std::string& uri) override;
 
 		virtual pplx::task<tl::expected<fwRefContainer<fx::Resource>, fx::ResourceManagerError>> LoadResourceWithError(const std::string& uri) override;
+
+	private:
+		std::map<std::string, pplx::task<tl::expected<fwRefContainer<vfs::Device>, fx::ResourceManagerError>>> m_overlayMountTasks;
 
 	protected:
 		struct ResourceFileEntry
@@ -68,13 +73,20 @@ namespace fx
 		std::multimap<std::string, ResourceFileEntry> m_resourceEntries;
 
 	public:
+		enum class StatusType
+		{
+			Downloading,
+			Verifying,
+		};
+
+	public:
 		virtual void RemoveResourceEntries(const std::string& resourceName);
 
 		virtual void AddResourceEntry(const std::string& resourceName, const std::string& basename, const std::string& referenceHash, const std::string& remoteUrl, size_t size = 0, const std::map<std::string, std::string>& extData = {});
 
 		virtual std::string FormatPath(const std::string& resourceName, const std::string& basename);
 
-		virtual void AddStatusCallback(const std::string& resourceName, const std::function<void(int, int)>& callback);
+		virtual void AddStatusCallback(const std::string& resourceName, const std::function<void(StatusType, int, int)>& callback);
 	};
 
 

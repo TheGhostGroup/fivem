@@ -8,6 +8,10 @@
 #include <CfxState.h>
 
 #include <CrossBuildRuntime.h>
+#include <timeapi.h> // timeGetTime()
+
+#include <ICoreGameInit.h>
+#include <GlobalInput.h>
 
 static WNDPROC origWndProc;
 
@@ -15,7 +19,30 @@ static bool g_isFocused = true;
 static bool g_enableSetCursorPos = false;
 static bool g_isFocusStolen = false;
 
-static void(*disableFocus)();
+static int* g_mouseButtons;
+static int* g_inputOffset;
+static rage::ioMouse* g_input;
+
+static bool g_useGlobalMouseMovement = true;
+static POINT g_mouseMovement{ 0 };
+
+static std::shared_ptr<GlobalInputHandler> GetGlobalInput()
+{
+	static auto handler = CreateGlobalInputHandler();
+
+	return handler;
+}
+
+static void UpdateMouseMovement(const RAWMOUSE& mouse)
+{
+	if (mouse.usButtonFlags != RI_MOUSE_WHEEL && !(mouse.usFlags & MOUSE_MOVE_ABSOLUTE))
+	{
+		g_mouseMovement.x += mouse.lLastX;
+		g_mouseMovement.y += mouse.lLastY;
+	}
+}
+
+static void (*disableFocus)();
 
 static void DisableFocus()
 {
@@ -25,7 +52,7 @@ static void DisableFocus()
 	}
 }
 
-static void(*enableFocus)();
+static void (*enableFocus)();
 
 static void EnableFocus()
 {
@@ -35,26 +62,142 @@ static void EnableFocus()
 	}
 }
 
-void InputHook::SetGameMouseFocus(bool focus)
-{
-	g_isFocusStolen = !focus;
+static bool g_useHostCursor;
 
-	return (focus) ? enableFocus() : disableFocus();
+void EnableHostCursor()
+{
+	while (ShowCursor(TRUE) < 0)
+		;
 }
 
-void InputHook::EnableSetCursorPos(bool enabled) {
-	g_enableSetCursorPos = enabled;
+void DisableHostCursor()
+{
+	while (ShowCursor(FALSE) >= 0)
+		;
+}
+
+static INT HookShowCursor(BOOL show)
+{
+	if (g_useHostCursor)
+	{
+		return (show) ? 0 : -1;
+	}
+
+	return ShowCursor(show);
+}
+
+void InputHook::SetHostCursorEnabled(bool enabled)
+{
+	static bool lastEnabled = false;
+
+	if (!lastEnabled && enabled)
+	{
+		EnableHostCursor();
+	}
+	else if (lastEnabled && !enabled)
+	{
+		DisableHostCursor();
+	}
+
+	g_useHostCursor = enabled;
 }
 
 static char* g_gameKeyArray;
 
+static std::atomic<int> g_isFocusStolenCount;
+
+void InputHook::SetGameMouseFocus(bool focus)
+{
+	if (focus)
+	{
+		g_isFocusStolenCount--;
+	}
+	else if (!focus)
+	{
+		g_isFocusStolenCount++;
+	}
+
+	g_isFocusStolen = (g_isFocusStolenCount > 0);
+
+	if (g_isFocusStolen)
+	{
+		memset(g_gameKeyArray, 0, 256);
+	}
+
+	return (!g_isFocusStolen) ? enableFocus() : disableFocus();
+}
+
+void InputHook::EnableSetCursorPos(bool enabled)
+{
+	g_enableSetCursorPos = enabled;
+}
+
 #include <LaunchMode.h>
+
+static std::map<int, std::vector<InputHook::ControlBypass>> g_controlBypasses;
+
+void InputHook::SetControlBypasses(int subsystem, std::initializer_list<ControlBypass> bypasses)
+{
+	g_controlBypasses[subsystem] = bypasses;
+}
+
+bool InputHook::IsMouseButtonDown(int buttonFlag)
+{
+	return ((*g_mouseButtons) & buttonFlag);
+}
+
+static bool GlobalInputIsDown(int vKey)
+{
+	static bool keys[512];
+
+	static auto gInput = []()
+	{
+		auto inp = GetGlobalInput();
+
+		inp->OnKey.Connect([](DWORD vKey, bool down)
+		{
+			keys[vKey] = down;
+		});
+
+		return inp;
+	}();
+
+	return keys[vKey];
+}
+
+bool InputHook::IsKeyDown(int vk_keycode)
+{
+	if (vk_keycode < 0 || vk_keycode > 255)
+	{
+		return false;
+	}
+
+	if (GlobalInputIsDown(vk_keycode))
+	{
+		return true;
+	}
+
+	return g_gameKeyArray[vk_keycode] & 0x80;
+}
 
 LRESULT APIENTRY grcWindowProcedure(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
-	if (uMsg == WM_CREATE)
+	// inform the game of being minimized
+	static bool minimized = false;
+
+	if (uMsg == WM_SIZE)
 	{
-		SetWindowText(FindWindow(L"grcWindow", nullptr), (CfxIsSinglePlayer()) ? L"Grand Theft Auto V (FiveM SP)" : L"FiveM");
+		if (wParam == SIZE_MINIMIZED)
+		{
+			minimized = true;
+
+			Instance<ICoreGameInit>::Get()->SetVariable("gameMinimized");
+		}
+		else if (minimized)
+		{
+			Instance<ICoreGameInit>::Get()->ClearVariable("gameMinimized");
+			minimized = false;
+		}
 	}
 
 	if (uMsg == WM_ACTIVATEAPP)
@@ -88,18 +231,82 @@ LRESULT APIENTRY grcWindowProcedure(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM 
 		lresult = DefWindowProc(hwnd, uMsg, wParam, lParam);
 	}
 
+	if (g_isFocusStolen)
+	{
+		if (uMsg == WM_LBUTTONDOWN || uMsg == WM_RBUTTONDOWN || uMsg == WM_MBUTTONDOWN || uMsg == WM_XBUTTONDOWN || uMsg == WM_LBUTTONUP || uMsg == WM_RBUTTONUP || uMsg == WM_MBUTTONUP || uMsg == WM_XBUTTONUP)
+		{
+			auto buttonIdx = 0;
+
+			if (uMsg == WM_LBUTTONUP || uMsg == WM_LBUTTONDOWN)
+			{
+				buttonIdx = 1;
+			}
+			else if (uMsg == WM_RBUTTONUP || uMsg == WM_RBUTTONDOWN)
+			{
+				buttonIdx = 2;
+			}
+			else if (uMsg == WM_MBUTTONUP || uMsg == WM_MBUTTONDOWN)
+			{
+				buttonIdx = 4;
+			}
+			else if (uMsg == WM_XBUTTONUP || uMsg == WM_XBUTTONDOWN)
+			{
+				buttonIdx = GET_XBUTTON_WPARAM(wParam) * 8;
+			}
+
+			for (const auto& bypassSystem : g_controlBypasses)
+			{
+				for (auto bypass : bypassSystem.second)
+				{
+					if (bypass.isMouse && (bypass.ctrlIdx & 0xFF) == buttonIdx)
+					{
+						if (uMsg == WM_LBUTTONUP || uMsg == WM_MBUTTONUP || uMsg == WM_RBUTTONUP || uMsg == WM_XBUTTONUP)
+						{
+							rage::g_input.m_Buttons() &= ~buttonIdx;
+						}
+						else
+						{
+							rage::g_input.m_Buttons() |= buttonIdx;
+						}
+
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	if (uMsg == WM_INPUT && g_useGlobalMouseMovement)
+	{
+		pass = false;
+	}
+
 	if (!pass)
 	{
-		return lresult;
+		bool shouldPassAnyway = false;
+
+		if (uMsg == WM_KEYUP || uMsg == WM_KEYDOWN)
+		{
+			for (const auto& bypassSystem : g_controlBypasses)
+			{
+				for (auto bypass : bypassSystem.second)
+				{
+					if (!bypass.isMouse && bypass.ctrlIdx == wParam)
+					{
+						shouldPassAnyway = true;
+					}
+				}
+			}
+		}
+
+		if (!shouldPassAnyway)
+		{
+			return lresult;
+		}
 	}
 
 	//return CallWindowProc(origWndProc, hwnd, uMsg, wParam, lParam);
 	lresult = origWndProc(hwnd, uMsg, wParam, lParam);
-
-	if (g_isFocusStolen)
-	{
-		memset(g_gameKeyArray, 0, 256);
-	}
 
 	return lresult;
 }
@@ -117,9 +324,7 @@ BOOL WINAPI ClipCursorWrap(const RECT* lpRekt)
 		lpRekt = nullptr;
 	}
 
-	if ((lpRekt && !lastRectPtr) ||
-		(lastRectPtr && !lpRekt) ||
-		!EqualRect(&lastRect, lpRekt))
+	if ((lpRekt && !lastRectPtr) || (lastRectPtr && !lpRekt) || (lpRekt && !EqualRect(&lastRect, lpRekt)))
 	{
 		// update last rect
 		if (lpRekt)
@@ -146,7 +351,7 @@ HKL WINAPI ActivateKeyboardLayoutWrap(IN HKL hkl, IN UINT flags)
 
 BOOL WINAPI SetCursorPosWrap(int X, int Y)
 {
-	if (!g_isFocused || g_enableSetCursorPos)
+	if (!g_isFocusStolen || g_enableSetCursorPos)
 	{
 		return SetCursorPos(X, Y);
 	}
@@ -157,21 +362,28 @@ BOOL WINAPI SetCursorPosWrap(int X, int Y)
 #include <HostSharedData.h>
 #include <ReverseGameData.h>
 
-static void(*origSetInput)(int, void*, void*, void*);
+BOOL WINAPI RegisterRawInputDevicesWrap(PCRAWINPUTDEVICE pRawInputDevices, UINT uiNumDevices, UINT cbSize)
+{
+	GetGlobalInput()->OnMouse.Connect([](const RAWMOUSE& mouse) { UpdateMouseMovement(mouse); });
+
+	return RegisterRawInputDevices(pRawInputDevices, uiNumDevices, cbSize);
+}
+
+static void (*origSetInput)(int, void*, void*, void*);
 
 struct ReverseGameInputState
 {
 	uint8_t keyboardState[256];
-	int mouseX;
-	int mouseY;
+	int mouseDeltaX;
+	int mouseDeltaY;
 	int mouseWheel;
 	int mouseButtons;
 
 	ReverseGameInputState()
 	{
 		memset(keyboardState, 0, sizeof(keyboardState));
-		mouseX = 0;
-		mouseY = 0;
+		mouseDeltaX = 0;
+		mouseDeltaY = 0;
 		mouseWheel = 0;
 		mouseButtons = 0;
 	}
@@ -179,12 +391,17 @@ struct ReverseGameInputState
 	explicit ReverseGameInputState(const ReverseGameData& data)
 	{
 		memcpy(keyboardState, data.keyboardState, sizeof(keyboardState));
-		mouseX = data.mouseX;
-		mouseY = data.mouseY;
+		mouseDeltaX = data.mouseDeltaX;
+		mouseDeltaY = data.mouseDeltaY;
 		mouseWheel = data.mouseWheel;
 		mouseButtons = data.mouseButtons;
 	}
 };
+
+static hook::cdecl_stub<bool(wchar_t, int)> ProcessWMChar([]()
+{
+	return hook::get_pattern("44 8B 0D ? ? ? ? 41 83 F9 1E 73");
+});
 
 static ReverseGameInputState lastInput;
 static ReverseGameInputState curInput;
@@ -193,162 +410,281 @@ static bool g_mainThreadId;
 
 #include <queue>
 
+extern void DoPatchMouseScrollDelta();
+
+static HookFunction setOffsetsHookFunction([]()
+{
+	g_inputOffset = hook::get_address<int*>(hook::get_pattern("89 3D ? ? ? ? EB 0F 48 8B CB", 2));
+	g_mouseButtons = hook::get_address<int*>(hook::get_pattern("FF 15 ? ? ? ? 85 C0 8B 05 ? ? ? ? 74 05", 10));
+
+	rage::g_input.mouseButtons = hook::get_address<int32_t*>(hook::get_pattern("8B 05 ? ? ? ? 89 05 ? ? ? ? E8 ? ? ? ? 48 63"), 2, 6);
+	rage::g_input.mouseLastDX = hook::get_address<int32_t*>(hook::get_pattern("83 25 ? ? ? ? 00 83 25 ? ? ? ? 00 48 8D 0D ? ? ? ? E8 ? ? ? ? 83"), 2, 7);
+	rage::g_input.mouseLastDY = hook::get_address<int32_t*>(hook::get_pattern("83 25 ? ? ? ? 00 83 25 ? ? ? ? 00 48 8D 0D ? ? ? ? E8 ? ? ? ? 83", 7), 2, 7);
+	rage::g_input.mouseDX = hook::get_address<int32_t*>(hook::get_pattern("D1 F8 89 05 ? ? ? ? E8 ? ? ? ? 83 25", 13), 2, 7);
+	rage::g_input.mouseDY = hook::get_address<int32_t*>(hook::get_pattern("D1 F8 89 05 ? ? ? ? E8 ? ? ? ? 83 25", 20), 2, 7);
+	rage::g_input.mouseDZ = hook::get_address<int32_t*>(hook::get_pattern("C1 E8 1F 03 D0 01 15", 7));
+	rage::g_input.mouseAbsX = hook::get_address<int32_t*>(hook::get_pattern("8B 15 ? ? ? ? 8B 0D ? ? ? ? EB"), 2, 6);
+	rage::g_input.mouseAbsY = hook::get_address<int32_t*>(hook::get_pattern("8B 15 ? ? ? ? 8B 0D ? ? ? ? EB", 6), 2, 6);
+	rage::g_input.cursorAbsX = hook::get_address<int32_t*>(hook::get_pattern("8B 15 ? ? ? ? 8B 0D ? ? ? ? 2B C7"), 2, 6);
+	rage::g_input.cursorAbsY = hook::get_address<int32_t*>(hook::get_pattern("8B 15 ? ? ? ? 8B 0D ? ? ? ? 2B C7", 6), 2, 6);
+	rage::g_input.mouseDiffDirectionX = hook::get_address<float*>(hook::get_pattern("21 3D ? ? ? ? 21 3D ? ? ? ? 48 8B"), 2, 6);
+	rage::g_input.mouseDiffDirectionY = hook::get_address<float*>(hook::get_pattern("21 3D ? ? ? ? 21 3D ? ? ? ? 48 8B", 6), 2, 6);
+
+	// this has to be here as the mouseDZ pattern gets invalidated otherwise
+	DoPatchMouseScrollDelta();
+});
+
 static void SetInputWrap(int a1, void* a2, void* a3, void* a4)
 {
 	static HostSharedData<ReverseGameData> rgd("CfxReverseGameData");
 
+	g_useGlobalMouseMovement = rgd->useRawMouseCapture;
+
 	WaitForSingleObject(rgd->inputMutex, INFINITE);
 
 	std::vector<InputTarget*> inputTargets;
-	static bool lastCaught;
-	bool caught = !InputHook::QueryInputTarget(inputTargets);
+	static bool lastBlockGameInput;
+	bool blockGameInput = !InputHook::QueryInputTarget(inputTargets);
 
-	if (caught)
-	{
-		if (rgd->mouseX < 0)
-		{
-			rgd->mouseX = 0;
-		}
-		else if (rgd->mouseX >= rgd->width)
-		{
-			rgd->mouseX = rgd->width;
-		}
-
-		if (rgd->mouseY < 0)
-		{
-			rgd->mouseY = 0;
-		}
-		else if (rgd->mouseY >= rgd->height)
-		{
-			rgd->mouseY = rgd->height;
-		}
-	}
 
 	curInput = ReverseGameInputState{ *rgd };
 
-	static POINT mousePos[2];
-
-	if (caught != lastCaught)
+	if (g_useGlobalMouseMovement)
 	{
-		mousePos[caught ? 1 : 0] = { curInput.mouseX, curInput.mouseY };
-
-		curInput.mouseX = mousePos[lastCaught ? 1 : 0].x;
-		curInput.mouseY = mousePos[lastCaught ? 1 : 0].y;
-
-		rgd->mouseX = curInput.mouseX;
-		rgd->mouseY = curInput.mouseY;
+		curInput.mouseDeltaX = g_mouseMovement.x;
+		curInput.mouseDeltaY = g_mouseMovement.y;
 	}
 
-	lastCaught = caught;
+	g_mouseMovement.x = 0;
+	g_mouseMovement.y = 0;
+	rgd->mouseWheel = 0;
 
-	auto loopTargets = [&inputTargets](const auto& fn)
+	rgd->mouseAbsX = std::clamp(rgd->mouseAbsX + curInput.mouseDeltaX, 0, rgd->twidth);
+	rgd->mouseAbsY = std::clamp(rgd->mouseAbsY + curInput.mouseDeltaY, 0, rgd->theight);
+
+	// handling switching between game input states
+	if (blockGameInput != lastBlockGameInput)
 	{
-		for (InputTarget* t : inputTargets)
-		{
-			fn(t);
-		}
-	};
+		static POINT mousePos[2];
 
-	// attempt input synthesis for standard key up/down and mouse events
-	for (size_t i = 0; i < std::size(curInput.keyboardState); i++)
-	{
-		bool pass = true;
-		LRESULT lr;
+		mousePos[blockGameInput ? 1 : 0] = { curInput.mouseDeltaX, curInput.mouseDeltaY };
 
-		// TODO: key repeat
-		if (curInput.keyboardState[i] && !lastInput.keyboardState[i])
-		{
-			loopTargets([i](InputTarget* target)
-			{
-				target->KeyDown(i, 0);
-			});
-		}
-		else if (!curInput.keyboardState[i] && lastInput.keyboardState[i])
-		{
-			loopTargets([i](InputTarget* target)
-			{
-				target->KeyUp(i, 0);
-			});
-		}
+		curInput.mouseDeltaX = mousePos[lastBlockGameInput ? 1 : 0].x;
+		curInput.mouseDeltaY = mousePos[lastBlockGameInput ? 1 : 0].y;
+
+		rgd->mouseDeltaX = curInput.mouseDeltaX;
+		rgd->mouseDeltaY = curInput.mouseDeltaY;
 	}
 
-	// mouse buttons
-	for (int i = 1; i <= 3; i++)
+	lastBlockGameInput = blockGameInput;
+
+	// propagate input to input targets
+	if (inputTargets.size())
 	{
-		bool pass = true;
-		LRESULT lr;
-
-		int mx = curInput.mouseX;
-		int my = curInput.mouseY;
-
-		if ((curInput.mouseButtons & i) && !(lastInput.mouseButtons & i))
+		auto loopTargets = [&inputTargets](const auto& fn)
 		{
-			loopTargets([i, mx, my](InputTarget* target)
+			for (InputTarget* t : inputTargets)
 			{
-				target->MouseDown(i - 1, mx, my);
+				fn(t);
+			}
+		};
+
+		// attempt input synthesis for standard key up/down and mouse events
+		for (size_t i = 0; i < std::size(curInput.keyboardState); i++)
+		{
+			bool pass = true;
+			LRESULT lr;
+
+			// TODO: key repeat
+			if (curInput.keyboardState[i] && !lastInput.keyboardState[i])
+			{
+				loopTargets([i](InputTarget* target)
+				{
+					target->KeyDown(i, 0);
+				});
+			}
+			else if (!curInput.keyboardState[i] && lastInput.keyboardState[i])
+			{
+				loopTargets([i](InputTarget* target)
+				{
+					target->KeyUp(i, 0);
+				});
+			}
+		}
+
+		// mouse buttons
+		for (int i = 0; i < 3; i++)
+		{
+			bool pass = true;
+			LRESULT lr;
+
+			int mb = 1 << i;
+			int mx = rgd->mouseAbsX;
+			int my = rgd->mouseAbsY;
+
+			if ((curInput.mouseButtons & mb) && !(lastInput.mouseButtons & mb))
+			{
+				loopTargets([i, mx, my](InputTarget* target)
+				{
+					target->MouseDown(i, mx, my);
+				});
+			}
+			else if (!(curInput.mouseButtons & mb) && (lastInput.mouseButtons & mb))
+			{
+				loopTargets([i, mx, my](InputTarget* target)
+				{
+					target->MouseUp(i, mx, my);
+				});
+			}
+		}
+
+		// mouse wheel
+		if (curInput.mouseWheel != lastInput.mouseWheel)
+		{
+			int mw = curInput.mouseWheel;
+
+			loopTargets([mw](InputTarget* target)
+			{
+				target->MouseWheel(mw);
 			});
 		}
-		else if (!(curInput.mouseButtons & i) && (lastInput.mouseButtons & i))
+
+		// mouse movement
+		if (curInput.mouseDeltaX != lastInput.mouseDeltaX || curInput.mouseDeltaY != lastInput.mouseDeltaY)
 		{
-			loopTargets([i, mx, my](InputTarget* target)
+			int mx = rgd->mouseAbsX;
+			int my = rgd->mouseAbsY;
+
+			loopTargets([mx, my](InputTarget* target)
 			{
-				target->MouseUp(i - 1, mx, my);
+				target->MouseMove(mx, my);
 			});
 		}
-	}
-
-	// mouse wheel
-	if (curInput.mouseWheel != lastInput.mouseWheel)
-	{
-		int mw = curInput.mouseWheel;
-
-		loopTargets([mw](InputTarget* target)
-		{
-			target->MouseWheel(mw);
-		});
-	}
-
-	// mouse movement
-	if (curInput.mouseX != lastInput.mouseX || curInput.mouseY != lastInput.mouseY)
-	{
-		int mx = curInput.mouseX;
-		int my = curInput.mouseY;
-
-		loopTargets([mx, my](InputTarget* target)
-		{
-			target->MouseMove(mx, my);
-		});
 	}
 
 	lastInput = curInput;
 
-	if (!a1 && !caught && !Is2060())
+	// keys typed
 	{
-		int off = ((*(int*)(0x142B3FD18) - 1) & 1) ? 4 : 0;
+		static uint16_t lastInputChar = 0;
+		static uint32_t inputCharChangedAt = timeGetTime();
+
+		auto currentInputChar = rgd->inputChar;
+		bool inputCharChanged = currentInputChar != lastInputChar;
+
+		lastInputChar = currentInputChar;
+
+		if (currentInputChar > 0)
+		{
+			auto vkey = VkKeyScanW(lastInputChar);
+
+			if (inputCharChanged)
+			{
+				inputCharChangedAt = timeGetTime();
+				ProcessWMChar(currentInputChar, vkey);
+			}
+			else if (timeGetTime() - inputCharChangedAt > 300)
+			{
+				ProcessWMChar(currentInputChar, vkey);
+			}
+		}
+	}
+
+	if (!a1 && !blockGameInput)
+	{
+		int off = ((*g_inputOffset - 1) & 1) ? 1 : 0;
 
 		// TODO: handle flush of keyboard
-		// 1604-rg
-		memcpy((void*)0x142B3FAD0, rgd->keyboardState, 256);
-		*(uint32_t*)(0x142B3FD08 + off) = curInput.mouseX;
-		*(uint32_t*)(0x142B3FD10 + off) = curInput.mouseY;
-		*(uint32_t*)0x142B3FD8C = rgd->mouseButtons;
-		*(uint32_t*)0x142B3FCE4 = rgd->mouseWheel;
+		memcpy(g_gameKeyArray, curInput.keyboardState, 256);
+		if (off)
+		{
+			rage::g_input.m_lastDX() = curInput.mouseDeltaX;
+			rage::g_input.m_lastDY() = curInput.mouseDeltaY;
+		}
+		else
+		{
+			rage::g_input.m_dX() = curInput.mouseDeltaX;
+			rage::g_input.m_dY() = curInput.mouseDeltaY;
+		}
+
+		rage::g_input.m_cursorAbsX() = std::clamp(rage::g_input.m_cursorAbsX() + curInput.mouseDeltaX, 0, rgd->twidth);
+		rage::g_input.m_cursorAbsY() = std::clamp(rage::g_input.m_cursorAbsY() + curInput.mouseDeltaY, 0, rgd->theight);
+
+		rage::g_input.m_Buttons() = curInput.mouseButtons;
+		rage::g_input.m_dZ() = curInput.mouseWheel;
 
 		origSetInput(a1, a2, a3, a4);
 
-		off = 0;// ((*(int*)(0x142B3FD18) - 1) & 1) ? 4 : 0;
+		off = 0;
 
-		memcpy(rgd->keyboardState, (void*)0x142B3FAD0, 256);
-		rgd->mouseX = *(uint32_t*)(0x142B3FD08 + off);
-		rgd->mouseY = *(uint32_t*)(0x142B3FD10 + off);
-		rgd->mouseButtons = *(uint32_t*)0x142B3FD8C;
-		rgd->mouseWheel = *(uint32_t*)0x142B3FCE4;
+		if (!rgd->skipKeyboardStateCopyback)
+		{
+			memcpy(rgd->keyboardState, g_gameKeyArray, 256);
+		}
+
+		if (off)
+		{
+			rgd->mouseDeltaX = rage::g_input.m_lastDX();
+			rgd->mouseDeltaY = rage::g_input.m_lastDY();
+		}
+		else
+		{
+			rgd->mouseDeltaX = rage::g_input.m_dX();
+			rgd->mouseDeltaY = rage::g_input.m_dY();
+		}
+		rgd->mouseButtons = rage::g_input.m_Buttons();
+		rgd->mouseWheel = rage::g_input.m_dZ();
 	}
 
 	ReleaseMutex(rgd->inputMutex);
 }
 
-static HookFunction hookFunction([] ()
+// testing valid gamepads, similar to how the game does it
+#if 0
+#include <Xinput.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "Xinput9_1_0")
+#endif
+#endif
+
+static void (*origIOPadUpdate)(void*, bool);
+
+// This hook is used for ReverseGame Gamepad input
+static void rage__ioPad__Update(rage::ioPad* thisptr, bool onlyVibrate)
+{
+	static HostSharedData<ReverseGameData> rgd("CfxReverseGameData");
+	WaitForSingleObject(rgd->inputMutex, INFINITE);
+
+	static char* location = (char*)hook::get_pattern("48 8D 05 ? ? ? ? 48 2B C8 48 B8 AB AA AA AA AA");
+	static int offset = *(int*)(location + 3);
+	static void* ioPadArray = location + offset + 7;
+
+#if 0
+	XINPUT_STATE state;
+	DWORD dwUserIndex = ((uintptr_t)out_RageIOPadState - (uintptr_t)ioPadArray) / 96/*sizeof(RageIOPad)*/;
+	if( !XInputGetState( dwUserIndex, &state ) )
+	{
+		trace("Pad is Valid\n");
+	}
+#endif
+
+	origIOPadUpdate(thisptr, onlyVibrate);
+
+	// save this from the original function
+	rgd->gamepad.lastButtonFlags = thisptr->lastButtonFlags;
+
+	// apply gamepad struct to the game
+	*thisptr = rgd->gamepad;
+
+	ReleaseMutex(rgd->inputMutex);
+}
+
+static int Return0()
+{
+	return 0;
+}
+
+static HookFunction hookFunction([]()
 {
 	static int* captureCount = hook::get_address<int*>(hook::get_pattern("48 3B 05 ? ? ? ? 0F 45 CA 89 0D ? ? ? ? 48 83 C4 28", 12));
 
@@ -367,11 +703,11 @@ static HookFunction hookFunction([] ()
 	});
 
 	// window procedure
-	char* location = hook::pattern("48 8D 05 ? ? ? ? 33 C9 44 89 75 20 4C 89 7D").count(1).get(0).get<char>(3);
-	
+	char* location = xbr::IsGameBuildOrGreater<2545>() ? hook::pattern("48 8D 05 ? ? ? ? 33 C9 89 75 20 4C 89 7D").count(1).get(0).get<char>(3) : hook::pattern("48 8D 05 ? ? ? ? 33 C9 44 89 75 20 4C 89 7D").count(1).get(0).get<char>(3);
+
 	origWndProc = (WNDPROC)(location + *(int32_t*)location + 4);
 
-	*(int32_t*)location = (intptr_t)(hook::AllocateFunctionStub(grcWindowProcedure)) - (intptr_t)location - 4;
+	hook::put<int32_t>(location, (intptr_t)(hook::AllocateFunctionStub(grcWindowProcedure)) - (intptr_t)location - 4);
 
 	// disable mouse focus function
 	void* patternMatch = hook::pattern("74 0D 38 1D ? ? ? ? 74 05 E8 ? ? ? ? 48 39").count(1).get(0).get<void>(10);
@@ -420,15 +756,43 @@ static HookFunction hookFunction([] ()
 	// don't allow SetCursorPos during focus
 	hook::iat("user32.dll", SetCursorPosWrap, "SetCursorPos");
 
+	hook::iat("user32.dll", HookShowCursor, "ShowCursor");
+
+	// NOTE: this specific flow should *only* be used if RG!
+	// there's a call above in OnGameFrame which handles all other ancillary responsibilities
 	static HostSharedData<CfxState> initState("CfxInitState");
 
-	if (initState->isReverseGame && !Is2060())
+	if (initState->isReverseGame)
 	{
-		// 1604-rg
-		// rg
-		hook::set_call(&origSetInput, 0x1407D1840);
-		hook::call(0x1407D1840, SetInputWrap);
+		if (launch::IsSDKGuest())
+		{
+			hook::iat("user32.dll", RegisterRawInputDevicesWrap, "RegisterRawInputDevices");
+		}
+
+		auto location = hook::get_pattern("45 33 C9 44 8A C7 40 8A D7 33 C9 E8", 11);
+		hook::set_call(&origSetInput, location);
+		hook::call(location, SetInputWrap);
+
+		// NOP these out in ReverseGame so the cursor will work
+		// Cursor X(Raw Input)
+		char* loc = hook::pattern("89 0D ? ? ? ? 8B 85").count(1).get(0).get<char>(0);
+		hook::nop(loc, 6);
+		// Cursor Y(Raw Input)
+		loc += 31;
+		hook::nop(loc, 6);
+
+		// Hook the GamePad sampling function so we can inject events into it from Reverse Game.
+		auto ioPadUpdate = hook::get_pattern("41 8A D6 48 8B CF E8 ? ? FF FF 48 83 C7 60", 6);
+		hook::set_call(&origIOPadUpdate, ioPadUpdate);
+		hook::call(ioPadUpdate, rage__ioPad__Update);
+
+		// NOP the function that changes mouse Input methods, this forces raw input
+		auto changeMouseInput = hook::get_pattern("0F 84 ? ? ? ? 8B CB E8 ? ? ? ? E9", 8);
+		hook::nop(changeMouseInput, 5);
 	}
+
+	// cancel out ioLogitechLedDevice
+	hook::jump(hook::get_pattern("85 C0 0F 85 ? ? 00 00 48 8B CB FF 15", -0x77), Return0);
 });
 
 fwEvent<HWND, UINT, WPARAM, LPARAM, bool&, LRESULT&> InputHook::DeprecatedOnWndProc;

@@ -1,9 +1,7 @@
 return {
 	include = function()
 		if not os.istarget('windows') then
-			defines { "BOTAN_DLL=" }
-		else
-			defines { "BOTAN_DLL=__declspec(dllimport)" }
+			defines { "BOTAN_DLL=__attribute__((visibility(\"default\")))" }
 		end
 
 		if _OPTIONS['game'] == 'server' then
@@ -28,10 +26,12 @@ return {
 				buildoptions '-mrdrnd -mrdseed'
 			end
 		else
-			defines { "BOTAN_DLL=" }
+			defines { "BOTAN_DLL=__attribute__((visibility(\"default\")))" }
 
 			buildoptions { '-msse', '-msse2' }
 		end
+
+		defines { "BOTAN_IS_BEING_BUILT" }
 
 		if os.istarget('windows') then
 			links { 'ws2_32', 'crypt32' }
@@ -49,7 +49,7 @@ return {
 			end
 		elseif os.istarget('linux') then
 			prebuildcommands {
-				('cp %s %s'):format(
+				('cp -a %s %s'):format(
 					path.getabsolute('vendor/botan_sv/include/build_linux.h'),
 					path.getabsolute('vendor/botan_sv/include/botan/build.h')
 				)

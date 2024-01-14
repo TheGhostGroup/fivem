@@ -6,6 +6,7 @@
 #include <GameInit.h>
 
 #include <CoreNetworking.h>
+#include <CrossBuildRuntime.h>
 #include <Error.h>
 
 NetLibrary* g_netLibrary;
@@ -101,7 +102,7 @@ int __stdcall CfxBind(SOCKET s, sockaddr* addr, int addrlen)
 {
 	sockaddr_in* addrIn = (sockaddr_in*)addr;
 
-	trace("binder on %i is %p\n", htons(addrIn->sin_port), s);
+	trace("binder on %d is %p\n", htons(addrIn->sin_port), (void*)s);
 
 	if (htons(addrIn->sin_port) == 6672)
 	{
@@ -182,9 +183,22 @@ static hook::cdecl_stub<bool()> isNetworkHost([]()
 	return hook::get_pattern("33 DB 38 1D ? ? ? ? 75 1B 38 1D", -6);
 });
 
+void MumbleVoice_BindNetLibrary(NetLibrary*);
+void ObjectIds_BindNetLibrary(NetLibrary*);
+
+#include <CloneManager.h>
+
 static HookFunction initFunction([]()
 {
 	g_netLibrary = NetLibrary::Create();
+
+	Instance<NetLibrary>::Set(g_netLibrary);
+
+	TheClones->BindNetLibrary(g_netLibrary);
+
+	MumbleVoice_BindNetLibrary(g_netLibrary);
+
+	ObjectIds_BindNetLibrary(g_netLibrary);
 
 	g_netLibrary->OnBuildMessage.Connect([](const std::function<void(uint32_t, const char*, int)>& writeReliable)
 	{
@@ -212,6 +226,42 @@ static HookFunction initFunction([]()
 		}
 	});
 
+	g_netLibrary->AddReliableHandler("msgFrame", [](const char* data, size_t len)
+	{
+		net::Buffer buffer(reinterpret_cast<const uint8_t*>(data), len);
+		auto idx = buffer.Read<uint32_t>();
+
+		auto icgi = Instance<ICoreGameInit>::Get();
+
+		uint8_t strictLockdown = 0;
+
+		if (icgi->NetProtoVersion >= 0x202002271209)
+		{
+			strictLockdown = buffer.Read<uint8_t>();
+		}
+
+		static uint8_t lastStrictLockdown;
+
+		if (strictLockdown != lastStrictLockdown)
+		{
+			if (!strictLockdown)
+			{
+				icgi->ClearVariable("strict_entity_lockdown");
+			}
+			else
+			{
+				icgi->SetVariable("strict_entity_lockdown");
+			}
+
+			lastStrictLockdown = strictLockdown;
+		}
+	}, true);
+
+	OnMainGameFrame.Connect([]()
+	{
+		g_netLibrary->RunMainFrame();
+	});
+
 	OnGameFrame.Connect([]()
 	{
 		g_netLibrary->RunFrame();
@@ -233,7 +283,7 @@ static HookFunction initFunction([]()
 
 static hook::cdecl_stub<void(int, void*, void*)> joinOrHost([]()
 {
-	return hook::get_pattern("48 8D 55 30 49 83 60 10 00 44 8B F1", -32);
+	return hook::get_call(hook::get_pattern("45 33 C9 41 8D 51 04 E8", 26));
 });
 
 // 
@@ -523,12 +573,12 @@ static hook::cdecl_stub<void(void*)> _rlPresence_GamerPresence_Clear([]()
 
 static hook::cdecl_stub<void(int)> _rlPresence_refreshSigninState([]()
 {
-	return hook::get_pattern("48 8D 54 24 20 48 69 ? ? ? ? ? 48 8D 05 ? ? ? ? 4C", -0x35);
+	return hook::get_call(hook::get_pattern("40 84 FF 74 0E 33 C9 E8", 7));
 });
 
 static hook::cdecl_stub<void(int)> _rlPresence_refreshNetworkStatus([]()
 {
-	return hook::get_pattern("45 33 ? 8B DE EB 0F 48 8D", -0x7D);
+	return hook::get_call(hook::get_pattern("40 84 FF 74 0E 33 C9 E8", 14));
 });
 
 // unused if we use sc sessions
@@ -599,7 +649,6 @@ static void WINAPI ExitProcessReplacement(UINT exitCode)
 	if (g_netLibrary)
 	{
 		g_netLibrary->Disconnect((g_quitMsg.empty()) ? "Exiting" : g_quitMsg.c_str());
-		g_netLibrary->FinalizeDisconnect();
 	}
 
 	TerminateProcess(GetCurrentProcess(), exitCode);
@@ -636,6 +685,39 @@ static struct : GtaThread
 	}
 } fakeThread;
 
+struct LoggedInt
+{
+	LoggedInt(int a)
+		: value(a)
+	{
+	}
+
+	LoggedInt& operator=(int value)
+	{
+		if (this->value != value)
+		{
+			trace("tryHostState changing from %d to %d\n", this->value, value);
+			this->value = value;
+		}
+
+		return *this;
+	}
+
+	operator int() const
+	{
+		return value;
+	}
+
+	int value;
+};
+
+bool IsWaitingForTimeSync();
+
+static int ReturnTrue()
+{
+	return true;
+}
+
 static HookFunction hookFunction([]()
 {
 	static ConsoleCommand quitCommand("quit", [](const std::string& message)
@@ -660,7 +742,7 @@ static HookFunction hookFunction([]()
 	// exitprocess -> terminateprocess
 	MH_Initialize();
 	MH_CreateHookApi(L"kernel32.dll", "ExitProcess", ExitProcessReplacement, nullptr);
-	MH_CreateHook(hook::get_pattern("48 8B F9 48 89 44 24 20 41 FF 52 28 85", -0x22), HandleInitPlayerResultStub, (void**)&g_origHandleInitPlayerResult);
+	MH_CreateHook(hook::get_pattern("45 33 C9 4C 8B 11 49 8B D8 48 8B F9", xbr::IsGameBuildOrGreater<1436>() ? -0x1E : -0x19), HandleInitPlayerResultStub, (void**)&g_origHandleInitPlayerResult);
 	MH_EnableHook(MH_ALL_HOOKS);
 
 	hook::iat("ws2_32.dll", CfxSendTo, 20);
@@ -675,23 +757,40 @@ static HookFunction hookFunction([]()
 		auto getLocalPeerAddress = hook::get_pattern<char>("48 8B D0 80 78 ? 02 75", -0x32);
 		hook::jump(getLocalPeerAddress, GetLocalPeerAddress);
 		hook::jump(hook::get_call(getLocalPeerAddress + 0x28), GetLocalPeerId);
-		//hook::jump(hook::get_call(getLocalPeerAddress + 0x2D), GetMyRelayAddress);
-		//hook::jump(hook::get_call(getLocalPeerAddress + 0x62), GetPublicIpAddress);
-		hook::jump(hook::get_call(getLocalPeerAddress + 0xF5), GetGamerHandle);
-		hook::jump(hook::get_call(getLocalPeerAddress + 0x116), InitP2PCryptKey);
-		//hook::call(0x14266F66C, InitP2PCryptKey);
-		//hook::call(0x14267B5A0, InitP2PCryptKey);
+
+		if (xbr::IsGameBuildOrGreater<1491>())
+		{
+			hook::jump(hook::get_call(getLocalPeerAddress + 0x103), GetGamerHandle);
+			hook::jump(hook::get_call(hook::get_call(getLocalPeerAddress + 0x114) + 0x14), InitP2PCryptKey);
+		}
+		else if (xbr::IsGameBuildOrGreater<1436>())
+		{
+			hook::jump(hook::get_call(getLocalPeerAddress + 0xF1), GetGamerHandle);
+			hook::jump(hook::get_call(hook::get_call(getLocalPeerAddress + 0x102) + 0x14), InitP2PCryptKey);
+		}
+		else
+		{
+			hook::jump(hook::get_call(getLocalPeerAddress + 0xF5), GetGamerHandle);
+			hook::jump(hook::get_call(getLocalPeerAddress + 0x116), InitP2PCryptKey);
+		}
 	}
 
 	//
 	//hook::call(0x1426E100B, ParseAddGamer);
 
 	// all uwuids be 2
-	hook::call(hook::get_pattern("B9 03 00 00 00 B8 01 00 00 00 87 83", -85), ZeroUUID);
+	if (xbr::IsGameBuildOrGreater<1436>())
+	{
+		hook::call(hook::get_pattern("48 83 A4 24 E0 00 00 00 00 48 8D 8C 24 E0", 17), ZeroUUID);
+	}
+	else
+	{
+		hook::call(hook::get_pattern("B9 03 00 00 00 B8 01 00 00 00 87 83", -85), ZeroUUID);
+	}
 
 	// get session for find result
 	// 1207.58
-	hook::jump(hook::get_pattern("48 85 C0 74 31 80 38 00 74 2C 45", -0x1B), ReadSession);
+	hook::jump(hook::get_pattern("48 85 C0 74 ? 80 38 00 74 ? 45", -0x1B), ReadSession);
 
 	seamlessOff = hook::get_address<uint8_t*>(hook::get_pattern("33 DB 38 1D ? ? ? ? 75 1B 38 1D", 4));
 
@@ -702,9 +801,12 @@ static HookFunction hookFunction([]()
 	// skip seamless host for is-host call
 	//hook::put<uint8_t>(hook::get_pattern("75 1B 38 1D ? ? ? ? 74 36"), 0xEB);
 
-	rlPresence__m_GamerPresences = hook::get_address<void*>(hook::get_pattern("48 8D 54 24 20 48 69 ? ? ? ? ? 48 8D 05 ? ? ? ? 4C", 0x44 - 0x35));
+	rlPresence__m_GamerPresences = hook::get_address<void*>(hook::get_pattern("F6 84 01 ? ? ? ? 02 74 ? 48 05", -4));
 
-	static int tryHostStage = 0;
+	// pretend to have CGameScriptHandlerNetComponent always be host
+	hook::jump(hook::get_pattern("33 DB 48 85 C0 74 17 48 8B 48 10 48 85 C9 74 0E", -10), ReturnTrue);
+
+	static LoggedInt tryHostStage = 0;
 
 	static bool gameLoaded;
 
@@ -712,6 +814,8 @@ static HookFunction hookFunction([]()
 	{
 		gameLoaded = true;
 	});
+
+	static ICoreGameInit* cgi = Instance<ICoreGameInit>::Get();
 
 	OnKillNetwork.Connect([](const char*)
 	{
@@ -735,7 +839,7 @@ static HookFunction hookFunction([]()
 			_rlPresence_refreshSigninState(0);
 			_rlPresence_refreshNetworkStatus(0);
 
-			tryHostStage = 2;
+			tryHostStage = 1;
 			break;
 		}
 		case 1:
@@ -786,19 +890,35 @@ static HookFunction hookFunction([]()
 			break;
 
 		case 5:
+			if (cgi->OneSyncEnabled)
+			{
+				if (IsWaitingForTimeSync())
+				{
+					return;
+				}
+			}
+
 			static char sessionIdPtr[48];
 			memset(sessionIdPtr, 0, sizeof(sessionIdPtr));
-			joinOrHost(0, nullptr, sessionIdPtr);
+			joinOrHost(1, nullptr, sessionIdPtr);
 
 			tryHostStage = 6;
 
 			break;
 
 		case 6:
-			if (*(BYTE*)((uint64_t)g_networkMgrPtr + 24))
+			struct
 			{
-				uint64_t networkMgr = *(uint64_t*)((uint64_t)g_networkMgrPtr);
-				auto networkState = *(BYTE*)(*(uint64_t*)networkMgr + networkStateOffset);
+				char* sessionMultiplayer;
+				char pad[16];
+				uint8_t networkInited;
+			}* networkMgr;
+
+			networkMgr = *(decltype(networkMgr)*)g_networkMgrPtr;
+
+			if (networkMgr->networkInited)
+			{
+				auto networkState = *(BYTE*)(networkMgr->sessionMultiplayer + networkStateOffset);
 
 				if (networkState == 4)
 				{
@@ -824,13 +944,7 @@ static HookFunction hookFunction([]()
 	// rlSession::InformPeersOfJoiner bugfix: reintroduce loop (as in, remove break; statement)
 	// (by handling the _called function_ and adding the loop in a wrapper there)
 	{
-		auto location = hook::get_pattern<char>("4C 63 83 ? ? 00 00 4D 85 C0 7E 4F 33");
-
-		playerCountOffset = *(uint32_t*)(location + 3);
-		playerListOffset = *(uint32_t*)(location + 14 + 3);
-		backwardsOffset = *(uint32_t*)(location + 62 + 3);
-
-		hook::set_call(&origSendGamer, location + 86);
+		auto location = hook::get_pattern<char>("48 8D 8B ? ? ? ? 48 8B 11 ? 3B D6 75 0E");
 
 		static struct : jitasm::Frontend
 		{
@@ -844,7 +958,24 @@ static HookFunction hookFunction([]()
 			}
 		} stub;
 
-		hook::call(location + 86, stub.GetCode());
+		if (xbr::IsGameBuildOrGreater<1436>())
+		{
+			playerCountOffset = *(uint32_t*)(location - 15 + 3);
+			playerListOffset = *(uint32_t*)(location + 3);
+			backwardsOffset = *(uint32_t*)(location + 45 + 3);
+
+			hook::set_call(&origSendGamer, location + 70);
+			hook::call(location + 70, stub.GetCode());
+		}
+		else
+		{
+			playerCountOffset = *(uint32_t*)(location - 14 + 3);
+			playerListOffset = *(uint32_t*)(location + 3);
+			backwardsOffset = *(uint32_t*)(location + 48 + 3);
+
+			hook::set_call(&origSendGamer, location + 72);
+			hook::call(location + 72, stub.GetCode());
+		}
 	}
 
 #if 0
@@ -870,7 +1001,7 @@ static HookFunction hookFunction([]()
 #endif
 
 	// don't allow tunable download requests to be considered pending
-	hook::jump(hook::get_pattern("44 8B C1 44 0F B7 50 40 45 85 D2 74 18", -0x15), Return<int, 0>);
+	hook::jump(hook::get_call(hook::get_pattern("75 59 48 8B C8 E8 ? ? ? ? 84 C0 75", 5)), Return<int, 0>);
 
 	// test: don't allow setting odd seamless mode
 	//hook::jump(hook::get_call(hook::get_pattern("B1 01 E8 ? ? ? ? 80 3D", 2)), SetSeamlessOn);
@@ -891,12 +1022,27 @@ static HookFunction hookFunction([]()
 	hook::jump(hook::get_pattern("33 C0 39 41 18 74 11 F6 81 B4 00 00"), Return<int, 1>); // 1408A1014
 
 	// skip cash/inventory
-	hook::jump(hook::get_pattern("75 21 4C 8D 0D ? ? ? ? 41 B8 30 10 00 10", -0x21), Return<int, 2>); // 1423E93A8
-	hook::jump(hook::get_pattern("A9 FD FF FF FF 75 64 48 8B 0D", -0x3A), Return<int, 2>); // 0x1423FAB4C
+	if (xbr::IsGameBuildOrGreater<1436>())
+	{
+		hook::jump(hook::get_pattern("75 42 8D 53 03 C7 44 24 20 F4 D2", -0x21), Return<int, 2>);
+		hook::jump(hook::get_pattern("A9 FD FF FF FF 0F 85 B1 00 00 00 48", -0x3E), Return<int, 2>);
+	}
+	else
+	{
+		hook::jump(hook::get_pattern("75 21 4C 8D 0D ? ? ? ? 41 B8 30 10 00 10", -0x21), Return<int, 2>);
+		hook::jump(hook::get_pattern("A9 FD FF FF FF 75 64 48 8B 0D", -0x3A), Return<int, 2>);
+	}
 
 	// skip poker
-	hook::jump(hook::get_pattern("48 83 EC 28 48 8B 0D ? ? ? ? E8 ? ? ? ? F6 D8 1B C0 83 C0 02"), Return<int, 2>); // 0x1423E9338
-	hook::jump(hook::get_pattern("B8 02 00 00 00 EB 1F 38 91", -0x22), Return<int, 2>); // 0x1423FAAFC
+	if (xbr::IsGameBuildOrGreater<1436>())
+	{
+		hook::jump(hook::get_pattern("48 83 EC 38 48 8B 0D ? ? ? ? E8 ? ? ? ? 33"), Return<int, 2>);
+	}
+	else
+	{
+		hook::jump(hook::get_pattern("48 83 EC 28 48 8B 0D ? ? ? ? E8 ? ? ? ? F6 D8 1B C0 83 C0 02"), Return<int, 2>);
+		hook::jump(hook::get_pattern("B8 02 00 00 00 EB 1F 38 91", -0x22), Return<int, 2>);
+	}
 
 	// don't stop unsafe network scripts
 	hook::jump(hook::get_pattern("83 7B 10 02 74 21 48 8B CB E8", -0x35), Return<int, 0>); // 0x140E8A58C
@@ -915,5 +1061,22 @@ static HookFunction hookFunction([]()
 		auto location = hook::get_pattern<char>("77 0C BA 02 00 00 00 EB 05 BA 01");
 		hook::put<int>(location + 3, 1);
 		hook::put<int>(location + 10, 2);
+	}
+
+	// unusual script check before allowing session to continue
+	if (xbr::IsGameBuildOrGreater<1436>())
+	{
+		hook::nop(hook::get_pattern("84 C0 0F 85 ? 00 00 00 ? ? ? ? 75 ? BA 02 00 00 00", 2), 6);
+	}
+	else
+	{
+		hook::nop(hook::get_pattern("84 C0 75 6C 44 39 7B 20 75", 2), 2);
+	}
+
+	// ignore tunable (0xE3AFC5BD/0x7CEC5CDA) which intentionally breaking some certain
+	// ped models appearance from syncing between clients, initially added in 1436.31
+	if (xbr::IsGameBuildOrGreater<1436>())
+	{
+		hook::jump(hook::get_pattern("B9 BD C5 AF E3 BA DA 5C EC 7C E8", -19), Return<bool, false>);
 	}
 });

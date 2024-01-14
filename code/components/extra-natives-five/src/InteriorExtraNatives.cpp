@@ -12,11 +12,11 @@
 #define DECLARE_ACCESSOR(x) \
 	decltype(impl.m2060.x)& x()        \
 	{                       \
-		return (Is2060() ? impl.m2060.x : impl.m1604.x);   \
+		return (xbr::IsGameBuildOrGreater<2060>() ? impl.m2060.x : impl.m1604.x);   \
 	} \
 	const decltype(impl.m2060.x)& x() const                         \
 	{                                                    \
-		return (Is2060() ? impl.m2060.x : impl.m1604.x);  \
+		return (xbr::IsGameBuildOrGreater<2060>() ? impl.m2060.x : impl.m1604.x);  \
 	}
 
 using Matrix3x4 = DirectX::XMFLOAT3X4;
@@ -29,7 +29,7 @@ struct Vector
 	float w; // +16
 };
 
-struct CEntityDef
+struct iCEntityDef
 {
 	void* vtable; // +0
 	uint32_t archetypeName; // +8
@@ -85,7 +85,7 @@ struct CMloEntitySet
 	void* vtable; // +0
 	uint64_t name; // +8
 	atArray<int32_t> locations; // +12
-	atArray<CEntityDef> entities; // +28
+	atArray<iCEntityDef> entities; // +28
 };
 
 struct CMloTimeCycleModifier
@@ -102,7 +102,7 @@ struct CMloTimeCycleModifier
 struct CMloModelInfo
 {
 	char pad1[200]; // +0
-	atArray<CEntityDef*>* entities; // +200
+	atArray<iCEntityDef*>* entities; // +200
 	atArray<CMloRoomDef>* rooms; // +208
 	atArray<CMloPortalDef>* portals; // +216
 	atArray<CMloEntitySet>* entitySets; // +224
@@ -189,9 +189,9 @@ static CInteriorProxy<Build>* GetInteriorProxy(int handle)
 
 static CMloModelInfo* GetInteriorArchetype(int interiorId)
 {
-	CInteriorInst* instance;
+	CInteriorInst* instance = nullptr;
 
-	if (Is2060())
+	if (xbr::IsGameBuildOrGreater<2060>())
 	{
 		CInteriorProxy<2060>* proxy = GetInteriorProxy<2060>(interiorId);
 		if (proxy)
@@ -252,6 +252,28 @@ static CMloEntitySet* GetInteriorEntitySet(int interiorId, int setId)
 	return &(arch->entitySets->Get(setId));
 }
 
+static iCEntityDef* GetInteriorPortalEntityDef(int interiorId, int portalId, int entityId)
+{
+	CMloModelInfo* arch = GetInteriorArchetype(interiorId);
+	if (arch == nullptr)
+	{
+		return nullptr;
+	}
+
+	CMloPortalDef* portalDef = GetInteriorPortalDef(interiorId, portalId);
+	if (portalDef == nullptr)
+	{
+		return nullptr;
+	}
+
+	if (entityId < 0 || entityId > (portalDef->attachedObjects.GetCount()) - 1)
+	{
+		return nullptr;
+	}
+
+	return arch->entities->Get(portalDef->attachedObjects[entityId]);
+}
+
 static CMloTimeCycleModifier* GetInteriorTimecycleModifier(int interiorId, int modId)
 {
 	CMloModelInfo* arch = GetInteriorArchetype(interiorId);
@@ -286,7 +308,7 @@ static HookFunction initFunction([]()
 	{
 		auto location = hook::get_pattern<char>("BA A1 85 94 52 41 B8 01", 0x34);
 
-		if (Is2060())
+		if (xbr::IsGameBuildOrGreater<2060>())
 		{
 			g_interiorProxyPool<2060> = hook::get_address<decltype(g_interiorProxyPool<2060>)>(location);
 		}
@@ -439,13 +461,13 @@ static HookFunction initFunction([]()
 			return false;
 		}
 
-		*context.GetArgument<float*>(1) = roomDef->bbMin.x;
-		*context.GetArgument<float*>(2) = roomDef->bbMin.y;
-		*context.GetArgument<float*>(3) = roomDef->bbMin.z;
+		*context.GetArgument<float*>(2) = roomDef->bbMin.x;
+		*context.GetArgument<float*>(3) = roomDef->bbMin.y;
+		*context.GetArgument<float*>(4) = roomDef->bbMin.z;
 
-		*context.GetArgument<float*>(4) = roomDef->bbMax.x;
-		*context.GetArgument<float*>(5) = roomDef->bbMax.y;
-		*context.GetArgument<float*>(6) = roomDef->bbMax.z;
+		*context.GetArgument<float*>(5) = roomDef->bbMax.x;
+		*context.GetArgument<float*>(6) = roomDef->bbMax.y;
+		*context.GetArgument<float*>(7) = roomDef->bbMax.z;
 
 		return true;
 	});
@@ -645,7 +667,7 @@ static HookFunction initFunction([]()
 
 		Vector* position;
 
-		if (Is2060())
+		if (xbr::IsGameBuildOrGreater<2060>())
 		{
 			CInteriorProxy<2060>* proxy = GetInteriorProxy<2060>(interiorId);
 			position = &proxy->position;
@@ -667,7 +689,7 @@ static HookFunction initFunction([]()
 
 		Vector* rotation;
 
-		if (Is2060())
+		if (xbr::IsGameBuildOrGreater<2060>())
 		{
 			CInteriorProxy<2060>* proxy = GetInteriorProxy<2060>(interiorId);
 			rotation = &proxy->rotation;
@@ -691,7 +713,7 @@ static HookFunction initFunction([]()
 		Vector* bbMin;
 		Vector* bbMax;
 
-		if (Is2060())
+		if (xbr::IsGameBuildOrGreater<2060>())
 		{
 			CInteriorProxy<2060>* proxy = GetInteriorProxy<2060>(interiorId);
 			bbMin = &proxy->entitiesExtentsMin;
@@ -739,5 +761,108 @@ static HookFunction initFunction([]()
 		}
 
 		context.SetResult<int>(result);
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_INTERIOR_PORTAL_ENTITY_COUNT", [=](fx::ScriptContext& context)
+	{
+		auto interiorId = context.GetArgument<int>(0);
+		auto portalId = context.GetArgument<int>(1);
+		auto result = 0;
+
+		CMloPortalDef* portalDef = GetInteriorPortalDef(interiorId, portalId);
+		if (portalDef != nullptr)
+		{
+			result = portalDef->attachedObjects.GetCount();
+		}
+
+		context.SetResult<int>(result);
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_INTERIOR_PORTAL_ENTITY_ARCHETYPE", [=](fx::ScriptContext& context)
+	{
+		auto interiorId = context.GetArgument<int>(0);
+		auto portalId = context.GetArgument<int>(1);
+		auto entityId = context.GetArgument<int>(2);
+		auto result = 0;
+
+		iCEntityDef* entityDef = GetInteriorPortalEntityDef(interiorId, portalId, entityId);
+		if (entityDef != nullptr)
+		{
+			result = entityDef->archetypeName;
+		}
+
+		context.SetResult<int>(result);
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_INTERIOR_PORTAL_ENTITY_FLAG", [=](fx::ScriptContext& context)
+	{
+		auto interiorId = context.GetArgument<int>(0);
+		auto portalId = context.GetArgument<int>(1);
+		auto entityId = context.GetArgument<int>(2);
+		auto result = -1;
+
+		iCEntityDef* entityDef = GetInteriorPortalEntityDef(interiorId, portalId, entityId);
+		if (entityDef != nullptr)
+		{
+			result = entityDef->flags;
+		}
+
+		context.SetResult<int>(result);
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("SET_INTERIOR_PORTAL_ENTITY_FLAG", [=](fx::ScriptContext& context)
+	{
+		auto interiorId = context.GetArgument<int>(0);
+		auto portalId = context.GetArgument<int>(1);
+		auto entityId = context.GetArgument<int>(2);
+		auto newValue = context.GetArgument<int>(3);
+
+		iCEntityDef* entityDef = GetInteriorPortalEntityDef(interiorId, portalId, entityId);
+		if (entityDef != nullptr)
+		{
+			entityDef->flags = newValue;
+			return true;
+		}
+
+		return false;
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_INTERIOR_PORTAL_ENTITY_POSITION", [=](fx::ScriptContext& context)
+	{
+		auto interiorId = context.GetArgument<int>(0);
+		auto portalId = context.GetArgument<int>(1);
+		auto entityId = context.GetArgument<int>(2);
+
+		iCEntityDef* entityDef = GetInteriorPortalEntityDef(interiorId, portalId, entityId);
+		if (entityDef == nullptr)
+		{
+			return false;
+		}
+
+		*context.GetArgument<float*>(3) = entityDef->position.x;
+		*context.GetArgument<float*>(4) = entityDef->position.y;
+		*context.GetArgument<float*>(5) = entityDef->position.z;
+
+		return true;
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_INTERIOR_PORTAL_ENTITY_ROTATION", [=](fx::ScriptContext& context)
+	{
+		auto interiorId = context.GetArgument<int>(0);
+		auto portalId = context.GetArgument<int>(1);
+		auto entityId = context.GetArgument<int>(2);
+
+		iCEntityDef* entityDef = GetInteriorPortalEntityDef(interiorId, portalId, entityId);
+		if (entityDef == nullptr)
+		{
+			return false;
+		}
+
+		*context.GetArgument<float*>(3) = entityDef->rotation.x;
+		*context.GetArgument<float*>(4) = entityDef->rotation.y;
+		*context.GetArgument<float*>(5) = entityDef->rotation.z;
+		*context.GetArgument<float*>(6) = entityDef->rotation.w;
+
+		return true;
 	});
 });

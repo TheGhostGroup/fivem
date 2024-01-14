@@ -3,6 +3,19 @@ local lastKind
 
 local prj_root = path.getabsolute('../../')
 
+function resign()
+	-- proprietary and confidential tooling
+	if os.isfile("C:\\f\\shadesofgray.cmd") then
+		removepostbuildcommands {
+			"call C:\\f\\shadesofgray.cmd \"$(TargetPath)\""
+		}
+
+		postbuildcommands {
+			"call C:\\f\\shadesofgray.cmd \"$(TargetPath)\""
+		}
+	end
+end
+
 if os.istarget('windows') then
 	local oldLanguage = language
 	local oldProject = project
@@ -11,17 +24,12 @@ if os.istarget('windows') then
 	local function check()
 		if lastLang == 'C' or lastLang == 'C++' then
 			if lastKind == 'SharedLib' or lastKind == 'WindowedApp' or lastKind == 'ConsoleApp' then
-				-- proprietary and confidential tooling
-				if os.isfile("C:\\f\\shadesofgray.cmd") then
-					postbuildcommands {
-						"call C:\\f\\shadesofgray.cmd \"$(TargetPath)\""
-					}
-				end
+				resign()
 			end
 		
 			if lastKind == 'SharedLib' then
 				prelinkcommands {
-					'python "' .. prj_root .. '/tools/gen_rc.py" "%{prj.location}/%{prj.name}.rc" "%{prj.location}/%{prj.name}.res" "$(SDK_ExecutablePath_x64)" "%{prj.name}" "' .. _OPTIONS['game'] .. '"'
+					pythonExecutable .. ' "' .. prj_root .. '/tools/gen_rc.py" "%{prj.location}/%{prj.name}.rc" "%{prj.location}/%{prj.name}.res" "$(SDK_ExecutablePath_x64)" "%{prj.name}" "' .. _OPTIONS['game'] .. '"'
 				}
 				
 				linkoptions {
