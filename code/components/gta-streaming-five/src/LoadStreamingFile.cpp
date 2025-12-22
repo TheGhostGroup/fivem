@@ -8,6 +8,7 @@
 #include <StdInc.h>
 #include <jitasm.h>
 #include <Hooking.h>
+#include <Hooking.Stubs.h>
 
 #include <Pool.h>
 
@@ -29,6 +30,8 @@
 #include <MinHook.h>
 
 #include <CrossBuildRuntime.h>
+
+#include <CustomRtti.h>
 
 #if __has_include(<StatusText.h>)
 #include <StatusText.h>
@@ -744,6 +747,13 @@ public:
 	};
 };
 
+namespace DataFileType
+{
+static int DLC_ITYP_REQUEST;
+static int DLC_POP_GROUPS;
+static int DLC_WEAPON_PICKUPS;
+}
+
 static void* g_dataFileMgr;
 
 #ifdef GTA_FIVE
@@ -873,28 +883,11 @@ static int LookupDataFileType(const std::string& type)
 {
 	uint32_t thisHash = HashRageString(boost::to_upper_copy(type).c_str());
 
-#ifdef GTA_FIVE
-	int typesCount = 0xC9;
-
-	if (xbr::IsGameBuildOrGreater<2545>())
+	for (EnumEntry* i = g_dataFileTypes; (i->hash != 0) || (i->index != 0xFFFFFFFF); ++i)
 	{
-		typesCount = 0xCE;
-	}
-	else if (xbr::IsGameBuildOrGreater<2189>())
-	{
-		typesCount = 0xCB;
-	}
-#elif IS_RDR3
-	int typesCount = 0x18B;
-#endif
-
-	for (size_t i = 0; i < typesCount; i++)
-	{
-		auto entry = &g_dataFileTypes[i];
-
-		if (entry->hash == thisHash)
+		if (i->hash == thisHash)
 		{
-			return entry->index;
+			return i->index;
 		}
 	}
 
@@ -1036,9 +1029,9 @@ static hook::cdecl_stub<void()> _reloadMapIfNeeded([]()
 	return hook::get_pattern("74 1F 48 8D 0D ? ? ? ? E8 ? ? ? ? 48 8D 0D ? ? ? ? E8 ? ? ? ? C6 05", -0xB);
 });
 
+static char* loadChangeSet = nullptr;
 static void ReloadMapStoreNative()
 {
-	static auto loadChangeSet = hook::get_pattern<char>("48 81 EC 50 03 00 00 49 8B F0 4C", -0x18);
 	uint8_t origCode[0x4F3];
 	memcpy(origCode, loadChangeSet, sizeof(origCode));
 
@@ -1123,7 +1116,10 @@ static void ReloadMapStore()
 #endif
 		   )
 		{
+			// currently, Reloading custom collision causes it to break in RDR3
+#ifndef IS_RDR3
 			collisionFiles.push_back(std::make_pair(file, obj));
+#endif
 		}
 		else
 		{
@@ -1164,7 +1160,7 @@ static void ReloadMapStore()
 
 #ifdef GTA_FIVE
 	// needs verification for newer builds
-	if (!xbr::IsGameBuildOrGreater<3095 + 1>())
+	if (!xbr::IsGameBuildOrGreater<xbr::Build::Latest + 1>())
 	{
 		ReloadMapStoreNative();
 	}
@@ -1323,6 +1319,7 @@ public:
 		if (*module->FindSlotFromHashKey(&slotId, HashString(baseName.c_str())) != -1)
 #endif
 		{
+			// rage::fwAssetStore<rage::fwMapTypesContents,rage::fwMapTypesDef>
 			auto refPool = (atPoolBase*)((char*)module + 56);
 			auto refPtr = refPool->GetAt<char>(slotId);
 
@@ -1347,11 +1344,7 @@ public:
 			}
 		}
 
-#ifdef GTA_FIVE
-		CDataFileMount::sm_Interfaces[174]->LoadDataFile(entry);
-#elif IS_RDR3
-		CDataFileMount::sm_Interfaces[216]->LoadDataFile(entry);
-#endif
+		CDataFileMount::sm_Interfaces[DataFileType::DLC_ITYP_REQUEST]->LoadDataFile(entry);
 
 		return true;
 	}
@@ -1392,11 +1385,7 @@ public:
 			}
 		}
 
-#ifdef GTA_FIVE
-		CDataFileMount::sm_Interfaces[174]->UnloadDataFile(entry);
-#elif IS_RDR3
-		CDataFileMount::sm_Interfaces[216]->UnloadDataFile(entry);
-#endif
+		CDataFileMount::sm_Interfaces[DataFileType::DLC_ITYP_REQUEST]->UnloadDataFile(entry);
 	}
 };
 
@@ -1532,17 +1521,12 @@ static CDataFileMountInterface* LookupDataFileMounter(const std::string& type)
 	{
 		return &g_proxyInteriorOrderMounter;
 	}
-
-	if (fileType == 174) // DLC_ITYP_REQUEST
-	{
-		return &g_proxyDlcItypMounter;
-	}
-#elif IS_RDR3
-	if (fileType == 216) // DLC_ITYP_REQUEST
-	{
-		return &g_proxyDlcItypMounter;
-	}
 #endif
+
+	if (fileType == DataFileType::DLC_ITYP_REQUEST)
+	{
+		return &g_proxyDlcItypMounter;
+	}
 
 	return CDataFileMount::sm_Interfaces[fileType];
 }
@@ -1568,11 +1552,7 @@ static void HandleDataFile(const std::pair<std::string, std::string>& dataFile, 
 
 	if (mounter)
 	{
-#ifdef GTA_FIVE
-		std::string className = (xbr::IsGameBuildOrGreater<2802>()) ? fmt::sprintf("%p", (void*)hook::get_unadjusted(*(void**)mounter)) : typeid(*mounter).name();
-#else
-		std::string className = fmt::sprintf("%p", (void*)hook::get_unadjusted(*(void**)mounter));
-#endif
+		std::string className = SearchTypeName(mounter);
 
 		CDataFileMgr::DataFile entry;
 		memset(&entry, 0, sizeof(entry));
@@ -1604,7 +1584,6 @@ inline void HandleDataFileList(const TList& list, const TFn& fn, const char* op 
 	}
 }
 
-#ifdef GTA_FIVE
 template<typename TFn, typename TList>
 inline void HandleDataFileListWithTypes(TList& list, const TFn& fn, const std::set<int>& types, const char* op = "loading")
 {
@@ -1622,7 +1601,6 @@ inline void HandleDataFileListWithTypes(TList& list, const TFn& fn, const std::s
 		}
 	}
 }
-#endif
 
 enum class LoadType
 {
@@ -1637,12 +1615,7 @@ void LoadStreamingFiles(LoadType loadType = LoadType::AfterSession);
 
 static LONG FilterUnmountOperation(CDataFileMgr::DataFile& entry)
 {
-	// DLC_ITYP_REQUEST
-#ifdef GTA_FIVE
-	if (entry.type == 174)
-#elif IS_RDR3
-	if (entry.type == 216)
-#endif
+	if (entry.type == DataFileType::DLC_ITYP_REQUEST)
 	{
 		trace("failed to unload DLC_ITYP_REQUEST %s\n", entry.name);
 
@@ -1779,13 +1752,17 @@ namespace rage
 }
 
 #ifdef GTA_FIVE
-extern bool GetRawStreamerForFile(const char* fileName, rage::fiCollection** collection);
-
 static hook::cdecl_stub<void(int, const char*)> initGfxTexture([]()
 {
 	return hook::get_pattern("4C 23 C0 41 83 78 10 FF", -0x57);
 });
 #endif
+
+std::unordered_map<std::string, int> g_resourceStats;
+
+static void (*g_assetOverridesCb)(uint32_t, const char*) = nullptr;
+
+static void (*g_assetOverridesRemovalCb)(uint32_t) = nullptr;
 
 static void LoadStreamingFiles(LoadType loadType)
 {
@@ -1865,6 +1842,8 @@ static void LoadStreamingFiles(LoadType loadType)
 			continue;
 		}
 
+		g_resourceStats[ext]++;
+
 		// this may get used on unloading
 		if (baseName == "busy_spinner.gfx")
 		{
@@ -1934,12 +1913,9 @@ static void LoadStreamingFiles(LoadType loadType)
 			int collectionId = 0;
 
 #ifdef GTA_FIVE
-			rage::fiCollection* customRawStreamer;
-
-			if (GetRawStreamerForFile(file.c_str(), &customRawStreamer))
+			if (auto idx = streaming::GetRawStreamerForFile(file.c_str(), &rawStreamer))
 			{
-				rawStreamer = customRawStreamer;
-				collectionId = 1;
+				collectionId = idx;
 			}
 #endif
 
@@ -1968,6 +1944,11 @@ static void LoadStreamingFiles(LoadType loadType)
 
 					// save the new handle
 					hs.push_front(entry.handle);
+
+					if (g_assetOverridesCb)
+					{
+						g_assetOverridesCb(strId + strModule->baseIdx, file.c_str());
+					}
 				}
 			}
 			else
@@ -1981,9 +1962,18 @@ static void LoadStreamingFiles(LoadType loadType)
 					g_handleStack[fileId].push_front(entry.handle);
 
 					// only for 'real' rawStreamer (mod variant likely won't reregister)
-					if ((entry.handle >> 16) == 0)
+					if (streaming::IsRawHandle(entry.handle))
 					{
-						rage::pgRawStreamerInvalidateEntry(entry.handle & 0xFFFF);
+#ifdef GTA_FIVE
+						if (auto rawEntry = rawStreamer->GetEntry(streaming::GetEntryIndex(entry.handle)))
+						{
+							// if timestamp is 0 then GetEntry triggers the invalidation as well
+							rawEntry->timestamp = 0;
+							rawStreamer->GetEntry(streaming::GetEntryIndex(entry.handle));
+						}
+#else
+						rage::pgRawStreamerInvalidateEntry(streaming::GetEntryIndex(entry.handle));
+#endif
 					}
 
 					g_handlesToTag[entry.handle] = tag;
@@ -2019,8 +2009,8 @@ static void LoadStreamingFiles(LoadType loadType)
 							auto& entry = cstreaming->Entries[fileId];
 
 							// incorrect: fix it in the raw streamer
-							auto strEntry = const_cast<rage::fiCollection::FileEntry*>(rawStreamer->GetEntry(entry.handle & 0xFFFF));
-							strEntry->size = fd.fileSize;
+							auto strEntry = rawStreamer->GetEntry(streaming::GetEntryIndex(entry.handle));
+							strEntry->fe.size = fd.fileSize;
 						}
 					}
 				}
@@ -2616,11 +2606,13 @@ void DLL_EXPORT CfxCollection_RemoveStreamingTag(const std::string& tag)
 			strModule->FindSlotFromHashKey(&strId, HashString(nameWithoutExt.c_str()));
 #endif
 
-			auto rawStreamer = getRawStreamer();
-			uint32_t idx = (rawStreamer->GetCollectionId() << 16) | rawStreamer->GetEntryByName(file.c_str());
-
 			if (strId != -1)
 			{
+#ifdef IS_RDR3
+				auto rawStreamer = getRawStreamer();
+				uint32_t idx = (rawStreamer->GetCollectionId() << 16) | rawStreamer->GetEntryByName(file.c_str());
+#endif
+
 				// remove from our index set
 				g_ourIndexes.erase(strId + strModule->baseIdx);
 
@@ -2629,7 +2621,13 @@ void DLL_EXPORT CfxCollection_RemoveStreamingTag(const std::string& tag)
 
 				for (auto it = handleData.begin(); it != handleData.end(); ++it)
 				{
+#ifdef GTA_FIVE
+					auto rawStreamer = streaming::GetRawStreamerByIndex(streaming::GetCollectionIndex(*it));
+					auto entryName = rawStreamer->GetEntryName(streaming::GetEntryIndex(*it));
+					if (entryName && strcmp(file.c_str(), entryName) == 0)
+#elif IS_RDR3
 					if (*it == idx)
+#endif
 					{
 						it = handleData.erase(it);
 					}
@@ -2648,6 +2646,11 @@ void DLL_EXPORT CfxCollection_RemoveStreamingTag(const std::string& tag)
 
 					g_customStreamingFileRefs.erase(baseName);
 					entry.handle = 0;
+				}
+
+				if (g_assetOverridesRemovalCb)
+				{
+					g_assetOverridesRemovalCb(strId + strModule->baseIdx);
 				}
 			}
 		}
@@ -2679,7 +2682,6 @@ static void UnloadDataFiles()
 	}
 }
 
-#ifdef GTA_FIVE
 static void UnloadDataFilesOfTypes(const std::set<int>& types)
 {
 	HandleDataFileListWithTypes(g_loadedDataFiles, [](CDataFileMountInterface* mounter, CDataFileMgr::DataFile& entry)
@@ -2688,12 +2690,6 @@ static void UnloadDataFilesOfTypes(const std::set<int>& types)
 		return true;
 	}, types, "pre-unloading");
 }
-
-static hook::cdecl_stub<void()> _unloadMultiplayerContent([]()
-{
-	return hook::get_pattern("01 E8 ? ? ? ? 48 8B 0D ? ? ? ? BA 79", -0x11);
-});
-#endif
 
 static const char* NormalizePath(char* out, const char* in, size_t length)
 {
@@ -2713,27 +2709,9 @@ static const char* NormalizePath(char* out, const char* in, size_t length)
 	return out;
 }
 
-struct pgRawStreamer
+static const char* pgRawStreamer__GetEntryNameToBuffer(rage::fiCollection* streamer, uint16_t index, char* buffer, int len)
 {
-	struct Entry
-	{
-#ifdef GTA_FIVE
-		char m_pad[24];
-#endif
-		const char* fileName;
-	};
-
-	char m_pad[1456];
-	Entry* m_entries[64];
-};
-
-static const char* pgRawStreamer__GetEntryNameToBuffer(pgRawStreamer* streamer, uint16_t index, char* buffer, int len)
-{
-#ifdef GTA_FIVE
-	const char* fileName = streamer->m_entries[index >> 10][index & 0x3FF].fileName;
-#elif IS_RDR3
-	const char* fileName = streamer->m_entries[index >> 10][5 * (index & 0x3FF) + 4].fileName;
-#endif
+	const char* fileName = streamer->m_entries[index].fileName;
 
 	if (fileName == nullptr)
 	{
@@ -2747,8 +2725,7 @@ static const char* pgRawStreamer__GetEntryNameToBuffer(pgRawStreamer* streamer, 
 	return buffer;
 }
 
-#ifdef GTA_FIVE
-static void DisplayRawStreamerError [[noreturn]] (pgRawStreamer* streamer, uint16_t index, const char* why)
+static void DisplayRawStreamerError [[noreturn]] (rage::fiCollection* streamer, uint16_t index, const char* why)
 {
 	auto streamingMgr = streaming::Manager::GetInstance();
 
@@ -2770,21 +2747,20 @@ static void DisplayRawStreamerError [[noreturn]] (pgRawStreamer* streamer, uint1
 		}
 	}
 
-	FatalError("Invalid pgRawStreamer call - %s.\nStreaming index: %d\n%s", why, index, extraData);
+	FatalError("Invalid pgRawStreamer call - %s.\nStreaming index: %d\n%s\n\nIf this issue persists make sure to remove incompatible asi mods.", why, index, extraData);
 }
 
-static void ValidateRawStreamerReq(pgRawStreamer* streamer, uint16_t index)
+static void ValidateRawStreamerReq(rage::fiCollection* streamer, uint16_t index)
 {
 	uint32_t index0 = index >> 10;
 	uint32_t index1 = index & 0x3FF;
 
-	if (index0 >= std::size(streamer->m_entries))
+	if (index0 >= std::size(streamer->m_entries.memory))
 	{
 		DisplayRawStreamerError(streamer, index, "index >= size(entries)");
 	}
 
-	auto entryList = streamer->m_entries[index0];
-
+	auto entryList = streamer->m_entries.memory[index0];
 	if (!entryList)
 	{
 		DisplayRawStreamerError(streamer, index, "!entryList");
@@ -2798,24 +2774,23 @@ static void ValidateRawStreamerReq(pgRawStreamer* streamer, uint16_t index)
 	}
 }
 
-static int64_t(*g_origOpenCollectionEntry)(pgRawStreamer* streamer, uint16_t index, uint64_t* ptr);
+static int64_t(*g_origOpenCollectionEntry)(rage::fiCollection* streamer, uint16_t index, uint64_t* ptr);
 
-static int64_t pgRawStreamer__OpenCollectionEntry(pgRawStreamer* streamer, uint16_t index, uint64_t* ptr)
+static int64_t pgRawStreamer__OpenCollectionEntry(rage::fiCollection* streamer, uint16_t index, uint64_t* ptr)
 {
 	ValidateRawStreamerReq(streamer, index);
 
 	return g_origOpenCollectionEntry(streamer, index, ptr);
 }
 
-static int64_t(*g_origGetEntry)(pgRawStreamer* streamer, uint16_t index);
+static int64_t(*g_origGetEntry)(rage::fiCollection* streamer, uint16_t index);
 
-static int64_t pgRawStreamer__GetEntry(pgRawStreamer* streamer, uint16_t index)
+static int64_t pgRawStreamer__GetEntry(rage::fiCollection* streamer, uint16_t index)
 {
 	ValidateRawStreamerReq(streamer, index);
 
 	return g_origGetEntry(streamer, index);
 }
-#endif
 
 static bool g_unloadingCfx;
 
@@ -2861,8 +2836,6 @@ static hook::cdecl_stub<void()> _unloadTextureLODs([]()
 });
 
 #ifdef GTA_FIVE
-int* g_archetypeStreamingIndex;
-
 static void FlushCustomAssets()
 {
 	auto strManager = streaming::Manager::GetInstance();
@@ -2877,7 +2850,7 @@ static void FlushCustomAssets()
 			// if this is registered by us
 			// #TODO: check if model info streaming module
 			if (g_handlesToTag.find(entry.handle) != g_handlesToTag.end() ||
-				strManager->moduleMgr.GetStreamingModule(i) == strManager->moduleMgr.modules[*g_archetypeStreamingIndex])
+				strManager->moduleMgr.GetStreamingModule(i) == rage::fwArchetypeManager::GetStreamingModule())
 			{
 				// force-unload the object (canceling the request)
 				// if this breaks next reload, 'so be it', we just want to get to the main menu safely
@@ -2927,6 +2900,8 @@ static void SafelyDrainStreamer()
 	_unloadTextureLODs();
 
 	trace("Shutdown: streamer tasks done\n");
+
+	g_resourceStats.clear();
 }
 
 #ifdef GTA_FIVE
@@ -3109,6 +3084,17 @@ static void fwMapDataStore__FinishLoadingHook(streaming::strStreamingModule* sto
 		}
 	}
 
+	// b2802 - four-april-virginia
+	// b2699 - skylark-whiskey-jig
+	CDistantLODLight& lodLights = mapData->distantLodLights;
+	if (lodLights.numStreetLights > lodLights.positions.GetCount())
+	{
+		auto name = streaming::GetStreamingNameForIndex(idx + store->baseIdx);
+		trace("Fixed CMapData DistantLODLightsSOA (numStreetLights > positions.GetCount()) in %s.\n", name);
+
+		lodLights.numStreetLights = lodLights.positions.GetCount();
+	}
+
 	return g_origfwMapDataStore__FinishLoading(store, idx, data);
 }
 #endif
@@ -3239,7 +3225,7 @@ static bool ParserCreateAndLoadAnyType(void* self, const char* path, const char*
 	{
 		uint32_t entryHash = HashString(path);
 		uint16_t entryCount = *(uint16_t*)(*(char**)parParsableStructure + 8);
-		g_archetypeFactories->Get(5)->GetOrCreate(entryHash, entryCount);
+		g_archetypeFactories->Get(5)->AddStorageBlock(entryHash, entryCount);
 	}
 	return success;
 }
@@ -3298,9 +3284,233 @@ static void FreeArchetypesHook(uint32_t idx)
 DLL_IMPORT extern fwEvent<> PreSetupLoadingScreens;
 #endif
 
+#if defined(GTA_FIVE) || IS_RDR3
+rage::fiCollection* (*g_GetRawStreamer)(void);
+static int32_t chunkyArrayCountOffset = 0;
+static int32_t chunkyArrayOffset = 0;
+void* (*g_chunkyArrayAppend)(hook::FlexStruct* self);
+void* chunkyArrayAppend(hook::FlexStruct* self)
+{
+	const int32_t loadedEntriesCount = self->Get<int32_t>(chunkyArrayCountOffset);
+	if (loadedEntriesCount >= 0xFFFF)
+	{
+		std::stringstream ss;
+		for (auto& [ext, num] : g_resourceStats)
+		{
+			ss << ext << ": " << num << ", ";
+		}
+		AddCrashometry("asset_stats", ss.str());
+
+		AddCrashometry("pgRawStreamer", std::to_string(g_GetRawStreamer()->m_entries.count));
+#ifdef GTA_FIVE
+		AddCrashometry("pgRawStreamer(ytd)", std::to_string(streaming::GetRawStreamerByIndex(1)->m_entries.count));
+		AddCrashometry("pgRawStreamer(mod)", std::to_string(streaming::GetRawStreamerByIndex(2)->m_entries.count));
+#endif
+		
+		FatalError("ERR_STR_FAILURE: trying to add more assets to pgRawStreamer when it's already full (65535).");
+	}
+
+	return g_chunkyArrayAppend(self);
+}
+
+static ConsoleCommand pgRawStreamer_AssetsCountCmd("assetscount", []()
+{
+	std::stringstream ss;
+	for (auto& [ext, num] : g_resourceStats)
+	{
+		ss << ext << ": " << num << ", ";
+	}
+	trace("%s\n", ss.str());
+	trace("Total loaded assets in pgRawStreamer - %d/65535\n", g_GetRawStreamer()->m_entries.count);
+
+#ifdef GTA_FIVE
+	trace("Total loaded assets in pgRawStreamer(ytd) - %d/65535\n", streaming::GetRawStreamerByIndex(1)->m_entries.count);
+	trace("Total loaded assets in pgRawStreamer(mod) - %d/65535\n", streaming::GetRawStreamerByIndex(2)->m_entries.count);
+#endif
+});
+
+const rage::chunkyArray<rage::fiCollection::RawEntry, 1024, 64>& rage::GetPgRawStreamerEntries()
+{
+	return g_GetRawStreamer()->m_entries;
+}
+
+#endif
+
+static void CleanupStreaming()
+{
+	// safely drain the RAGE streamer before we unload everything
+	SafelyDrainStreamer();
+
+	g_lockReload = true;
+	g_unloadingCfx = true;
+
+	UnloadDataFiles();
+
+	std::set<std::string> tags;
+
+	for (auto& tag : g_customStreamingFilesByTag)
+	{
+		tags.insert(tag.first);
+	}
+
+	for (auto& tag : tags)
+	{
+		CfxCollection_RemoveStreamingTag(tag);
+	}
+
+	auto mapDataStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ymap");
+	auto typesStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ytyp");
+	auto navMeshStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ynv");
+	auto staticBoundsStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ybn");
+	auto str = streaming::Manager::GetInstance();
+
+	for (auto [module, idx] : g_pendingRemovals)
+	{
+		if (module == typesStore)
+		{
+			struct fwMapDataDef
+			{
+#ifdef GTA_FIVE
+				uint8_t pad[24];
+#elif IS_RDR3
+				uint8_t pad[32];
+#endif
+				union
+				{
+					uint32_t idx;
+					uint32_t* idxArray;
+				} dependencies;
+
+				uint8_t pad2[6];
+				uint16_t dependencyCount;
+
+				void RemoveDependency(uint32_t idx)
+				{
+					if (dependencyCount == 1)
+					{
+						if (dependencies.idx == idx)
+						{
+							dependencyCount = 0;
+							dependencies.idx = -1;
+						}
+					}
+					else
+					{
+						for (int i = 0; i < dependencyCount; i++)
+						{
+							if (dependencies.idxArray[i] == idx)
+							{
+								if ((i + 1) < dependencyCount)
+								{
+									memmove(&dependencies.idxArray[i], &dependencies.idxArray[i + 1], sizeof(uint32_t) * (dependencyCount - i));
+								}
+
+								dependencyCount--;
+								i--;
+							}
+						}
+
+						// move out of array if we're 1 now
+						if (dependencyCount == 1)
+						{
+							auto soleIdx = dependencies.idxArray[0];
+							rage::GetAllocator()->Free(dependencies.idxArray);
+
+							dependencies.idx = soleIdx;
+						}
+					}
+				}
+			};
+
+			atPoolBase* entryPool = (atPoolBase*)((char*)module + 56);
+			auto entry = entryPool->GetAt<char>(idx);
+
+#ifdef GTA_FIVE
+			*(uint16_t*)(entry + 16) &= ~0x14;
+#elif IS_RDR3
+			*(uint16_t*)(entry + 24) &= ~0x14;
+#endif
+
+			// remove from any dependent mapdata
+			for (auto entry : fx::GetIteratorView(g_itypToMapDataDeps.equal_range(*(uint32_t*)(entry + 12))))
+			{
+				auto mapDataHash = entry.second;
+				auto mapDataIdx = streaming::GetStreamingIndexForLocalHashKey(mapDataStore, mapDataHash);
+
+				if (mapDataIdx != -1)
+				{
+					atPoolBase* entryPool = (atPoolBase*)((char*)mapDataStore + 56);
+					auto mdEntry = entryPool->GetAt<fwMapDataDef>(mapDataIdx);
+
+					if (mdEntry)
+					{
+						mdEntry->RemoveDependency(idx);
+					}
+				}
+			}
+		}
+
+		// if this is loaded by means of dependents, in Five we should remove the flags indicating this, or RemoveObject will fail and RemoveSlot will lead to inconsistent state
+		// in RDR3 this will have a special-case check in RemoveObject for dependents, but in case it fails we shall remove this still (otherwise RemoveSlot will corrupt)
+		//
+		// we don't do this for fwStaticBoundsStore since we don't call RemoveSlot for other reasons (will lead to odd state for interiors)
+		if (module != staticBoundsStore && str->Entries[idx + module->baseIdx].flags & 0xFFFC)
+		{
+			str->Entries[idx + module->baseIdx].flags &= ~0xFFFC;
+		}
+
+		// ClearRequiredFlag
+		str->ReleaseObject(idx + module->baseIdx, 0xF1);
+
+		// RemoveObject
+		str->ReleaseObject(idx + module->baseIdx);
+
+#ifdef GTA_FIVE
+		if (module == typesStore)
+		{
+			// if unloaded at *runtime* but flags were set, archetypes likely weren't freed - we should
+			// free them now.
+			rage__fwArchetypeManager__FreeArchetypes(idx);
+		}
+#endif
+	}
+
+	// call RemoveSlot after we have removed all objects, or dependency tracking may crash
+	for (auto [module, idx] : g_pendingRemovals)
+	{
+		// navmeshstore won't remove from some internal 'name hash' and therefore re-registration crashes
+		// staticboundsstore has a weird issue too at times (regarding interior proxies?)
+		if (module != navMeshStore && module != staticBoundsStore)
+		{
+			module->RemoveSlot(idx);
+		}
+	}
+
+	g_pendingRemovals.clear();
+
+	g_unloadingCfx = false;
+}
+
 static HookFunction hookFunction([]()
 {
 #ifdef GTA_FIVE
+	g_GetRawStreamer = (decltype(g_GetRawStreamer))hook::get_pattern<uint8_t>("48 83 EC ? 48 8B 05 ? ? ? ? 48 85 C0 75 ? 8D 50");
+	auto chunkyArrayAppendLoc = hook::get_pattern<uint8_t>("40 53 48 83 EC ? F7 81 ? ? ? ? ? ? ? ? 48 8B D9 75");
+	chunkyArrayCountOffset = *(int32_t*)(chunkyArrayAppendLoc + 8);
+	chunkyArrayOffset = *hook::get_pattern<int32_t>("48 8D 8F ? ? ? ? E8 ? ? ? ? 48 8D 4C 24", 3);
+	g_chunkyArrayAppend = hook::trampoline(chunkyArrayAppendLoc, &chunkyArrayAppend);
+#elif IS_RDR3
+	g_GetRawStreamer = (decltype(g_GetRawStreamer))hook::get_pattern<uint8_t>("48 83 EC ? 48 8B 05 ? ? ? ? 48 85 C0 75 ? 8D 50 ? B9");
+	auto chunkyArrayAppendLoc = hook::get_pattern<uint8_t>("40 53 48 83 EC ? 8B 91 ? ? ? ? 48 8B D9 F7 C2");
+	chunkyArrayCountOffset = *(int32_t*)(chunkyArrayAppendLoc + 8);
+	chunkyArrayOffset = *hook::get_pattern<int32_t>("48 8D 9F ? ? ? ? 48 89 07 83 A3", 3);
+	g_chunkyArrayAppend = hook::trampoline(chunkyArrayAppendLoc, &chunkyArrayAppend);
+#endif
+
+#ifdef GTA_FIVE
+
+	loadChangeSet = hook::get_pattern<char>("48 81 EC 50 03 00 00 49 8B F0 4C", -0x18);
+
 	PreSetupLoadingScreens.Connect([]()
 	{
 		FlushCustomAssets();
@@ -3341,8 +3551,6 @@ static HookFunction hookFunction([]()
 		MH_CreateHook(location, FreeArchetypesHook, (void**)&g_origFreeArchetypes);
 		MH_EnableHook(location);
 	}
-
-	g_archetypeStreamingIndex = hook::get_address<int*>(hook::get_pattern("48 83 7B 68 00 44 8B 05 ? ? ? ? 48 8B 15", 8));
 #endif
 
 	// process streamer-loaded resource: check 'free instantly' flag even if no dependencies exist (change jump target)
@@ -3432,6 +3640,12 @@ static HookFunction hookFunction([]()
 
 	g_dataFileTypes = hook::get_pattern<EnumEntry>("61 44 DF 04 00 00 00 00");
 
+#define X(NAME) DataFileType::NAME = LookupDataFileType(#NAME)
+	X(DLC_ITYP_REQUEST);
+	X(DLC_POP_GROUPS);
+	X(DLC_WEAPON_PICKUPS);
+#undef X
+
 	rage::OnInitFunctionStart.Connect([](rage::InitFunctionType type)
 	{
 		if (type == rage::INIT_BEFORE_MAP_LOADED)
@@ -3477,165 +3691,13 @@ static HookFunction hookFunction([]()
 
 		g_unloadingCfx = false;
 
-#ifdef GTA_FIVE
 		// unload pre-unloaded data files
-		UnloadDataFilesOfTypes({ 0xB3 /* DLC_POP_GROUPS */, 166 /* DLC_WEAPON_PICKUPS */ });
-#endif
+		UnloadDataFilesOfTypes({ DataFileType::DLC_POP_GROUPS, DataFileType::DLC_WEAPON_PICKUPS });
 	}, 99900);
 
 	Instance<ICoreGameInit>::Get()->OnShutdownSession.Connect([]()
 	{
-		// safely drain the RAGE streamer before we unload everything
-		SafelyDrainStreamer();
-
-		g_lockReload = true;
-		g_unloadingCfx = true;
-
-		UnloadDataFiles();
-
-		std::set<std::string> tags;
-
-		for (auto& tag : g_customStreamingFilesByTag)
-		{
-			tags.insert(tag.first);
-		}
-
-		for (auto& tag : tags)
-		{
-			CfxCollection_RemoveStreamingTag(tag);
-		}
-
-		auto mapDataStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ymap");
-		auto typesStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ytyp");
-		auto navMeshStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ynv");
-		auto staticBoundsStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ybn");
-		auto str = streaming::Manager::GetInstance();
-
-		for (auto [module, idx] : g_pendingRemovals)
-		{
-			if (module == typesStore)
-			{
-				struct fwMapDataDef
-				{
-#ifdef GTA_FIVE
-					uint8_t pad[24];
-#elif IS_RDR3
-					uint8_t pad[32];
-#endif
-					union
-					{
-						uint32_t idx;
-						uint32_t* idxArray;
-					} dependencies;
-
-					uint8_t pad2[6];
-					uint16_t dependencyCount;
-
-					void RemoveDependency(uint32_t idx)
-					{
-						if (dependencyCount == 1)
-						{
-							if (dependencies.idx == idx)
-							{
-								dependencyCount = 0;
-								dependencies.idx = -1;
-							}
-						}
-						else
-						{
-							for (int i = 0; i < dependencyCount; i++)
-							{
-								if (dependencies.idxArray[i] == idx)
-								{
-									if ((i + 1) < dependencyCount)
-									{
-										memmove(&dependencies.idxArray[i], &dependencies.idxArray[i + 1], sizeof(uint32_t) * (dependencyCount - i));
-									}
-
-									dependencyCount--;
-									i--;
-								}
-							}
-
-							// move out of array if we're 1 now
-							if (dependencyCount == 1)
-							{
-								auto soleIdx = dependencies.idxArray[0];
-								rage::GetAllocator()->Free(dependencies.idxArray);
-
-								dependencies.idx = soleIdx;
-							}
-						}
-					}
-				};
-
-				atPoolBase* entryPool = (atPoolBase*)((char*)module + 56);
-				auto entry = entryPool->GetAt<char>(idx);
-
-#ifdef GTA_FIVE
-				*(uint16_t*)(entry + 16) &= ~0x14;
-#elif IS_RDR3
-				*(uint16_t*)(entry + 24) &= ~0x14;
-#endif
-
-				// remove from any dependent mapdata
-				for (auto entry : fx::GetIteratorView(g_itypToMapDataDeps.equal_range(*(uint32_t*)(entry + 12))))
-				{
-					auto mapDataHash = entry.second;
-					auto mapDataIdx = streaming::GetStreamingIndexForLocalHashKey(mapDataStore, mapDataHash);
-
-					if (mapDataIdx != -1)
-					{
-						atPoolBase* entryPool = (atPoolBase*)((char*)mapDataStore + 56);
-						auto mdEntry = entryPool->GetAt<fwMapDataDef>(mapDataIdx);
-
-						if (mdEntry)
-						{
-							mdEntry->RemoveDependency(idx);
-						}
-					}
-				}
-			}
-
-			// if this is loaded by means of dependents, in Five we should remove the flags indicating this, or RemoveObject will fail and RemoveSlot will lead to inconsistent state
-			// in RDR3 this will have a special-case check in RemoveObject for dependents, but in case it fails we shall remove this still (otherwise RemoveSlot will corrupt)
-			//
-			// we don't do this for fwStaticBoundsStore since we don't call RemoveSlot for other reasons (will lead to odd state for interiors)
-			if (module != staticBoundsStore && str->Entries[idx + module->baseIdx].flags & 0xFFFC)
-			{
-				str->Entries[idx + module->baseIdx].flags &= ~0xFFFC;
-			}
-
-			// ClearRequiredFlag
-			str->ReleaseObject(idx + module->baseIdx, 0xF1);
-
-			// RemoveObject
-			str->ReleaseObject(idx + module->baseIdx);
-
-#ifdef GTA_FIVE
-			if (module == typesStore)
-			{
-				// if unloaded at *runtime* but flags were set, archetypes likely weren't freed - we should
-				// free them now.
-				rage__fwArchetypeManager__FreeArchetypes(idx);
-			}
-#endif
-		}
-
-		// call RemoveSlot after we have removed all objects, or dependency tracking may crash
-		for (auto [module, idx] : g_pendingRemovals)
-		{
-			// navmeshstore won't remove from some internal 'name hash' and therefore re-registration crashes
-			// staticboundsstore has a weird issue too at times (regarding interior proxies?)
-			if (module != navMeshStore && module != staticBoundsStore)
-			{
-				module->RemoveSlot(idx);
-			}
-		}
-
-		g_pendingRemovals.clear();
-
-		g_unloadingCfx = false;
+		CleanupStreaming();
 	}, -9999);
 
 	OnMainGameFrame.Connect([=]()
@@ -3819,12 +3881,18 @@ static HookFunction hookFunction([]()
 		hook::call(location, WrapAddMapBoolEntry);
 	}
 
-	// debug hook for pgRawStreamer::OpenCollectionEntry
 	MH_Initialize();
-	MH_CreateHook(hook::get_pattern("8B D5 81 E2", -0x24), pgRawStreamer__OpenCollectionEntry, (void**)&g_origOpenCollectionEntry);
-	MH_CreateHook(hook::get_pattern("0F B7 C3 48 8B 5C 24 30 8B D0 25 FF", -0x14), pgRawStreamer__GetEntry, (void**)&g_origGetEntry);
 	MH_CreateHook(hook::get_pattern("45 8B E8 4C 8B F1 83 FA FF 0F 84", -0x18), fwStaticBoundsStore__ModifyHierarchyStatus, (void**)&g_orig_fwStaticBoundsStore__ModifyHierarchyStatus);
 	MH_CreateHook(hook::get_pattern("45 33 D2 84 C0 0F 84 ? 01 00 00 4C", -0x28), fwMapDataStore__ModifyHierarchyStatusRecursive, (void**)&g_orig_fwMapDataStore__ModifyHierarchyStatusRecursive);
 	MH_EnableHook(MH_ALL_HOOKS);
+#endif
+
+	// debug hook for pgRawStreamer::OpenCollectionEntry
+
+#ifdef GTA_FIVE
+	g_origOpenCollectionEntry = hook::trampoline(hook::get_pattern("8B D5 81 E2", -0x24), pgRawStreamer__OpenCollectionEntry);
+	g_origGetEntry = hook::trampoline(hook::get_pattern("0F B7 C3 48 8B 5C 24 30 8B D0 25 FF", -0x14), pgRawStreamer__GetEntry);
+#elif IS_RDR3
+	g_origOpenCollectionEntry = hook::trampoline(hook::get_pattern("49 8B F0 48 8B 84 C1", -0x2D), pgRawStreamer__OpenCollectionEntry);
 #endif
 });

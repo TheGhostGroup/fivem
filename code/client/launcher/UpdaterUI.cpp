@@ -7,6 +7,8 @@
 
 #include "StdInc.h"
 #include <CommCtrl.h>
+#include <ctime>
+#include <chrono>
 
 #ifdef LAUNCHER_PERSONALITY_MAIN
 #include <shobjidl.h>
@@ -77,7 +79,9 @@ struct CompositionEffect : winrt::implements
 	template<int N>
 	void SetProperty(const std::string& name, const float (&value)[N], GRAPHICS_EFFECT_PROPERTY_MAPPING mapping = GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT)
 	{
-		m_properties.emplace_back(name, winrt::Windows::Foundation::PropertyValue::CreateSingleArray(winrt::array_view<const float>{ (float*)&value, (float*)&value + N }), mapping);
+		const float* valuePointerStart = &value[0];
+		const float* valuePointerEnd = valuePointerStart + N;
+		m_properties.emplace_back(name, winrt::Windows::Foundation::PropertyValue::CreateSingleArray(winrt::array_view<const float>{ valuePointerStart, valuePointerEnd }), mapping);
 	}
 
 	template<>
@@ -1285,15 +1289,16 @@ static void InitializeRenderOverlay(winrt::Windows::UI::Xaml::Controls::SwapChai
 
 			g_pd3dDeviceContext->OMSetBlendState(bs.Get(), NULL, 0xFFFFFFFF);
 
-			static auto startTime = timeGetTime();
+			static auto startTime = std::chrono::steady_clock::now();
 
 			D3D11_MAPPED_SUBRESOURCE mapped_resource;
 			if (SUCCEEDED(g_pd3dDeviceContext->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped_resource)))
 			{
-				auto c = (CBuf*)mapped_resource.pData;
-				c->res[0] = float(w);
-				c->res[1] = float(h);
-				c->sec = (timeGetTime() - startTime) / 1000.0f;
+				auto c = static_cast<CBuf*>(mapped_resource.pData);
+				c->res[0] = static_cast<float>(w);
+				c->res[1] = static_cast<float>(h);
+				auto now = std::chrono::steady_clock::now();
+				c->sec = std::chrono::duration<float>(now - startTime).count();
 				g_pd3dDeviceContext->Unmap(cb, 0);
 			}
 
@@ -1384,7 +1389,12 @@ void UI_CreateWindow()
 		{
 			auto sc = ui.FindName(L"Overlay").as<winrt::Windows::UI::Xaml::Controls::SwapChainPanel>();
 
-			if (_time64(NULL) < 1675206000)
+			auto time = std::time(nullptr);
+			auto datetime = std::localtime(&time);
+			auto month = datetime->tm_mon + 1;
+
+			// Snow effect for December and January
+			if (month == 12 || month == 1)
 			{
 				InitializeRenderOverlay(sc, g_dpi.ScaleX(wwidth), g_dpi.ScaleY(wheight));
 			}

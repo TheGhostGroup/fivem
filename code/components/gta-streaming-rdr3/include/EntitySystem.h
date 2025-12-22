@@ -63,8 +63,6 @@ class STREAMING_EXPORT fwArchetypeManager
 {
 public:
 	static fwArchetype* GetArchetypeFromHashKey(uint32_t hash, fwModelId& id);
-
-	static fwArchetype* GetArchetypeFromHashKeySafe(uint32_t hash, fwModelId& id);
 };
 
 class STREAMING_EXPORT fwRefAwareBase
@@ -163,12 +161,19 @@ public:
 		return m_entityType;
 	}
 
+	inline fwArchetype* GetArchetype()
+	{
+		return m_archetype;
+	}
+
 private:
-	char m_pad[40]; // +8
+	char m_pad[24]; // +8
+	fwArchetype* m_archetype; // +32
+	char m_pad2[8]; // +40
 	uint8_t m_entityType; // +48
-	char m_pad2[15]; // +49
+	char m_pad3[15]; // +49
 	rage::PreciseTransform m_transform; // +64
-	char m_pad3[96]; // +128
+	char m_pad4[96]; // +128
 	void* m_netObject; // +224
 };
 

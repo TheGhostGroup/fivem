@@ -11,6 +11,7 @@
 #include <functional>
 #include <mutex>
 #include <queue>
+#include <thread>
 
 #include <VFSDevice.h>
 
@@ -75,6 +76,14 @@ public:
 	virtual void Abort() = 0;
 
 	virtual std::string GetRawBody() = 0;
+
+	inline void Wait()
+	{
+		while (!HasCompleted())
+		{
+			std::this_thread::yield();
+		}
+	}
 };
 
 struct ManualHttpRequestHandle : HttpRequestHandle
@@ -108,6 +117,7 @@ public:
 	HttpRequestPtr DoPostRequest(const std::wstring& host, uint16_t port, const std::wstring& url, const std::string& postData, const fwMap<fwString, fwString>& headers, const std::function<void(bool, const char*, size_t)>& callback, std::function<void(const std::map<std::string, std::string>&)> headerCallback = std::function<void(const std::map<std::string, std::string>&)>());
 
 	HttpRequestPtr DoPostRequest(const std::string& url, const std::map<std::string, std::string>& fields, const std::function<void(bool, const char*, size_t)>& callback);
+	HttpRequestPtr DoPostRequest(const std::string& url, const std::map<std::string, std::string>& fields, const HttpRequestOptions& options, const std::function<void(bool, const char*, size_t)>& callback);
 	HttpRequestPtr DoPostRequest(const std::string& url, const std::string& postData, const std::function<void(bool, const char*, size_t)>& callback);
 	HttpRequestPtr DoPostRequest(const std::string& url, const std::string& postData, const fwMap<fwString, fwString>& headers, const std::function<void(bool, const char*, size_t)>& callback, std::function<void(const std::map<std::string, std::string>&)> headerCallback = std::function<void(const std::map<std::string, std::string>&)>());
 

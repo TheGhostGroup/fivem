@@ -13,9 +13,12 @@
 #include <Streaming.h>
 #include "Hooking.h"
 #include <Error.h>
-#include <CoreConsole.h>
 #include <MinHook.h>
 #include <jitasm.h>
+
+#include <GameInit.h>
+#include <CoreConsole.h>
+#include <CL2LaunchMode.h>
 
 #ifdef GTA_FIVE
 #include <atPool.h>
@@ -151,7 +154,7 @@ static int (*g_origGetFileTypeIdFromExtension)(const char*, const char*);
 static int GetFileTypeIdFromExtension(const char* extension, const char* fileName)
 {
 	// set the name for the later hook to use
-	g_lastStreamingName = extension;
+	g_lastStreamingName = fileName;
 
 	return g_origGetFileTypeIdFromExtension(extension, fileName);
 }
@@ -353,78 +356,20 @@ static void MakeDefragmentableHook(rage::pgBase* self, const rage::datResourceMa
 	g_origMakeDefragmentable(self, map, a3);
 }
 
-#include <EntitySystem.h>
-#include <stack>
-#include <atHashMap.h>
-
-static void (*g_origArchetypeDtor)(fwArchetype* at);
-
-static std::unordered_map<uint32_t, std::deque<uint32_t>> g_archetypeDeletionStack;
-static atHashMapReal<uint32_t>* g_archetypeHash;
-static char** g_archetypeStart;
-static size_t* g_archetypeLength;
-
-static void ArchetypeDtorHook1(fwArchetype* at)
-{
-	if (auto stackIt = g_archetypeDeletionStack.find(at->hash); stackIt != g_archetypeDeletionStack.end())
-	{
-		auto& stack = stackIt->second;
-
-		if (!stack.empty())
-		{
-			// get our index
-			auto atIdx = *g_archetypeHash->find(at->hash);
-
-			// delete ourselves from the stack
-			for (auto it = stack.begin(); it != stack.end();)
-			{
-				if (*it == atIdx)
-				{
-					it = stack.erase(it);
-				}
-				else
-				{
-					it++;
-				}
-			}
-
-			if (!stack.empty())
-			{
-				// update hash map with the front
-				auto oldArchetype = stack.front();
-
-				*g_archetypeHash->find(at->hash) = oldArchetype;
-			}
-		}
-
-		if (stack.empty())
-		{
-			g_archetypeDeletionStack.erase(stackIt);
-		}
-	}
-
-	g_origArchetypeDtor(at);
-}
-
-static void (*g_origArchetypeInit)(void* at, void* a3, fwArchetypeDef* def, void* a4);
-
-static void ArchetypeInitHook(void* at, void* a3, fwArchetypeDef* def, void* a4)
-{
-	g_origArchetypeInit(at, a3, def, a4);
-
-	auto atIdx = g_archetypeHash->find(def->name);
-
-	if (atIdx)
-	{
-		g_archetypeDeletionStack[def->name].push_front(*atIdx);
-	}
-}
 #endif
 
 static HookFunction hookFunction([] ()
 {
+	static ConVar<bool> enableFlush("str_enableFlush", ConVar_Replicated, false);
 	static ConsoleCommand flushCommand("str_requestFlush", []()
 	{
+#ifndef _DEBUG
+		if (!launch::IsSDK() && !launch::IsSDKGuest() && !enableFlush.GetValue())
+		{
+			trace("str_requestFlush requires the 'str_enableFlush' replicated convar to be enabled");
+			return;
+		}
+#endif
 		if (*g_strStreamingInterface)
 		{
 			(*g_strStreamingInterface)->RequestFlush();
@@ -489,54 +434,27 @@ static HookFunction hookFunction([] ()
 		doStub.addFunc = AddStreamingFileWrap;
 		hook::jump_rcx(location, doStub.GetCode());
 #elif IS_RDR3
-		if (xbr::IsGameBuildOrGreater<1436>()) // starting from 1436.31
+		void* location = hook::pattern("83 0F FF 48 8D 4D C8 E8 3C 93 FE FF").count(1).get(0).get<void>(27);
+
+		static struct : public jitasm::Frontend
 		{
-			void* location = hook::pattern("83 0F FF 48 8D 4D C8 E8 3C 93 FE FF").count(1).get(0).get<void>(27);
+			void* addFunc;
 
-			static struct : public jitasm::Frontend
+			void InternalMain() override
 			{
-				void* addFunc;
+				pop(rdi);
+				pop(rsi);
+				pop(rbx);
+				pop(rbp);
 
-				void InternalMain() override
-				{
-					pop(rdi);
-					pop(rsi);
-					pop(rbx);
-					pop(rbp);
+				mov(rcx, rax);
+				mov(rax, (uint64_t)addFunc);
+				jmp(rax);
+			}
+		} doStub;
 
-					mov(rcx, rax);
-					mov(rax, (uint64_t)addFunc);
-					jmp(rax);
-				}
-			} doStub;
-
-			doStub.addFunc = AddStreamingFileWrap;
-			hook::jump_rcx(location, doStub.GetCode());
-		}
-		else
-		{
-			void* location = hook::pattern("83 CF FF 89 3E 48 8D 4D 58 E8").count(1).get(0).get<void>(35);
-
-			static struct : public jitasm::Frontend
-			{
-				void* addFunc;
-
-				void InternalMain() override
-				{
-					pop(r12);
-					pop(rdi);
-					pop(rsi);
-					pop(rbp);
-
-					mov(rcx, rax);
-					mov(rax, (uint64_t)addFunc);
-					jmp(rax);
-				}
-			} doStub;
-
-			doStub.addFunc = AddStreamingFileWrap;
-			hook::jump_rcx(location, doStub.GetCode());
-		}
+		doStub.addFunc = AddStreamingFileWrap;
+		hook::jump_rcx(location, doStub.GetCode());
 #endif
 	}
 
@@ -597,24 +515,6 @@ static HookFunction hookFunction([] ()
 	// pgBase destructor, to free the relocated page map we created
 	MH_CreateHook(hook::get_pattern("48 81 EC 48 0C 00 00 48 8B"), pgBaseDtorHook, (void**)&g_origPgBaseDtor);
 
-	// archetype initfromdefinition
-	MH_CreateHook(hook::get_pattern("C0 E8 02 A8 01 75 0A 48", -0x66), ArchetypeInitHook, (void**)&g_origArchetypeInit);
-
 	MH_EnableHook(MH_ALL_HOOKS);
-
-	// archetype dtor int dereg
-	{
-		auto location = hook::get_pattern("E8 ? ? ? ? 80 7B 60 01 74 39");
-		hook::set_call(&g_origArchetypeDtor, location);
-		hook::call(location, ArchetypeDtorHook1);
-	}
-
-	{
-		auto getArchetypeFn = hook::get_pattern<char>("0F 84 AD 00 00 00 44 0F B7 C0 33 D2", 20);
-
-		g_archetypeHash = (atHashMapReal<uint32_t>*)hook::get_address<void*>(getArchetypeFn);
-		g_archetypeStart = (char**)hook::get_address<void*>(getArchetypeFn + 0x84);
-		g_archetypeLength = (size_t*)hook::get_address<void*>(getArchetypeFn + 0x7D);
-	}
 #endif
 });

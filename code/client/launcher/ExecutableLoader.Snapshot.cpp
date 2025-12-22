@@ -12,9 +12,14 @@ inline static uintptr_t GetLauncherTriggerEP()
 {
 	if (getenv("CitizenFX_ToolMode"))
 	{
-		if (wcsstr(GetCommandLineW(), L"launcher.exe"))
+		LPWSTR commandLine = GetCommandLineW();
+
+		// Case insensitive: name must match newCommandLine in LoopbackTcpServer
+		if (wcsstr(commandLine, L"Launcher.exe") != nullptr && wcsstr(commandLine, L"ros:legit") == nullptr)
 		{
-			// launcher.exe with sha256 hash 0dbf58119cdd2d67e6ecee1e31be3f19827444df978f7df747064a870736bce4
+			// Launcher.exe with
+			//	sha1 = f259de45c50f399d3e278fd39401ef51a3cc031a
+			//	sha256 = 0dbf58119cdd2d67e6ecee1e31be3f19827444df978f7df747064a870736bce4
 			return 0x14020b70c;
 		}
 	}
@@ -31,9 +36,29 @@ inline uintptr_t GetTriggerEP()
 		return ep;
 	}
 
-	if (Is372())
+	if (xbr::IsGameBuild<xbr::Build::Winter_2025>())
 	{
-		return 0x141623FC8;
+		return 0x141878E2C;
+	}
+
+	if (xbr::IsGameBuild<xbr::Build::Summer_2025>())
+	{
+		return 0x141868504;
+	}
+
+	if (xbr::IsGameBuild<3407>())
+	{
+		return 0x14185CFAC;
+	}
+
+	if (xbr::IsGameBuild<3323>())
+	{
+		return 0x1418492F0;
+	}
+	
+	if (xbr::IsGameBuild<3258>())
+	{
+		return 0x14183A44C;
 	}
 
 	if (xbr::IsGameBuild<3095>())
@@ -76,17 +101,14 @@ inline uintptr_t GetTriggerEP()
 		return 0x1417ACE74;
 	}
 
-	if (Is2060())
+	if (xbr::IsGameBuild<2060>())
 	{
 		return 0x141796A34;
 	}
 
-	return 0x14175DE00;
+	return 0x14175DE00; // 1604
 }
 
-// 1604
-// 1868 now...!
-// 2060 realities
 #define TRIGGER_EP (GetTriggerEP())
 #elif defined(IS_RDR3)
 inline uintptr_t GetTriggerEP()
@@ -96,22 +118,7 @@ inline uintptr_t GetTriggerEP()
 		return ep;
 	}
 
-	if (xbr::IsGameBuild<1355>())
-	{
-		return 0x142DE455C; // 1355.18
-	}
-
-	if (xbr::IsGameBuild<1436>())
-	{
-		return 0x142E13DA4; // 1436.31
-	}
-
-	if (xbr::IsGameBuild<1491>())
-	{
-		return 0x142E31F84; // 1491.18
-	}
-
-	return 0x142E0F92C; // 1311.20
+	return 0x142E4FAD0; // 1491.50
 }
 
 #define TRIGGER_EP (GetTriggerEP())
@@ -190,6 +197,20 @@ static LONG CALLBACK SnapshotVEH(PEXCEPTION_POINTERS pointers)
 		IMAGE_DOS_HEADER* header = GetTargetRVA<IMAGE_DOS_HEADER>(0);
 		IMAGE_NT_HEADERS* ntHeader = GetTargetRVA<IMAGE_NT_HEADERS>(header->e_lfanew);
 		IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(ntHeader);
+
+		IMAGE_DATA_DIRECTORY* importDirectory = &ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+
+		auto descriptor = GetTargetRVA<IMAGE_IMPORT_DESCRIPTOR>(importDirectory->VirtualAddress);
+
+		int i = 0;
+		while (descriptor->Name)
+		{
+			char* name = GetTargetRVA<char>(descriptor->Name);
+			const char* realName = ExecutableLoader::m_moduleNames[i++].c_str();
+			memcpy(name, realName, strlen(realName) + 1);
+
+			descriptor++;
+		}
 
 		FILE* f = _wfopen(MakeRelativeCitPath(fmt::sprintf(L"data\\cache\\executable_snapshot_%x.bin", ntHeader->OptionalHeader.AddressOfEntryPoint)).c_str(), L"wb");
 
@@ -355,6 +376,20 @@ static LONG CALLBACK DumpVEH(PEXCEPTION_POINTERS pointers)
 		IMAGE_DOS_HEADER* header = GetTargetRVA<IMAGE_DOS_HEADER>(0);
 		IMAGE_NT_HEADERS* ntHeader = GetTargetRVA<IMAGE_NT_HEADERS>(header->e_lfanew);
 		IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(ntHeader);
+
+		IMAGE_DATA_DIRECTORY* importDirectory = &ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+
+		auto descriptor = GetTargetRVA<IMAGE_IMPORT_DESCRIPTOR>(importDirectory->VirtualAddress);
+
+		int i = 0;
+		while (descriptor->Name)
+		{
+			char* name = GetTargetRVA<char>(descriptor->Name);
+			const char* realName = ExecutableLoader::m_moduleNames[i++].c_str();
+			memcpy(name, realName, strlen(realName) + 1);
+
+			descriptor++;
+		}
 
 		FILE* f = _wfopen(g_dumpFileName.c_str(), L"wb");
 

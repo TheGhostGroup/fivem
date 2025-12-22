@@ -99,7 +99,8 @@ export default defineComponent({
     this.listener = (event: MessageEvent) => {
       const item: any = event.data || (<any>event).detail; //'detail' is for debugging via browsers
 
-      if (!item || !item.type) {
+      // When adding a new event that *DOES NOT* start with "ON_", you need to modify this line.
+      if (!item?.type?.startsWith("ON_")) {
         return;
       }
 
@@ -107,27 +108,32 @@ export default defineComponent({
         'ON_OPEN' | 'ON_SCREEN_STATE_CHANGE' | 'ON_MESSAGE' | 'ON_CLEAR' | 'ON_SUGGESTION_ADD' |
         'ON_SUGGESTION_REMOVE' | 'ON_TEMPLATE_ADD' | 'ON_UPDATE_THEMES' | 'ON_MODE_ADD' | 'ON_MODE_REMOVE';
 
-      if (this[typeRef]) {
-        this[typeRef](item);
+      if (typeof this[typeRef] !== "function") {
+        return;
       }
+
+      this[typeRef](item);
     };
 
     window.addEventListener("message", this.listener);
   },
   watch: {
-    messages() {
-      if (this.hideState !== ChatHideStates.AlwaysHide) {
-        if (this.showWindowTimer) {
-          clearTimeout(this.showWindowTimer);
+    messages: {
+      handler() {
+        if (this.hideState !== ChatHideStates.AlwaysHide) {
+          if (this.showWindowTimer) {
+            clearTimeout(this.showWindowTimer);
+          }
+          this.showWindow = true;
+          this.resetShowWindowTimer();
         }
-        this.showWindow = true;
-        this.resetShowWindowTimer();
-      }
 
-      const messagesObj = this.$refs.messages as HTMLDivElement;
-      this.$nextTick(() => {
-        messagesObj.scrollTop = messagesObj.scrollHeight;
-      });
+        const messagesObj = this.$refs.messages as HTMLDivElement;
+        this.$nextTick(() => {
+          messagesObj.scrollTop = messagesObj.scrollHeight;
+        });
+      },
+      deep: true
     }
   },
   computed: {
@@ -181,6 +187,7 @@ export default defineComponent({
     }
   },
   methods: {
+    // If adding a new event that *DOES NOT* start with "ON_", you'll need to modify the validation in mounted()
     ON_SCREEN_STATE_CHANGE({ hideState, fromUserInteraction }: { hideState: ChatHideStates, fromUserInteraction: boolean }) {
       this.hideState = hideState;
 

@@ -177,15 +177,23 @@ namespace rage
 	class audMixerDevice
 	{
 	public:
+		static constexpr uint32_t kSubmixCount = 40;
+
+	public:
 		audMixerSubmix* CreateSubmix(const char* name, int numOutputChannels, bool a3);
 		uint8_t GetSubmixIndex(audMixerSubmix* submix);
 		void ComputeProcessingGraph();
 		void FlagThreadCommandBufferReadyToProcess(uint32_t a1 = 0);
 		void InitClientThread(const char* name, uint32_t bufferSize);
 
+		inline uint32_t GetSubmixCount()
+		{
+			return m_numSubmixes;
+		}
+
 		inline audMixerSubmix* GetSubmix(int idx)
 		{
-			if (idx < 0 || idx >= 40)
+			if (idx < 0 || idx >= m_numSubmixes)
 			{
 				return nullptr;
 			}
@@ -198,9 +206,9 @@ namespace rage
 
 		uint64_t m_8;
 #ifdef GTA_FIVE
-		uint8_t m_submixes[40][256];
+		uint8_t m_submixes[kSubmixCount][256];
 #elif IS_RDR3
-		uint8_t m_submixes[40][368];
+		uint8_t m_submixes[kSubmixCount][368];
 #endif
 		uint32_t m_numSubmixes;
 	};
@@ -244,6 +252,13 @@ namespace rage
 
 	audMixerSubmix* audMixerDevice::CreateSubmix(const char* name, int numOutputChannels, bool a3)
 	{
+		// FORUM-5083891: game-code does not sanitize the fixed number of
+		// submixes. Avoid clobbering memory.
+		if (GetSubmixCount() >= kSubmixCount)
+		{
+			trace("Exceeded maximum number of audio submixes <%d> supported by the game!\n", kSubmixCount);
+			return nullptr;
+		}
 		return _audMixerDevice_CreateSubmix(this, name, numOutputChannels, a3);
 	}
 
@@ -1074,14 +1089,15 @@ namespace rage
 		static audCategoryControllerManager* GetInstance();
 	};
 
+	static audCategoryControllerManager** g_audCategoryControllerManager = nullptr;
 	audCategoryControllerManager* audCategoryControllerManager::GetInstance()
 	{
-#ifdef GTA_FIVE
-		static auto patternRef = hook::get_address<audCategoryControllerManager**>(hook::get_pattern("45 33 C0 BA 90 1C E2 44 E8", -4));
-#elif IS_RDR3
-		static auto patternRef = hook::get_address<audCategoryControllerManager**>(hook::get_pattern("48 8B 0D ? ? ? ? E8 ? ? ? ? 8B 15 ? ? ? ? 48 8D 0D ? ? ? ? E8", 3));
-#endif
-		return *patternRef;
+		if (!g_audCategoryControllerManager)
+		{
+			return nullptr;
+		}
+
+		return *g_audCategoryControllerManager;
 	}
 
 	static hook::thiscall_stub<char*(audCategoryControllerManager*, uint32_t)> _audCategoryControllerManager_CreateController([]()
@@ -1108,6 +1124,8 @@ namespace rage
 		initParamVal = hook::get_address<uint8_t*>(hook::get_pattern("BA 11 CC 23 C3 E8 ? ? ? ? 48 8D", 0x16));
 
 		audDriver::sm_Mixer = hook::get_address<audMixerDevice**>(hook::get_pattern("75 64 44 0F B7 45 06 48 8B 0D", 10));
+
+		g_audCategoryControllerManager = hook::get_address<audCategoryControllerManager**>(hook::get_pattern("45 33 C0 BA 90 1C E2 44 E8", -4));
 #elif IS_RDR3
 		g_frontendAudioEntity = hook::get_address<audEntityBase*>(hook::get_pattern("48 8D 0D ? ? ? ? E8 ? ? ? ? 45 84 E4 74 ? 39 1D"), 3, 7);
 
@@ -1116,6 +1134,8 @@ namespace rage
 		initParamVal = hook::get_address<uint8_t*>(hook::get_pattern("8A 05 ? ? ? ? 48 8B CF F3 0F 11 45 ? 88 45 66"), 2, 6);
 
 		audDriver::sm_Mixer = hook::get_address<audMixerDevice**>(hook::get_pattern("48 8B 05 ? ? ? ? 44 38 8C 01 ? ? ? ? 0F"), 3, 7);
+
+		g_audCategoryControllerManager = hook::get_address<audCategoryControllerManager**>(hook::get_pattern("48 8B 0D ? ? ? ? E8 ? ? ? ? 8B 15 ? ? ? ? 48 8D 0D ? ? ? ? E8", 3));
 #endif
 	});
 #ifdef GTA_FIVE
@@ -1287,7 +1307,7 @@ extern "C"
 class MumbleAudioEntityBase
 {
 public:
-	MumbleAudioEntityBase(const std::wstring& name)
+	MumbleAudioEntityBase(const std::string& name)
 		: m_position(rage::Vec3V{ 0.f, 0.f, 0.f }),
 		  m_positionForce(rage::Vec3V{ 0.f, 0.f, 0.f }),
 		  m_buffer(nullptr),
@@ -1369,7 +1389,7 @@ protected:
 
 	CPed* m_ped;
 
-	std::wstring m_name;
+	std::string m_name;
 
 	std::function<void(int)> m_poller;
 };
@@ -1378,7 +1398,7 @@ template<int Build>
 class MumbleAudioEntity : public rage::audEntity<Build>, public MumbleAudioEntityBase, public std::enable_shared_from_this<MumbleAudioEntity<Build>>
 {
 public:
-	MumbleAudioEntity(const std::wstring& name)
+	MumbleAudioEntity(const std::string& name)
 		: MumbleAudioEntityBase(name)
 	{
 	}
@@ -1491,6 +1511,16 @@ void MumbleAudioEntity<Build>::MInit(float overrideVolume)
 {
 	std::lock_guard _(m_render);
 	m_environmentGroup = naEnvironmentGroup::Create();
+
+	// Some malicious clients can spam ped scenarios, indirectly exhausting
+	// the global audio EnvironmentGroup pool. When the pool is full,
+	// Create() may return nullptr. Previously this caused a crash because
+	// voice setup assumed the pointer was always valid.
+	if (m_environmentGroup == nullptr)
+	{
+		return;
+	}
+	
 	m_environmentGroup->Init(nullptr, 20.0f, 1000, 4000, 0.5f, 1000);
 	m_environmentGroup->SetPosition(m_position);
 
@@ -1801,7 +1831,7 @@ class MumbleAudioSink : public IMumbleAudioSink
 public:
 	void Process();
 
-	MumbleAudioSink(const std::wstring& name);
+	MumbleAudioSink(const std::string& name);
 	virtual ~MumbleAudioSink() override;
 
 	virtual void SetPollHandler(const std::function<void(int)>& poller) override;
@@ -1813,7 +1843,7 @@ public:
 	void Reset();
 
 private:
-	std::wstring m_name;
+	std::string m_name;
 	int m_serverId;
 
 	/// <summary>
@@ -1840,11 +1870,9 @@ static std::set<MumbleAudioSink*> g_sinks;
 static std::shared_mutex g_submixMutex;
 static std::map<int, int> g_submixIds;
 
-MumbleAudioSink::MumbleAudioSink(const std::wstring& name)
-	: m_serverId(-1), m_position(rage::Vec3V{ 0.f, 0.f, 0.f }), m_distance(5.0f), m_overrideVolume(-1.0f), m_name(name)
+MumbleAudioSink::MumbleAudioSink(const std::string& userName)
+	: m_serverId(-1), m_position(rage::Vec3V{ 0.f, 0.f, 0.f }), m_distance(5.0f), m_overrideVolume(-1.0f), m_name(userName)
 {
-	auto userName = ToNarrow(name);
-
 	if (userName.length() >= 2)
 	{
 		int serverId = atoi(userName.substr(1, userName.length() - 1).c_str());
@@ -2208,13 +2236,60 @@ DLL_IMPORT void ForceMountDataFile(const std::pair<std::string, std::string>& da
 
 static uint32_t* g_preferenceArray;
 
-// Outdated as of b2944, we're mapping indexes now.
-enum AudioPrefs
+// Virtual mapping - incomplete - function order
+enum eMenuPref
 {
-	PREF_SFX_VOLUME = 7,
-	PREF_MUSIC_VOLUME = 8,
-	PREF_MUSIC_VOLUME_IN_MP = 0x25,
+	PREF_SFX_VOLUME,
+	PREF_MUSIC_VOLUME,
+	PREF_MUSIC_VOLUME_IN_MP,
+	PREF_SPEAKER_OUTPUT,
+	PREF_INTERACTIVE_MUSIC,
+	PREF_RADIO_STATION,
+	PREF_DIAG_BOOST,
+	PREF_SS_FRONT,
+	PREF_SS_REAR,
+	PREF_VOICE_OUTPUT,
+	PREF_UR_AUTOSCAN,
+	PREF_UR_PLAYMODE,
+	PREF_VIRTUAL_MAX // NOT A GAME ENUM
 };
+
+static std::array<uint8_t, PREF_VIRTUAL_MAX> voicePrefEnums;
+
+static int MapPrefsEnum(const int index)
+{
+	return voicePrefEnums[index];
+}
+
+static void GetDynamicAudioPrefEnums()
+{
+	uint8_t inserted = 0;
+	uint8_t offset = 0xFF;
+
+	auto instructionPtr = hook::get_pattern<uint8_t>("48 89 5C 24 ? 57 48 83 EC ? BF ? ? ? ? 44 8B C7");
+
+	while (inserted < PREF_VIRTUAL_MAX)
+	{
+		if (instructionPtr[0] == 0xBF && offset == 0xFF)
+		{
+			assert(inserted == 0);
+			offset = instructionPtr[1];
+		}
+
+		if (instructionPtr[0] == 0x8D && instructionPtr[1] == 0x4F)
+		{
+			assert(offset != 0xFF && inserted < PREF_VIRTUAL_MAX);
+
+			const uint8_t enumVal = offset + instructionPtr[2];
+
+			voicePrefEnums[inserted++] = enumVal;
+		}
+
+		++instructionPtr;
+	}
+
+	assert(inserted == PREF_VIRTUAL_MAX);
+}
 #endif
 #ifdef GTA_FIVE
 static bool (*g_origLoadCategories)(void* a1, const char* why, const char* filename, int a4, int version, bool, void*);
@@ -2285,6 +2360,7 @@ static HookFunction hookFunction([]()
 {
 #ifdef GTA_FIVE
 	g_preferenceArray = hook::get_address<uint32_t*>(hook::get_pattern("48 8D 15 ? ? ? ? 8D 43 01 83 F8 02 77 2D", 3));
+	GetDynamicAudioPrefEnums();
 #endif
 	{
 #ifdef GTA_FIVE
@@ -2466,18 +2542,6 @@ static HookFunction hookFunction([]()
 
 rage::audDspEffect* MakeRadioFX();
 
-#ifdef GTA_FIVE
-static int MapPrefsEnum(int index)
-{
-	if (index >= 2 && xbr::IsGameBuildOrGreater<2944>())
-	{
-		index++;
-	}
-
-	return index;
-}
-#endif
-
 static InitFunction initFunction([]()
 {
 #if IS_RDR3
@@ -2582,7 +2646,7 @@ static InitFunction initFunction([]()
 	{
 		int idx = ctx.GetArgument<int>(1);
 
-		if (idx < 0 || idx > 40)
+		if (idx < 0 || idx >= rage::audMixerDevice::kSubmixCount)
 		{
 			idx = -1;
 		}
@@ -2868,7 +2932,7 @@ static InitFunction initFunction([]()
 		ProcessAudioSinks();
 	});
 
-	OnGetMumbleAudioSink.Connect([](const std::wstring& name, fwRefContainer<IMumbleAudioSink>* sink)
+	OnGetMumbleAudioSink.Connect([](const std::string& name, fwRefContainer<IMumbleAudioSink>* sink)
 	{
 		fwRefContainer<MumbleAudioSink> ref = new MumbleAudioSink(name);
 		*sink = ref;
@@ -2899,3 +2963,4 @@ static InitFunction initFunction([]()
 });
 
 rage::audMixerDevice** rage::audDriver::sm_Mixer;
+

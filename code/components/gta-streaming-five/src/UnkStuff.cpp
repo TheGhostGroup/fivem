@@ -6,7 +6,6 @@
 #include <sysAllocator.h>
 
 #include <CrossBuildRuntime.h>
-#include <LaunchMode.h>
 
 static int ReturnTrue()
 {
@@ -20,8 +19,6 @@ static int ReturnTrue()
 #include <MinHook.h>
 
 #include <Error.h>
-
-extern hook::cdecl_stub<rage::fiCollection*()> getRawStreamer;
 
 #define VFS_GET_RCD_DEBUG_INFO 0x30001
 
@@ -58,15 +55,15 @@ static void ErrorInflateFailure(char* ioData, char* requestData, int zlibError, 
 	}
 
 	// get the entry name
-	uint16_t fileIndex = (handle & 0xFFFF);
-	uint16_t collectionIndex = (handle >> 16);
+	uint16_t fileIndex = streaming::GetEntryIndex(handle);
+	uint16_t collectionIndex = streaming::GetCollectionIndex(handle);
 
 	auto spf = streaming::GetStreamingPackfileByIndex(collectionIndex);
 	auto collection = (rage::fiCollection*)(spf ? spf->packfile : nullptr);
 
-	if (!collection && collectionIndex == 0)
+	if (!collection && collectionIndex < 2)
 	{
-		collection = getRawStreamer();
+		collection = streaming::GetRawStreamerByIndex(collectionIndex);
 	}
 
 	std::string name = fmt::sprintf("unknown - handle %08x", handle);
@@ -82,7 +79,7 @@ static void ErrorInflateFailure(char* ioData, char* requestData, int zlibError, 
 	{
 		name = collection->GetEntryName(fileIndex);
 
-		if (collectionIndex == 0)
+		if (collectionIndex < 2)
 		{
 			// get the _raw_ file name
 			char fileNameBuffer[1024];
@@ -276,7 +273,6 @@ static HookFunction hookFunction([]()
 	hook::put<uint8_t>(hook::pattern("F6 05 ? ? ? ? ? 74 08 84 C0 0F 84").count(1).get(0).get<void>(0x18), 0xEB);
 #endif
 
-	if (!CfxIsSinglePlayer())
 	{
 		// passenger stuff?
 		hook::put<uint16_t>(hook::get_pattern("8B 45 30 48 8B 4F 20 41 BE FF FF 00 00", -6), 0xE990);
@@ -329,7 +325,15 @@ static HookFunction hookFunction([]()
 		}
 
 		hook::put<uint8_t>(hook::get_pattern("74 24 84 D2 74 20 8B 83", 4), 0xEB);
-		hook::put<uint8_t>(hook::get_pattern("84 D2 75 41 8B 83", 0x5F), 0xEB);
+			
+		if (xbr::IsGameBuildOrGreater<3258>())
+		{
+			hook::put<uint8_t>(hook::get_pattern("8B 83 ? ? ? ? C1 E8 ? 41 84 C5 74 ? 8B 87", -2), 0xEB);
+		}
+		else
+		{
+			hook::put<uint8_t>(hook::get_pattern("84 D2 75 41 8B 83", 0x5F), 0xEB);
+		}
 		//hook::put<uint8_t>(hook::get_pattern("40 B6 01 74 52 F3 0F 10 01", 3), 0xEB); // this skips a world grid check, might be bad!
 
 		// another scenario cluster network game check
