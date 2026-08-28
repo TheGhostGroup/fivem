@@ -1,7 +1,7 @@
 /*
- * This file is part of the CitizenFX project - http://citizen.re/
+ * This file is part of the Cfx project - https://cfx.re/
  *
- * See LICENSE and MENTIONS in the root of the source tree for information
+ * See LICENSE in the root of the source tree for information
  * regarding licensing.
  */
 
@@ -135,7 +135,7 @@ namespace fx::v8shared
 				v8::Local<v8::ArrayBuffer> buffer = abv->Buffer();
 
 				auto abs = buffer->GetBackingStore();
-				return Push((uint8_t*)abs->Data() + abv->ByteOffset(), abs->ByteLength());
+				return Push(static_cast<uint8_t*>(abs->Data()) + abv->ByteOffset(), abv->ByteLength());
 			}
 			// this should be the last entry, I'd guess
 			else if (arg->IsObject())

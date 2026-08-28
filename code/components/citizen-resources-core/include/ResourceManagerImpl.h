@@ -1,7 +1,7 @@
 /*
- * This file is part of the CitizenFX project - http://citizen.re/
+ * This file is part of the Cfx project - https://cfx.re/
  *
- * See LICENSE and MENTIONS in the root of the source tree for information
+ * See LICENSE in the root of the source tree for information
  * regarding licensing.
  */
 
@@ -27,6 +27,8 @@ private:
 	std::recursive_mutex m_mountersMutex;
 
 	std::vector<fwRefContainer<ResourceMounter>> m_mounters;
+
+	bool m_isMonitorMode = false;
 
 public:
 	ResourceManagerImpl();
@@ -56,5 +58,9 @@ public:
 	virtual void Tick() override;
 
 	virtual std::string CallReferenceInternal(const std::string& functionReference, const std::string& argsSerialized) override;
+
+	virtual bool IsMonitor() override;
+
+	virtual void SetMonitor(bool monitor) override;
 };
 }

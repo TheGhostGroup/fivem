@@ -1,7 +1,7 @@
 /*
-* This file is part of the CitizenFX project - http://citizen.re/
+* This file is part of the Cfx project - https://cfx.re/
 *
-* See LICENSE and MENTIONS in the root of the source tree for information
+* See LICENSE in the root of the source tree for information
 * regarding licensing.
 */
 
@@ -330,7 +330,7 @@ void NetLibraryResourcesComponent::UpdateResources(const std::string& updateList
 															})
 									 .dump());
 
-			static ConVar<bool> streamerMode("ui_streamerMode", ConVar_None, false);
+			static ConVar<bool> streamerMode("ui_streamerMode", ConVar_UserPref, false);
 			std::string errorData = fmt::sprintf(" Error state: %s", std::string{ data, size });
 
 			if (streamerMode.GetValue())

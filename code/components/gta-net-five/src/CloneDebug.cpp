@@ -1315,9 +1315,9 @@ static InitFunction initFunction([]()
 	static bool timeWindowEnabled;
 	static bool drilldownWindowEnabled;
 
-	static ConVar<bool> netViewerVar("netobjviewer", ConVar_Archive, false, &netViewerEnabled);
-	static ConVar<bool> syncLogVar("netobjviewer_syncLog", ConVar_Archive, false, &g_captureSyncLog);
-	static ConVar<bool> timeVar("net_showTime", ConVar_Archive, false, &timeWindowEnabled);
+	static ConVar<bool> netViewerVar("netobjviewer", ConVar_Archive | ConVar_UserPref, false, &netViewerEnabled);
+	static ConVar<bool> syncLogVar("netobjviewer_syncLog", ConVar_Archive | ConVar_UserPref, false, &g_captureSyncLog);
+	static ConVar<bool> timeVar("net_showTime", ConVar_Archive | ConVar_UserPref, false, &timeWindowEnabled);
 	static ConVar<bool> cloneDrilldownVar("net_showDrilldown", ConVar_Archive | ConVar_UserPref, false, &drilldownWindowEnabled);
 
 	ConHost::OnShouldDrawGui.Connect([](bool* should)
@@ -1508,6 +1508,9 @@ static HookFunction hookFunction([]()
 		g_vtbl_playerAppearanceDataNode = hook::get_address<uintptr_t>(hook::pattern("48 89 BB B8 00 00 00 48 89 83 B0 00 00 00").count(2).get(1).get<void*>(-0xE));
 		g_offset_playerAppearanceDataNode_hasDecorations = *hook::get_pattern<uint32_t>("88 ? ? ? ? ? 84 C0 75 0D 44 8B C5 33", 2);
 	}
+
+	// Change bit size of component variation data from 7 to 8 in CPlayerAppearanceDataNode
+	hook::put(hook::get_pattern("41 B8 ? ? ? ? 48 8B 03 45 33 C9", 2), 8);
 
 	// allow CSyncDataLogger even without label string
 	hook::nop(hook::get_pattern("4D 85 C9 74 44 48 8D 4C", 3), 2);

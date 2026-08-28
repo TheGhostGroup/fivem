@@ -1,7 +1,7 @@
 /*
- * This file is part of the CitizenFX project - http://citizen.re/
+ * This file is part of the Cfx project - https://cfx.re/
  *
- * See LICENSE and MENTIONS in the root of the source tree for information
+ * See LICENSE in the root of the source tree for information
  * regarding licensing.
  */
 
@@ -48,17 +48,15 @@
 
 #include <CrossBuildRuntime.h>
 
-#include <SteamComponentAPI.h>
-
 #include <MinMode.h>
 
 #include "CfxState.h"
 #include "GameInit.h"
 #include "CnlEndpoint.h"
 #include <SharedLegitimacyAPI.h>
+#include "Error.h"
 
 #include "PacketHandler.h"
-#include "PaymentRequest.h"
 
 #include "LinkProtocolIPC.h"
 
@@ -105,18 +103,18 @@ static void SaveBuildNumber(uint32_t build)
 	}
 }
 
-static void SaveGameSettings(const std::wstring& poolIncreases, bool replaceExecutable)
+static void SaveGameSettings(const std::wstring& poolIncreases, int defaultBuild)
 {
 	std::wstring fpath = MakeRelativeCitPath(L"CitizenFX.ini");
 
 	if (GetFileAttributes(fpath.c_str()) != INVALID_FILE_ATTRIBUTES)
 	{
 		WritePrivateProfileString(L"Game", L"PoolSizesIncrease", poolIncreases.c_str(), fpath.c_str());
-		WritePrivateProfileString(L"Game", L"ReplaceExecutable", replaceExecutable ? L"1" : L"0", fpath.c_str());
+		WritePrivateProfileString(L"Game", L"DefaultBuild", fmt::sprintf(L"%d", defaultBuild).c_str(), fpath.c_str());
 	}
 }
 
-void RestartGameToOtherBuild(int build, int pureLevel, std::wstring poolSizesIncreaseSetting, bool replaceExecutable)
+void RestartGameToOtherBuild(int build, int pureLevel, std::wstring poolSizesIncreaseSetting, int defaultBuild)
 {
 #if defined(GTA_FIVE) || defined(IS_RDR3)
 	SECURITY_ATTRIBUTES securityAttributes = { 0 };
@@ -141,9 +139,9 @@ void RestartGameToOtherBuild(int build, int pureLevel, std::wstring poolSizesInc
 		SaveBuildNumber(xbr::GetDefaultGameBuild());
 	}
 
-	SaveGameSettings(poolSizesIncreaseSetting, replaceExecutable);
+	SaveGameSettings(poolSizesIncreaseSetting, defaultBuild);
 
-	trace("Switching from build %d to build %d...\n", xbr::GetRequestedGameBuild(), build);
+	trace("Switching from build %d to build %d (exe %d)...\n", xbr::GetRequestedGameBuild(), build, defaultBuild);
 
 	SIZE_T size = 0;
 	InitializeProcThreadAttributeList(NULL, 1, 0, &size);
@@ -177,7 +175,7 @@ void RestartGameToOtherBuild(int build, int pureLevel, std::wstring poolSizesInc
 #endif
 }
 
-extern void InitializeBuildSwitch(int build, int pureLevel, std::wstring poolSizesIncreaseSetting, bool replaceExecutable);
+extern void InitializeBuildSwitch(int build, int pureLevel, std::wstring poolSizesIncreaseSetting, int defaultBuild);
 
 void saveSettings(const wchar_t *json) {
 	PWSTR appDataPath;
@@ -218,24 +216,6 @@ void loadSettings() {
 		
 		CoTaskMemFree(appDataPath);
 	}
-}
-
-inline ISteamComponent* GetSteam()
-{
-	auto steamComponent = Instance<ISteamComponent>::Get();
-
-	// if Steam isn't running, return an error
-	if (!steamComponent->IsSteamRunning())
-	{
-		steamComponent->Initialize();
-
-		if (!steamComponent->IsSteamRunning())
-		{
-			return nullptr;
-		}
-	}
-
-	return steamComponent;
 }
 
 NetLibrary* netLibrary;
@@ -529,59 +509,6 @@ static void DisconnectCmd()
 
 extern void MarkNuiLoaded();
 
-static std::function<void()> g_onYesCallback;
-
-class PaymentRequestPacketHandler : public net::PacketHandler<net::packet::ServerPaymentRequest, HashRageString("msgPaymentRequest")>
-{
-public:
-	template<typename T>
-	bool Process(T& stream)
-	{
-		return ProcessPacket(stream, [](net::packet::ServerPaymentRequest& serverPaymentRequest)
-		{
-			try
-			{
-				auto json = nlohmann::json::parse(std::string(reinterpret_cast<const char*>(serverPaymentRequest.data.GetValue().data()), serverPaymentRequest.data.GetValue().size()));
-
-				se::ScopedPrincipal scope(se::Principal{ "system.console" });
-				console::GetDefaultContext()->GetVariableManager()->FindEntryRaw("warningMessageResult")->SetValue("0");
-				console::GetDefaultContext()->ExecuteSingleCommandDirect(ProgramArguments{ "warningmessage", "PURCHASE REQUEST", fmt::sprintf("The server is requesting a purchase of %s for %s.", json.value("sku_name", ""), json.value("sku_price", "")), "Do you want to purchase this item?", "20" });
-
-				g_onYesCallback = [json]()
-				{
-					std::map<std::string, std::string> postMap;
-					postMap["data"] = json.value<std::string>("data", "");
-					postMap["sig"] = json.value<std::string>("sig", "");
-					postMap["clientId"] = g_discourseClientId;
-					postMap["userToken"] = g_discourseUserToken;
-
-					Instance<HttpClient>::Get()->DoPostRequest("https://keymaster.fivem.net/api/paymentAssign", postMap, [](bool success, const char* data, size_t length)
-					{
-						if (success)
-						{
-							auto res = nlohmann::json::parse(std::string(data, length));
-							auto url = res.value("url", "");
-
-							if (!url.empty())
-							{
-								if (url.find("http://") == 0 || url.find("https://") == 0)
-								{
-									ShellExecute(nullptr, L"open", ToWide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-								}
-							}
-						}
-					});
-				};
-			}
-			catch (const std::exception& e)
-			{
-
-			}
-		});
-	}
-};
-
-
 static InitFunction initFunction([] ()
 {
 	static std::function<void()> backfillDoneEvent;
@@ -597,6 +524,18 @@ static InitFunction initFunction([] ()
 
 	OnGameFrame.Connect([]()
 	{
+		static bool wasSteamInitialized = cfx::legitimacy::IsSteamInitializedWrapper();
+
+		if (wasSteamInitialized && !cfx::legitimacy::IsSteamRunning())
+		{
+			FatalError("Steam process has exited. The game will now close.");
+		}
+
+		if (!wasSteamInitialized && cfx::legitimacy::IsSteamInitializedWrapper())
+		{
+			wasSteamInitialized = true;
+		}
+
 		if (disconnect)
 		{
 			DisconnectCmd();
@@ -680,9 +619,9 @@ static InitFunction initFunction([] ()
 			nui::PostRootMessage(fmt::sprintf(R"({ "type": "setServerAddress", "data": "%s" })", peerAddress));
 		});
 
-		netLibrary->OnRequestBuildSwitch.Connect([](int build, int pureLevel, std::wstring poolSizesIncreaseSetting, bool replaceExecutable)
+		netLibrary->OnRequestBuildSwitch.Connect([](int build, int pureLevel, std::wstring poolSizesIncreaseSetting, int defaultBuild)
 		{
-			InitializeBuildSwitch(build, pureLevel, std::move(poolSizesIncreaseSetting), replaceExecutable);
+			InitializeBuildSwitch(build, pureLevel, std::move(poolSizesIncreaseSetting), defaultBuild);
 			g_connected = false;
 		});
 
@@ -692,26 +631,11 @@ static InitFunction initFunction([] ()
 
 			if ((strstr(error.c_str(), "steam") || strstr(error.c_str(), "Steam")) && !strstr(error.c_str(), ".ms/verify"))
 			{
-				if (auto steam = GetSteam())
+				auto steamID = cfx::legitimacy::GetSteamIdAsIntWrapper();
+
+				if ((steamID & 0xFFFFFFFF00000000) != 0)
 				{
-					if (steam->IsSteamRunning())
-					{
-						if (IClientEngine* steamClient = steam->GetPrivateClient())
-						{
-							InterfaceMapper steamUser(steamClient->GetIClientUser(steam->GetHSteamUser(), steam->GetHSteamPipe(), "CLIENTUSER_INTERFACE_VERSION001"));
-
-							if (steamUser.IsValid())
-							{
-								uint64_t steamID = 0;
-								steamUser.Invoke<void>("GetSteamID", &steamID);
-
-								if ((steamID & 0xFFFFFFFF00000000) != 0)
-								{
-									error += "\nThis is a Steam authentication failure, but you are running Steam and it is signed in. The server owner can find more information in their server console.";
-								}
-							}
-						}
-					}
+					error += "\nThis is a Steam authentication failure, but you are running Steam and it is signed in. The server owner can find more information in their server console.";
 				}
 			}
 
@@ -826,26 +750,6 @@ static InitFunction initFunction([] ()
 				ep.Call("unloaded");
 			}
 		}, 5000);
-
-		lib->AddPacketHandler<PaymentRequestPacketHandler>(true);
-	});
-
-	OnMainGameFrame.Connect([]()
-	{
-		if (g_onYesCallback)
-		{
-			int result = atoi(console::GetDefaultContext()->GetVariableManager()->FindEntryRaw("warningMessageResult")->GetValue().c_str());
-
-			if (result != 0)
-			{
-				if (result == 4)
-				{
-					g_onYesCallback();
-				}
-
-				g_onYesCallback = {};
-			}
-		}
 	});
 
 	OnKillNetwork.Connect([](const char*)
@@ -1003,7 +907,7 @@ static InitFunction initFunction([] ()
 
 	curChannel = ToNarrow(resultPath);
 
-	static ConVar<bool> uiPremium("ui_premium", ConVar_None, false);
+	static ConVar<bool> uiPremium("ui_premium", ConVar_Internal | ConVar_ScriptRestricted, false);
 
 	// ConVar_ScriptRestricted because update channel is often misused as a marker for other things
 	static ConVar<std::string> uiUpdateChannel("ui_updateChannel", ConVar_ScriptRestricted, curChannel,

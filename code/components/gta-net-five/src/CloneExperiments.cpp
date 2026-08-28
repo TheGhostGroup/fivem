@@ -2190,6 +2190,11 @@ static HookFunction hookFunction([]()
 		// memset in CNetworkDamageTracker::ctor
 		hook::put<uint32_t>(hook::get_pattern("48 89 11 48 8B D9 41 B8 80 00 00 00", 8), sizeof(float) * 256);
 	}
+
+	if (xbr::IsGameBuildOrGreater<xbr::Build::Patch_2026_1>())
+	{
+		hook::put<uint8_t>(hook::get_pattern("80 FB ? 73 ? 0F B6 C3 48 8D 14 80", 2), 0x80);
+	}
 #endif
 
 	MH_EnableHook(MH_ALL_HOOKS);
@@ -2780,6 +2785,12 @@ static InitFunction initFunction([]()
 			return;
 		}
 
+		// don't run clone updates until resources are started after connect
+		if (!icgi->HasVariable("gameSettled"))
+		{
+			return;
+		}
+
 		ArrayManager_Update();
 		rage::EventManager_Update();
 		TheClones->Update();
@@ -3285,7 +3296,7 @@ static HookFunction hookFunctionNative([]()
 	MH_Initialize();
 
 #ifdef GTA_FIVE
-	if (xbr::IsGameBuildOrGreater<xbr::Build::Summer_2025>())
+	if (xbr::IsGameBuildOrGreater<xbr::Build::Summer_2025>() && !xbr::IsGameBuildOrGreater<xbr::Build::Summer_2026>())
 	{
 		MH_CreateHook(hook::get_pattern("48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 41 54 41 55 41 56 41 57 48 83 EC ? 0F B6 B2"), SendCloneSync, (void**)&g_origSendCloneSync);
 	}

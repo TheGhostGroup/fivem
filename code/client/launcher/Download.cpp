@@ -1,7 +1,7 @@
 /*
- * This file is part of the CitizenFX project - http://citizen.re/
+ * This file is part of the Cfx project - https://cfx.re/
  *
- * See LICENSE and MENTIONS in the root of the source tree for information
+ * See LICENSE in the root of the source tree for information
  * regarding licensing.
  */
 
@@ -421,8 +421,6 @@ static int DL_CurlDebug(CURL *handle,
 
 	return 0;
 }
-
-extern void UI_SetSnailState(bool snail);
 
 #include <shellapi.h>
 #include <shobjidl.h>

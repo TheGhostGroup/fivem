@@ -1,7 +1,7 @@
 /*
- * This file is part of the CitizenFX project - http://citizen.re/
+ * This file is part of the Cfx project - https://cfx.re/
  *
- * See LICENSE and MENTIONS in the root of the source tree for information
+ * See LICENSE in the root of the source tree for information
  * regarding licensing.
  */
 
@@ -124,6 +124,17 @@ public:
 	// Makes this resource manager the current resource manager.
 	//
 	virtual void MakeCurrent() = 0;
+
+	//
+	// Gets is in monitor mode for permission manager
+	//
+	virtual bool IsMonitor() = 0;
+
+	//
+	// Sets monitor mode for permission manager
+	//
+	virtual void SetMonitor(bool monitor) = 0;
+
 
 public:
 	//

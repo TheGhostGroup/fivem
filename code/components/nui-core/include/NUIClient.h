@@ -1,7 +1,7 @@
 /*
- * This file is part of the CitizenFX project - http://citizen.re/
+ * This file is part of the Cfx project - https://cfx.re/
  *
- * See LICENSE and MENTIONS in the root of the source tree for information
+ * See LICENSE in the root of the source tree for information
  * regarding licensing.
  */
 
@@ -73,6 +73,23 @@ public:
 	inline bool HasLoadedMainFrame()
 	{
 		return m_loadedMainFrame;
+	}
+
+	inline bool IsUrlBlocked(std::string const& url)
+	{
+		std::shared_lock _(m_requestBlocklistLock);
+
+		return std::any_of(m_requestBlocklist.begin(), m_requestBlocklist.end(), [&](auto& reg)
+		{
+			try
+			{
+				return std::regex_search(url, reg);
+			}
+			catch (std::exception& e)
+			{
+				return false;
+			}
+		});
 	}
 
 public:
@@ -201,6 +218,9 @@ protected:
 
 	// CefRequestHandler
 	virtual bool OnOpenURLFromTab(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, const CefString& target_url, CefRequestHandler::WindowOpenDisposition target_disposition, bool user_gesture) override;
+
+	// CefResourceRequestHandler
+	virtual CefRefPtr<CefResourceHandler> GetResourceHandler(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefRequest> request) override;
 
 	IMPLEMENT_REFCOUNTING(NUIClient);
 };

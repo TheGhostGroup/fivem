@@ -1,7 +1,7 @@
 /*
- * This file is part of the CitizenFX project - http://citizen.re/
+ * This file is part of the Cfx project - https://cfx.re/
  *
- * See LICENSE and MENTIONS in the root of the source tree for information
+ * See LICENSE in the root of the source tree for information
  * regarding licensing.
  */
 
@@ -83,6 +83,21 @@ namespace fx
 		}
 	}
 
+	uint32_t PoolSizeManager::GetLimit(const std::string& poolName)
+	{
+		if (!LimitsLoaded())
+		{
+			return 0;
+		}
+
+		auto it = limits->find(poolName);
+		if (it == limits->end())
+		{
+			return 0;
+		}
+		return it->second;
+	}
+
 	std::optional<std::string> PoolSizeManager::ValidateImpl(const std::string& poolName, uint32_t sizeIncrease)
 	{
 		if (!LimitsLoaded())
@@ -106,7 +121,7 @@ namespace fx
 
 	std::optional<std::string> PoolSizeManager::Validate(const std::string& poolName, uint32_t sizeIncrease)
 	{
-		static ConVar<int> moo("moo", ConVar_None, 0);
+		static ConVar<int> moo("moo", ConVar_UserPref, 0);
 
 		bool skipValidation = moo.GetValue() == 31337;
 
@@ -132,18 +147,30 @@ namespace fx
 		return std::nullopt;
 	}
 
-	std::optional<std::string> PoolSizeManager::Validate(const std::unordered_map<std::string, uint32_t>& increaseRequest)
+	void PoolSizeManager::Sanitize(std::unordered_map<std::string, uint32_t>& increaseRequest)
 	{
 		for (const auto& [name, sizeIncrease] : increaseRequest)
 		{
 			std::optional<std::string> validationError = Validate(name, sizeIncrease);
-			if (validationError.has_value())
+			if (!validationError.has_value())
 			{
-				return validationError;
+				continue;
+			}
+
+			uint32_t limit = GetLimit(name);
+			trace(
+				"Pool size increase validation failed: %s. Using maximum allowed increase %d instead.\n",
+				validationError.value(), limit
+			);
+			if (limit == 0)
+			{
+				increaseRequest.erase(name);
+			}
+			else
+			{
+				increaseRequest[name] = limit;
 			}
 		}
-
-		return std::nullopt;
 	}
 }
 
@@ -151,9 +178,9 @@ namespace fx
 static InitFunction initFunction([]()
 {
 #ifdef GTA_FIVE
-	std::string limitsFileUrl = "https://content.cfx.re/mirrors/client/pool-size-limits/fivem.json";
+	std::string limitsFileUrl = "https://gss.cfx-services.net/v1/public/pool-size-limits/fivem";
 #else
-	std::string limitsFileUrl = "https://content.cfx.re/mirrors/client/pool-size-limits/redm.json";
+	std::string limitsFileUrl = "https://gss.cfx-services.net/v1/public/pool-size-limits/redm";
 #endif
 	fx::PoolSizeManager::FetchLimits(limitsFileUrl);
 	fx::PoolSizeManager::FetchIncreaseRequest();

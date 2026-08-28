@@ -1,7 +1,7 @@
 /*
- * This file is part of the CitizenFX project - http://citizen.re/
+ * This file is part of the Cfx project - https://cfx.re/
  *
- * See LICENSE and MENTIONS in the root of the source tree for information
+ * See LICENSE in the root of the source tree for information
  * regarding licensing.
  */
 
@@ -171,7 +171,7 @@ void NUIApp::OnBeforeCommandLineProcessing(const CefString& process_type, CefRef
 	static ConVar<bool> nuiUseInProcessGpu("nui_useInProcessGpu", ConVar_Archive, true);
 
 	static std::string defaultUiUrl = "https://nui-game-internal/ui/app/index.html";
-	static ConVar<std::string> uiUrlVar("ui_url", ConVar_None, defaultUiUrl);
+	static ConVar<std::string> uiUrlVar("ui_url", ConVar_UserPref, defaultUiUrl);
 
 	if (uiUrlVar.GetValue() != defaultUiUrl)
 	{
@@ -221,6 +221,9 @@ void NUIApp::OnBeforeCommandLineProcessing(const CefString& process_type, CefRef
 	command_line->AppendSwitch("disable-accelerated-video-decode");
 	command_line->AppendSwitch("disable-accelerated-video-encode");
 	command_line->AppendSwitch("disable-accelerated-mjpeg-decode");
+
+	// prevent widewine from downloading
+	command_line->AppendSwitch("disable-component-update");
 
 	// register the CitizenFX game view plugin
 #if !GTA_NY

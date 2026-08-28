@@ -89,8 +89,6 @@ std::shared_ptr<ConVar<std::string>> g_oneSyncLogVar;
 std::shared_ptr<ConVar<bool>> g_oneSyncWorkaround763185;
 std::shared_ptr<ConVar<bool>> g_oneSyncBigMode;
 std::shared_ptr<ConVar<bool>> g_oneSyncLengthHack;
-std::shared_ptr<ConVar<bool>> g_experimentalOneSyncPopulation;
-std::shared_ptr<ConVar<bool>> g_experimentalNetGameEventHandler;
 std::shared_ptr<ConVar<fx::OneSyncState>> g_oneSyncVar;
 std::shared_ptr<ConVar<bool>> g_oneSyncPopulation;
 std::shared_ptr<ConVar<bool>> g_oneSyncARQ;
@@ -1798,7 +1796,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 				localLastFrameIndex = entity->lastFrameIndex;
 			}
 
-			ces.syncedEntities[entity->handle] = { entity, baseFrameIndex, syncData.hasCreated };
+			ces.Insert(entity->handle, ClientEntityData{ entity, baseFrameIndex, syncData.hasCreated });
 
 			if (syncData.hasCreated && !syncData.hasRoutedStateBag)
 			{
@@ -2000,6 +1998,8 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			{
 				firstFrameState = m_frameIndex;
 			}
+			
+			ces.Sort();
 
 			// emplace new frame
 			clientDataUnlocked->frameStates.emplace(m_frameIndex, std::move(ces));
@@ -3545,6 +3545,18 @@ bool ServerGameState::ProcessClonePacket(const fx::ClientSharedPtr& client, rl::
 			std::unique_lock _lock(data->playerEntityMutex);
 			sync::SyncEntityPtr playerEntity = data->playerEntity.lock();
 
+			// Prevent clients from creating multiple CNetObjPlayer entities
+			if (createdHere && playerEntity)
+			{
+				GS_LOG("%s: client %d %s tried to create duplicate player entity %d, but already has player entity %d. Rejecting!\n",
+					__func__,
+					client->GetNetId(),
+					client->GetName(),
+					objectId,
+					playerEntity->handle & 0xFFFF);
+				return false;
+			}
+
 			if (!playerEntity)
 			{
 				SendWorldGrid(nullptr, client);
@@ -4017,7 +4029,7 @@ void ServerGameState::GetFreeObjectIds(const fx::ClientSharedPtr& client, uint8_
 	{
 		bool hadId = false;
 
-		for (; id < m_objectIdsSent.size(); id++)
+		for (; id < static_cast<uint16_t>(MaxObjectId); id++)
 		{
 			if (!m_objectIdsSent.test(id) && !m_objectIdsUsed.test(id))
 			{
@@ -4258,8 +4270,8 @@ void ServerGameState::HandleGameStateNAck(fx::ServerInstanceBase* instance, cons
 		{
 			if (auto frameIt = states.find(frame); frameIt != states.end())
 			{
-				auto& [synced, deletions] = frameIt->second;
-				for (auto& [objectId, entData] : synced)
+				ClientEntityState& clientEntityState = frameIt->second;
+				for (auto& [objectId, entData] : clientEntityState.GetSyncedEntities())
 				{
 					if (auto ent = entData.GetEntity(this))
 					{
@@ -4282,7 +4294,7 @@ void ServerGameState::HandleGameStateNAck(fx::ServerInstanceBase* instance, cons
 					}
 				}
 
-				for (auto [identPair, deletionData] : deletions)
+				for (auto [identPair, deletionData] : clientEntityState.deletions)
 				{
 					clientData->entitiesToDestroy[identPair] = { fx::sync::SyncEntityPtr{}, deletionData };
 				}
@@ -4297,13 +4309,13 @@ void ServerGameState::HandleGameStateNAck(fx::ServerInstanceBase* instance, cons
 		// propagate these frames into newer states, as well
 		for (auto frameIt = states.upper_bound(lastMissingFrame); frameIt != states.end(); frameIt++)
 		{
-			auto& [synced, deletions] = frameIt->second;
+			ClientEntityState& clientEntityState = frameIt->second;
 
 			for (const auto& [objectId, correction] : lastSentCorrections)
 			{
-				if (auto entIt = synced.find(objectId); entIt != synced.end())
+				if (auto entIt = clientEntityState.GetClientEntityData(objectId); entIt != nullptr)
 				{
-					entIt->second.lastSent = correction;
+					entIt->lastSent = correction;
 				}
 			}
 		}
@@ -4319,10 +4331,10 @@ void ServerGameState::HandleGameStateNAck(fx::ServerInstanceBase* instance, cons
 		{
 			for (auto& ignoreListEntry : packet.GetIgnoreList())
 			{
-				auto& [synced, deletions] = frameIt->second;
-				if (auto entIter = synced.find(ignoreListEntry.entry); entIter != synced.end())
+				ClientEntityState& clientEntityState = frameIt->second;
+				if (auto entIter = clientEntityState.GetClientEntityData(ignoreListEntry.entry); entIter != nullptr)
 				{
-					if (auto ent = entIter->second.GetEntity(this))
+					if (auto ent = entIter->GetEntity(this))
 					{
 						std::lock_guard _(ent->frameMutex);
 						ent->lastFramesSent[slotId] = std::min(ignoreListEntry.lastFrame, ent->lastFramesSent[slotId]);
@@ -4337,10 +4349,10 @@ void ServerGameState::HandleGameStateNAck(fx::ServerInstanceBase* instance, cons
 			for (uint16_t objectId : packet.GetRecreateList())
 			{
 				GS_LOG("attempt recreate of id %d for client %d\n", objectId, client->GetNetId());
-				auto& [synced, deletions] = frameIt->second;
-				if (auto entIter = synced.find(objectId); entIter != synced.end())
+				ClientEntityState& clientEntityState = frameIt->second;
+				if (auto entIter = clientEntityState.GetClientEntityData(objectId); entIter != nullptr)
 				{
-					if (auto ent = entIter->second.GetEntity(this))
+					if (auto ent = entIter->GetEntity(this))
 					{
 						const auto entIdentifier = MakeHandleUniqifierPair(objectId, ent->uniqifier);
 						if (auto syncedIt = clientData->syncedEntities.find(entIdentifier); syncedIt != clientData->syncedEntities.end())
@@ -4387,14 +4399,14 @@ void ServerGameState::HandleGameStateAck(fx::ServerInstanceBase* instance, const
 	auto [lock, clientData] = GetClientData(sgs.GetRef(), client);
 			
 	const auto& ref = clientData->frameStates[frameIndex];
-	const auto& [synced, deletions] = ref;
+	const ClientEntityState& clientEntityState = ref;
 
 	{
 		for (const uint16_t objectId : packet.GetRecreateList())
 		{
-			if (auto entIter = synced.find(objectId); entIter != synced.end())
+			if (auto entIter = clientEntityState.GetClientEntityData(objectId); entIter != nullptr)
 			{
-				if (auto ent = entIter->second.GetEntity(sgs.GetRef()))
+				if (auto ent = entIter->GetEntity(sgs.GetRef()))
 				{
 					if (auto secIt = clientData->syncedEntities.find(MakeHandleUniqifierPair(objectId, ent->uniqifier)); secIt != clientData->syncedEntities.end())
 					{
@@ -4406,9 +4418,9 @@ void ServerGameState::HandleGameStateAck(fx::ServerInstanceBase* instance, const
 
 		for (auto& ignoreListEntry : packet.GetIgnoreList())
 		{
-			if (auto entIter = synced.find(ignoreListEntry.entry); entIter != synced.end())
+			if (auto entIter = clientEntityState.GetClientEntityData(ignoreListEntry.entry); entIter != nullptr)
 			{
-				if (auto ent = entIter->second.GetEntity(sgs.GetRef()))
+				if (auto ent = entIter->GetEntity(sgs.GetRef()))
 				{
 					std::lock_guard _(ent->frameMutex);
 					ent->lastFramesSent[slotId] = std::min(ent->lastFramesSent[slotId], ignoreListEntry.lastFrame);
@@ -4419,7 +4431,7 @@ void ServerGameState::HandleGameStateAck(fx::ServerInstanceBase* instance, const
 	}
 
 	{
-		for (auto& [id, entityData] : synced)
+		for (auto& [id, entityData] : clientEntityState.GetSyncedEntities())
 		{
 			fx::sync::SyncEntityPtr entityRef = entityData.GetEntity(sgs.GetRef());
 
@@ -4648,11 +4660,6 @@ void ServerGameState::AttachToObject(fx::ServerInstanceBase* instance)
 			trace("^3You must specify an event name to block.^7\n");
 			return;
 		}
-		if (!g_experimentalNetGameEventHandler->GetValue())
-		{
-			trace("^3You must enable sv_experimentalNetGameEventHandler convar before using this command.^7\n");
-			return;
-		}
 
 		std::transform(eventName.begin(), eventName.end(), eventName.begin(),
 		[](unsigned char c)
@@ -4669,11 +4676,6 @@ void ServerGameState::AttachToObject(fx::ServerInstanceBase* instance)
 		if (eventName.empty())
 		{
 			trace("^3You must specify an event name to unblock.^7\n");
-			return;
-		}
-		if (!g_experimentalNetGameEventHandler->GetValue())
-		{
-			trace("^3You must enable sv_experimentalNetGameEventHandler convar before using this command.^7\n");
 			return;
 		}
 
@@ -7851,18 +7853,15 @@ static InitFunction initFunction([]()
 			return g_oneSyncEnabledVar->GetValue() || g_oneSyncVar->GetValue() != fx::OneSyncState::Off;
 		});
 
-		g_oneSyncVar = instance->AddVariable<fx::OneSyncState>("onesync", ConVar_ReadOnly, fx::OneSyncState::Off);
+		g_oneSyncVar = instance->AddVariable<fx::OneSyncState>("onesync", ConVar_Internal, fx::OneSyncState::On);
 		g_oneSyncPopulation = instance->AddVariable<bool>("onesync_population", ConVar_ReadOnly, true);
 		g_oneSyncARQ = instance->AddVariable<bool>("onesync_automaticResend", ConVar_None, false);
 
 		// .. to infinity?
-		g_oneSyncBigMode = instance->AddVariable<bool>("onesync_enableInfinity", ConVar_ReadOnly, false);
+		g_oneSyncBigMode = instance->AddVariable<bool>("onesync_enableInfinity", ConVar_Internal, true);
 
 		// or maybe, beyond?
-		g_oneSyncLengthHack = instance->AddVariable<bool>("onesync_enableBeyond", ConVar_ReadOnly, false);
-
-		g_experimentalOneSyncPopulation = instance->AddVariable<bool>("sv_experimentalOneSyncPopulation", ConVar_None, true);
-		g_experimentalNetGameEventHandler = instance->AddVariable<bool>("sv_experimentalNetGameEventHandler", ConVar_None, true);
+		g_oneSyncLengthHack = instance->AddVariable<bool>("onesync_enableBeyond", ConVar_Internal, true);
 
 		constexpr bool canLengthHack =
 #ifdef STATE_RDR3
@@ -7873,21 +7872,11 @@ static InitFunction initFunction([]()
 		;
 
 		fx::SetBigModeHack(g_oneSyncBigMode->GetValue(), canLengthHack && g_oneSyncLengthHack->GetValue());
-		if (g_experimentalOneSyncPopulation->GetValue() || g_experimentalNetGameEventHandler->GetValue())
-		{
-			fx::SetOneSyncPopulation(g_oneSyncPopulation->GetValue());
-		}
+		fx::SetOneSyncPopulation(g_oneSyncPopulation->GetValue());
 
 		if (g_oneSyncVar->GetValue() == fx::OneSyncState::On)
 		{
-			if (g_experimentalOneSyncPopulation->GetValue() || g_experimentalNetGameEventHandler->GetValue())
-			{
-				fx::SetBigModeHack(true, canLengthHack);
-			}
-			else
-			{
-				fx::SetBigModeHack(true, canLengthHack && g_oneSyncPopulation->GetValue());
-			}
+			fx::SetBigModeHack(true, canLengthHack);
 
 			g_oneSyncBigMode->GetHelper()->SetRawValue(true);
 			g_oneSyncLengthHack->GetHelper()->SetRawValue(fx::IsLengthHack());
@@ -7916,7 +7905,7 @@ static InitFunction initFunction([]()
 			return;
 		}
 
-		g_oneSyncEnabledVar = instance->AddVariable<bool>("onesync_enabled", ConVar_ServerInfo, false);
+		g_oneSyncEnabledVar = instance->AddVariable<bool>("onesync_enabled", ConVar_ServerInfo | ConVar_Internal, false);
 		g_oneSyncCulling = instance->AddVariable<bool>("onesync_distanceCulling", ConVar_None, true);
 		g_oneSyncVehicleCulling = instance->AddVariable<bool>("onesync_distanceCullVehicles", ConVar_None, false);
 		g_oneSyncForceMigration = instance->AddVariable<bool>("onesync_forceMigration", ConVar_None, true);
@@ -7940,12 +7929,9 @@ static InitFunction initFunction([]()
 
 		auto gameServer = instance->GetComponent<fx::GameServer>();
 
+#if 0
 		gameServer->GetComponent<fx::HandlerMapComponent>()->Add(HashRageString("msgNetGameEvent"), { fx::ThreadIdx::Sync, [=](const fx::ClientSharedPtr& client, net::ByteReader& reader, fx::ENetPacketPtr packet)
 		{
-			if (g_experimentalNetGameEventHandler->GetValue())
-			{
-				return;
-			}
 			// this should match up with SendGameEventRaw on client builds
 			// 1024 bytes is from the rlBuffer
 			// 512 is from the max amount of players (2 * 256)
@@ -8025,13 +8011,19 @@ static InitFunction initFunction([]()
 				routeEvent();
 			}
 		} });
+#endif
 
 		auto consoleCtx = instance->GetComponent<console::Context>();
 
 		// start sessionmanager
 		if (gameServer->GetGameName() == fx::GameName::RDR3)
 		{
-			consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "start", "sessionmanager-rdr3" });
+			// Race
+			instance->OnInitialConfiguration.Connect([consoleCtx]()
+			{
+				consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "start", "sessionmanager-rdr3" });
+			},
+			INT32_MAX);
 		}
 		else if (!g_oneSyncEnabledVar->GetValue() && g_oneSyncVar->GetValue() == fx::OneSyncState::Off)
 		{

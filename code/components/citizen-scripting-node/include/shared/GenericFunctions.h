@@ -1,7 +1,7 @@
 /*
- * This file is part of the CitizenFX project - http://citizen.re/
+ * This file is part of the Cfx project - https://cfx.re/
  *
- * See LICENSE and MENTIONS in the root of the source tree for information
+ * See LICENSE in the root of the source tree for information
  * regarding licensing.
  */
 
@@ -255,5 +255,18 @@ namespace fx::v8shared
 		auto path = ((fx::Resource*)runtime->GetParentObject())->GetPath();
 
 		args.GetReturnValue().Set(v8::String::NewFromUtf8(args.GetIsolate(), path.c_str(), v8::NewStringType::kNormal, path.size()).ToLocalChecked());
+	}
+
+	template<class RuntimeType>
+	static void V8_GetResourceTempPath(const v8::FunctionCallbackInfo<v8::Value>& args)
+	{
+		auto runtime = GetScriptRuntimeFromArgs<RuntimeType>(args);
+		const auto& tempPath = runtime->GetTempPath();
+
+		// lazily create the directory on first call
+		std::error_code ec;
+		std::filesystem::create_directories(tempPath, ec);
+
+		args.GetReturnValue().Set(v8::String::NewFromUtf8(args.GetIsolate(), tempPath.c_str(), v8::NewStringType::kNormal, tempPath.size()).ToLocalChecked());
 	}
 }

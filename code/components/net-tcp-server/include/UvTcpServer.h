@@ -1,7 +1,7 @@
 /*
- * This file is part of the CitizenFX project - http://citizen.re/
+ * This file is part of the Cfx project - https://cfx.re/
  *
- * See LICENSE and MENTIONS in the root of the source tree for information
+ * See LICENSE in the root of the source tree for information
  * regarding licensing.
  */
 
@@ -344,6 +344,22 @@ void UvCloseHelper(std::unique_ptr<Handle> handle, const TFn& fn)
 template<typename Handle>
 void UvClose(std::unique_ptr<Handle> handle)
 {
+	auto h = (uv_handle_t*)handle.get();
+
+	// handle was never initialized with uv_*_init, nothing to close
+	if (!h->loop)
+	{
+		return;
+	}
+
+	// handle is already closing or closed, release ownership so libuv can
+	// finish its own cleanup without us freeing the memory underneath it
+	if (uv_is_closing(h))
+	{
+		handle.release();
+		return;
+	}
+
 	return UvCloseHelper(std::move(handle), [](auto handle, auto cb)
 	{
 		uv_close((uv_handle_t*)handle, cb);

@@ -1,7 +1,7 @@
 /*
-* This file is part of the CitizenFX project - http://citizen.re/
+* This file is part of the Cfx project - https://cfx.re/
 *
-* See LICENSE and MENTIONS in the root of the source tree for information
+* See LICENSE in the root of the source tree for information
 * regarding licensing.
 */
 
@@ -1026,7 +1026,7 @@ bool IsNonProduction()
 #if (!defined(GTA_FIVE) && !defined(IS_RDR3)) || defined(_DEBUG)
 	return true;
 #else
-	static ConVar<int> moo("moo", ConVar_None, 0);
+	static ConVar<int> moo("moo", ConVar_UserPref, 0);
 
 	static auto isProd = ([]()
 	{

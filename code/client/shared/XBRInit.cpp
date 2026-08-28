@@ -21,6 +21,10 @@ int GetRequestedGameBuildInit()
 #undef EXPAND
 	};
 
+	constexpr const std::pair<const wchar_t*, int> deprecatedBuildMappings[] = {
+		{ L"-b3717", xbr::Build::Winter_2025 }
+	};
+
 	auto sharedData = CfxState::Get();
 	std::wstring_view cli = (sharedData->initCommandLine[0]) ? sharedData->initCommandLine : GetCommandLineW();
 	auto buildNumber = GetDefaultGameBuild();
@@ -29,6 +33,11 @@ int GetRequestedGameBuildInit()
 	wchar_t** wargv = CommandLineToArgvW(cli.data(), &argc);
 	for (int i = 1; i < argc; i++)
 	{
+		if (buildNumber != GetDefaultGameBuild())
+		{
+			break;
+		}
+
 		std::wstring_view arg = wargv[i];
 
 		for (auto [build, number] : buildNumbers)
@@ -36,6 +45,15 @@ int GetRequestedGameBuildInit()
 			if (arg == build)
 			{
 				buildNumber = number;
+				break;
+			}
+		}
+
+		for (const auto& [deprecatedBuild, mappedBuild] : deprecatedBuildMappings)
+		{
+			if (arg == deprecatedBuild)
+			{
+				buildNumber = mappedBuild;
 				break;
 			}
 		}
@@ -47,15 +65,42 @@ int GetRequestedGameBuildInit()
 
 bool GetReplaceExecutableInit()
 {
-	bool replaceExecutable = true;
-
 	std::wstring fpath = MakeRelativeCitPath(L"CitizenFX.ini");
 	if (GetFileAttributes(fpath.c_str()) != INVALID_FILE_ATTRIBUTES)
 	{
-		replaceExecutable = (GetPrivateProfileInt(L"Game", L"ReplaceExecutable", 1, fpath.c_str()) != 0);
+		int defaultBuild = GetPrivateProfileInt(L"Game", L"DefaultBuild", 0, fpath.c_str());
+		if (defaultBuild > 0)
+		{
+			return false;
+		}
+
+		return (GetPrivateProfileInt(L"Game", L"ReplaceExecutable", 0, fpath.c_str()) != 0);
 	}
 
-	return replaceExecutable;
+	return false;
+}
+
+int GetDefaultBuildInit()
+{
+	std::wstring fpath = MakeRelativeCitPath(L"CitizenFX.ini");
+	if (GetFileAttributes(fpath.c_str()) != INVALID_FILE_ATTRIBUTES)
+	{
+		// New ini key: explicit default build persisted from sv_defaultGameBuild or legacy effectiveDefaultBuild
+		int defaultBuild = GetPrivateProfileInt(L"Game", L"DefaultBuild", 0, fpath.c_str());
+		if (defaultBuild > 0)
+		{
+			return defaultBuild;
+		}
+
+		// Backward compat: old ReplaceExecutable=1 means use the requested build's exe directly
+		bool replaceExecutable = (GetPrivateProfileInt(L"Game", L"ReplaceExecutable", 0, fpath.c_str()) != 0);
+		if (replaceExecutable)
+		{
+			return GetRequestedGameBuildInit();
+		}
+	}
+
+	return GetDefaultGameBuild();
 }
 
 }

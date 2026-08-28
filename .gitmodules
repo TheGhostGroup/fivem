@@ -82,7 +82,7 @@
 	url = https://github.com/nmoinvaz/minizip.git
 [submodule "vendor/glm"]
 	path = vendor/glm
-	url = https://github.com/g-truc/glm.git
+	url = https://github.com/citizenfx/glm.git
 [submodule "vendor/eastl"]
 	path = vendor/eastl
 	url = https://github.com/citizenfx/EASTL.git
@@ -175,7 +175,7 @@
 	url = https://github.com/syoyo/tinygltf.git
 [submodule "vendor/lss"]
 	path = vendor/lss
-	url = https://chromium.googlesource.com/linux-syscall-support/
+	url = https://github.com/citizenfx/linux-syscall-support
 [submodule "vendor/range-v3"]
 	path = vendor/range-v3
 	url = https://github.com/ericniebler/range-v3.git
@@ -451,9 +451,6 @@
 [submodule "vendor/boost-submodules/boost-static-string"]
 	path = vendor/boost-submodules/boost-static-string
 	url = https://github.com/boostorg/static_string.git
-[submodule "vendor/libnode/node"]
-	path = vendor/libnode/node
-	url = https://github.com/nodejs/node.git
 [submodule "vendor/v8/12.4/source"]
 	path = vendor/v8/12.4/source
 	url = https://github.com/v8/v8.git

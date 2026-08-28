@@ -1,7 +1,7 @@
 /*
- * This file is part of the CitizenFX project - http://citizen.re/
+ * This file is part of the Cfx project - https://cfx.re/
  *
- * See LICENSE and MENTIONS in the root of the source tree for information
+ * See LICENSE in the root of the source tree for information
  * regarding licensing.
  */
 
@@ -2040,6 +2040,7 @@ int V8ScriptRuntime::GetInstanceId()
 
 int32_t V8ScriptRuntime::HandlesFile(char* fileName, IScriptHostWithResourceData* metadata)
 {
+#ifndef IS_FXSERVER
 #ifdef V8_12_2
 	constexpr bool isInLegacyRuntime = false;
 #else
@@ -2059,12 +2060,13 @@ int32_t V8ScriptRuntime::HandlesFile(char* fileName, IScriptHostWithResourceData
 	char* versionStr = "16";
 	metadata->GetResourceMetaData("node_version", 0, &versionStr);
 
-	const bool useLegacyRuntime = !strcmp("16", versionStr);
+	const bool useLegacyRuntime = launch::IsSDK();
 
 	if (useLegacyRuntime == isInLegacyRuntime)
 	{
 		return true;
 	}
+#endif
 	return false;
 }
 

@@ -1,7 +1,7 @@
 /*
- * This file is part of the CitizenFX project - http://citizen.re/
+ * This file is part of the Cfx project - https://cfx.re/
  *
- * See LICENSE and MENTIONS in the root of the source tree for information
+ * See LICENSE in the root of the source tree for information
  * regarding licensing.
  */
 
@@ -280,6 +280,16 @@ std::string ResourceManagerImpl::CallReferenceInternal(const std::string& functi
 void ResourceManager::SetCallRefCallback(const std::function<std::string(const std::string &, const std::string &)>& refCallback)
 {
 	g_callRefCallback = refCallback;
+}
+
+bool ResourceManagerImpl::IsMonitor()
+{
+	return m_isMonitorMode;
+}
+
+void ResourceManagerImpl::SetMonitor(bool monitor)
+{
+	m_isMonitorMode = monitor;
 }
 
 ResourceManager* CreateResourceManager()

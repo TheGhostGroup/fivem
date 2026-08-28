@@ -1,7 +1,7 @@
 /*
- * This file is part of the CitizenFX project - http://citizen.re/
+ * This file is part of the Cfx project - https://cfx.re/
  *
- * See LICENSE and MENTIONS in the root of the source tree for information
+ * See LICENSE in the root of the source tree for information
  * regarding licensing.
  */
 
@@ -31,6 +31,41 @@ extern nui::GameInterface* g_nuiGi;
 bool shouldHaveRootWindow;
 
 static nui::IAudioSink* g_audioSink;
+
+static bool IsTrustedEntitlementFrame(const std::string& frameUrl)
+{
+	static ConVar<std::string> uiUrlVar("ui_url", ConVar_UserPref, "https://nui-game-internal/ui/app/index.html");
+	if (boost::algorithm::starts_with(frameUrl, uiUrlVar.GetValue()))
+	{
+		return true;
+	}
+
+	if (frameUrl.empty())
+	{
+		return false;
+	}
+
+	CefURLParts urlParts;
+	if (!CefParseURL(frameUrl, urlParts))
+	{
+		return false;
+	}
+
+	auto scheme = boost::algorithm::to_lower_copy(CefString(&urlParts.scheme).ToString());
+	auto host = boost::algorithm::to_lower_copy(CefString(&urlParts.host).ToString());
+
+	if (scheme == "nui")
+	{
+		return (host == "game" || host == "nui-game-internal");
+	}
+
+	if (scheme == "https")
+	{
+		return (host == "nui-game-internal");
+	}
+
+	return false;
+}
 
 namespace nui
 {
@@ -451,6 +486,13 @@ auto NUIClient::OnBeforeResourceLoad(CefRefPtr<CefBrowser> browser, CefRefPtr<Ce
 
 	if (cfx::legitimacy::ShouldProcessHeaders(hostString.c_str()))
 	{
+		auto& frameUrl = (frame) ? frame->GetURL().ToString() : std::string{};
+
+		if (!IsTrustedEntitlementFrame(frameUrl))
+		{
+			return RV_CONTINUE;
+		}
+
 		char key[256] = { 0 };
 		char value[2048] = { 0 };
 		cfx::legitimacy::ProcessHeaders(key, value);
@@ -458,6 +500,15 @@ auto NUIClient::OnBeforeResourceLoad(CefRefPtr<CefBrowser> browser, CefRefPtr<Ce
 	}
 
 	return RV_CONTINUE;
+}
+
+CefRefPtr<CefResourceHandler> NUIClient::GetResourceHandler(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefRequest> request)
+{
+	CefRefPtr<CefResourceHandler> handler;
+
+	OnGetResourceHandler(browser, frame, request, handler);
+
+	return handler;
 }
 
 void NUIClient::AddProcessMessageHandler(std::string key, TProcessMessageHandler handler)
